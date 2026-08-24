@@ -190,8 +190,29 @@ test); an interferer confined to one bin is nulled without attenuating a wanted 
 a completely different, uncorrelated bin; freezing holds every bin's weight. `cargo test -p
 sdroxide-dsp`: all pass, full crate suite unaffected.
 
-Real-air verification (this section's own suggested order, step 2) has not happened — everything
-above is synthetic-signal testing only, same caveat as the scalar piece.
+**Real-air verification has now happened** (RSPduo, both tuners, serial 1905037B32, 1130 kHz
+local mediumwave broadcast, `2048`-point FFT at 2 Msps) and confirms the core claim this whole
+document rests on: scalar decorrelation and the adaptive filter behave the same way on real
+interference (one compromise weight for the whole span, same limitation a single-tap analogue
+phaser has — "not very useful for the most part," in the tester's own words, matching what the
+per-branch trade-off in "Two ways to expose it" above predicted), while decorrelate *per bin*
+produced "a massive null vs. strong signal" by ear — the qualitative version of the 22–26 dB vs.
+28–38 dB gap this document opened with, now reproduced on different hardware and a different
+signal chain than the one the numbers were originally measured on.
+
+One real gap the test surfaced, since fixed: the log's `depth_db()` reads misleadingly shallow
+for the per-bin technique — 1.4–2.4 dB on the session that produced an audibly "massive" null.
+The reason is exactly what `depth_db()`'s own doc now says: it averages *the whole span* (all
+2048 bins), so one narrow, deep null gets diluted by however many of the other ~2000 bins had
+nothing to remove at all. Fixed by adding `WidebandDecorrelator::peak_depth_db()` — the single
+deepest null among the bins that actually passed the power gate, computed from the same
+closed-form output-variance quadratic form `covariance_eigen`'s own tests already verify, just
+evaluated at the rescaled Cancel weight instead of the raw eigenvector. `SdrPlaySource::log_depth`
+now reports both numbers together (`"N dB peak null (M dB span average)"`), since they answer
+genuinely different questions rather than one being a rougher version of the other. Regression
+test added in `wbdecorrelator.rs`'s existing one-bin-interferer test: peak reads a real null
+(&gt;14 dB) while the whole-span average reads at least 6 dB lower for the identical scenario —
+the synthetic version of exactly what real air showed.
 
 ## Where this lands, concretely
 
@@ -203,30 +224,35 @@ above is synthetic-signal testing only, same caveat as the scalar piece.
   STFT-based per-bin version, genuinely new infrastructure, not an extension of anything
   existing. Reuses `covariance_eigen` and `cancel_weight` from `diversity.rs` rather than
   duplicating either.
-- **Not started**: `sdroxide_types::SdrPlayDiversity` (and any future `Rsr200Diversity`, per the
-  other plan) — gains whatever fields expose the two additions to config: at minimum an algorithm
-  selector (`Adaptive`/`Decorrelate`) alongside the existing mode selector, a gate-threshold field
-  for the wideband version, and — for the one-shot "Solve" flow — probably nothing new at all,
-  since freezing a computed weight is already `Diversity::set_frozen`'s (and
-  `WidebandDecorrelator::set_frozen`'s) job.
-- **Not started**: `crates/sdroxide-ui/src/app/settings/radio.rs`'s `settings_sdrplay_tab` (and,
-  later, RSR200's own settings tab) — an algorithm selector, and the wideband version's own
-  controls (gate dB, active-bin-count readout) once wired up. A `depth_db()`-style readout is
-  exactly as valuable here as it already is for `Cancel`, probably more so, since "is this
-  actually working" matters even more once there's no adaptive convergence to visually watch
-  happen — both `Diversity` and `WidebandDecorrelator` already expose one.
+- **Done**: `sdroxide_types::SdrPlayDiversity` gained `technique` (`DiversityTechnique`:
+  `Adaptive`/`Decorrelate`/`WidebandDecorrelate` — a new, RSPduo-config-level enum, since the
+  distinction spans two different DSP *components*, not one setting either takes) and `gate_db`.
+  `Rsr200Diversity`, per the other plan, does not exist yet — nothing has started there.
+- **Done**: `crates/sdroxide-ui/src/app/settings/radio.rs`'s `settings_sdrplay_tab` — a "How to
+  find it" technique selector under the existing mode selector, a gate-dB slider (wideband only),
+  Filter length/Adaptation rate (adaptive only), Hold/Restart shared by all three. RSR200's own
+  settings tab still doesn't exist (the backend itself hasn't been started — see
+  `RSR200_PLAN.md`), but this is now the template for it.
+- **Done, then found wanting, then fixed**: a `depth_db()`-style readout existed for the wideband
+  technique from the start, but real-air testing showed it alone is actively misleading (see
+  above) — `peak_depth_db()` is the fix, and the pair of them together is what actually answers
+  "is this doing anything."
 
 ## Suggested order
 
-1. **Scalar decorrelation inside `Diversity`** — smallest, self-contained, immediately useful on
-   the RSPduo today, and unblocks `RSR200_PLAN.md`'s own hardware-diversity step regardless of
-   how much of the rest of that plan has landed yet.
-2. **Real-air verification against actual antennas** — before touching the wideband version,
-   confirm the ported math produces a real, holdable null on real interference here, the same way
-   the original work verified synthetically first and then on real air before ever building the
-   per-bin version on top of it.
-3. **Wideband/per-bin decorrelation**, power-gated from the start rather than discovering the
-   instability the hard way a second time.
+1. **Done. Scalar decorrelation inside `Diversity`** — smallest, self-contained, immediately
+   useful on the RSPduo today, and unblocks `RSR200_PLAN.md`'s own hardware-diversity step
+   regardless of how much of the rest of that plan has landed yet.
+2. **Done, out of order — real-air verification actually happened *after* the wideband version was
+   already built and wired into the settings UI, not before it as this list originally suggested.**
+   That turned out fine: the wideband implementation's own synthetic tests (one-bin-interferer,
+   dead-aux) gave enough confidence to build and ship the UI ahead of hardware time, and real air
+   confirmed the core claim once it was available rather than catching a fundamental problem that
+   would have been cheaper to find first. Worth recording as a real data point on how load-bearing
+   "verify on real air before building the next piece" actually was here — not very, this time —
+   without overgeneralizing from a single instance.
+3. **Done. Wideband/per-bin decorrelation**, power-gated from the start rather than discovering
+   the instability the hard way a second time.
 
 ## Open questions
 
@@ -240,4 +266,6 @@ above is synthetic-signal testing only, same caveat as the scalar piece.
   gets without touching a setting is a real UX choice, not obviously either way.
 - Whether the 20 dB power-gate default is even the right starting point for sdroxide's own noise
   floor/AGC chain, which may not match the other program's closely enough to inherit the number
-  unchanged.
+  unchanged. First real-air data point: left at the 20 dB default, on the RSPduo, it produced an
+  audibly deep null on a real mediumwave interferer — evidence the default is *usable*, not
+  evidence it is *optimal*. No deliberate A/B against other thresholds has happened yet.

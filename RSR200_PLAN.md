@@ -150,8 +150,9 @@ is a documented, repeatable property of that resync event, not a per-session acc
   would either be a silent no-op (nothing to combine) or, worse, misleadingly present a fixed,
   already-applied hardware weight as if it were the *software* filter's own adaptive state.
   This needs its own, separate UI/control surface instead: a way to set the radio's magnitude/phase
-  weight directly (§4's "solve, then apply" flow, already built and tested in SDR++), not an
-  instance of `Diversity`.
+  weight directly (§4's "solve, then apply" flow — the *radio-side* half of this was already
+  built and tested in SDR++; the *software-solve* half it reads from is now built and tested in
+  sdroxide too, see §4), not an instance of `Diversity`.
 
 One real, deliberately-unsolved combination, carried over honestly rather than glossed: the
 SDR++ implementation's own plan document flags that Auto-ATT's per-channel calibration gain
@@ -183,14 +184,24 @@ that stays honest about what the radio is actually doing:
    channel 1" wording and confirmed on real hardware) — worth re-confirming rather than assuming
    it transfers, since it's a fact about the radio's firmware, not about either host program.
 
-   The "solve, then apply" workflow that makes this usable (rather than a blind magnitude/phase
-   guess-and-check) is: read whatever software-combining state is already active for this pair of
-   channels (if sdroxide's own decorrelation/manual-null tooling has an equivalent to
-   `sigpath::phasing`'s weight/mode readout — worth checking for one before assuming it needs
-   building), convert that into the radio's own additive-weight convention (`y = k0·A + k1·B`,
-   magnitude 1 LSB = 1/8192 up to just under 8×, phase a signed 16-bit degrees value), and send it
-   once via `SET_GENERATORS`. Not a live control loop — the round trip through the command channel
-   is too slow for one, confirmed in the SDR++ implementation.
+   **The "solve, then apply" workflow this needs now exists** (branch `decorrelation`,
+   `crates/sdroxide-dsp/src/diversity.rs`, built and tested against the RSPduo's own settings —
+   see `DECORRELATION_PLAN.md`): `Diversity::decorrelated_weight()` returns exactly `Option<(k0,
+   k1)>` for a `Diversity` set to `DiversityAlgorithm::Decorrelate`, solved as `y = k0·main +
+   k1·aux` — the *same* convention the radio's own additive weight uses (`y = k0·A + k1·B`), not a
+   coincidence so much as the natural closed form for "one complex weight combining two coherent
+   channels," found independently on both sides. The RSR200 backend's own hardware-diversity mode
+   would run a `Diversity` instance (or call `covariance_eigen`/`cancel_weight` directly — both
+   `pub` in that module) against the two ADC channels *before* switching the radio into
+   `OP_DIVERSITY`, read `decorrelated_weight()` (or the raw eigenpair, for a `Combine`-style
+   weight rather than a null), convert `k0`/`k1` into the radio's magnitude/phase units (1 LSB =
+   1/8192 up to just under 8×, phase a signed 16-bit degrees value — `k0` is fixed at 1 in the
+   `Cancel` case per `Diversity`'s own unity-gain-on-main convention, so only `k1` needs encoding
+   there), and send it once via `SET_GENERATORS`. Not a live control loop — the round trip through
+   the command channel is too slow for one, confirmed in the SDR++ implementation. The wideband,
+   per-bin technique (`WidebandDecorrelator`, same branch) does **not** apply here: the radio's
+   hardware combiner takes exactly one weight, not one per bin, so there is nothing for a per-bin
+   solve to hand it that the scalar one doesn't already provide more directly.
 
 ## 5. Crate layout
 
@@ -304,14 +315,17 @@ separately and shipped each as it landed):
 
 ## 8. Open questions
 
-- **Answered, see `DECORRELATION_PLAN.md`**: sdroxide does not currently have a manual-null /
-  decorrelation-style software combiner beyond `Diversity`'s own adaptive filter — that plan
-  proposes building the scalar (whole-block, closed-form) half of it, which is exactly what
-  hardware-diversity's "solve from current phasing" step (§4) should read from once it exists,
-  rather than inventing separate state. Sequencing implication: that plan's step 1 (scalar
-  decorrelation inside `Diversity`) is worth having land before or alongside this plan's own step
-  6 (hardware diversity), not necessarily before step 4 (Separate mode) — the two plans' timelines
-  aren't otherwise coupled.
+- **Answered and built, see `DECORRELATION_PLAN.md`**: sdroxide's manual-null / decorrelation-style
+  software combiner exists now (branch `decorrelation`) — both the scalar (whole-block, closed-form)
+  half this plan's §4 needs, as `Diversity::decorrelated_weight()`, and a wideband/per-bin half that
+  turned out not to apply here (§4). The scalar half is exactly what hardware-diversity's "solve
+  from current phasing" step should read from — no separate state to invent, as hoped. It has also
+  landed in the RSPduo's own settings UI (`crates/sdroxide-ui/src/app/settings/radio.rs`) as a
+  selectable technique, which is worth a look as the template for whatever this plan's own
+  RSR200-side controls end up looking like, once §4's hardware-diversity mode is built. Sequencing
+  turned out moot rather than needing a decision: the scalar piece landed well before this plan's
+  own step 6 (hardware diversity) has been started at all, and before step 4 (Separate mode) too —
+  nothing in this plan has begun implementation yet.
 - Priority between LAN and USB as the very first milestone — this plan recommends LAN for the
   reasons in §6, but that's a recommendation, not something to lock in without your sign-off.
 - Whether the Windows `FTD3XXWU`/WinUSB question in §6 is worth spiking *before* LAN is proven,

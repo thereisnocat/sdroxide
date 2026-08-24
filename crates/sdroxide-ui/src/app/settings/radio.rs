@@ -5665,7 +5665,7 @@ pub(in crate::app) fn settings_sdrplay_tab(
     // switch that cannot be seen is a switch that cannot be turned off, and
     // this one survives moving the configuration to another receiver.
     if model == SdrPlayModel::RspDuo || cfg.sdrplay.diversity.enabled {
-        use sdroxide_types::{DIVERSITY_MAX_TAPS, DiversityMode, diversity_cost_note};
+        use sdroxide_types::{DIVERSITY_MAX_TAPS, DiversityMode, DiversityTechnique, diversity_cost_note};
 
         ui.add_space(6.0);
         ui.separator();
@@ -5718,6 +5718,34 @@ pub(in crate::app) fn settings_sdrplay_tab(
                         });
                     ui.end_row();
 
+                    ui.label("How to find it").on_hover_text(
+                        "Three different ways to compute the weight above. The adaptive \
+                         filter converges over a second or two but can equalise a delay \
+                         between the aerials; decorrelate is instant but one weight for the \
+                         whole span; decorrelate per bin is also instant and can null several \
+                         interferers at once, each in its own bin. Takes effect immediately \
+                         and needs no reconnect.",
+                    );
+                    ComboBox::from_id_salt("sdrplay_div_technique")
+                        .selected_text(div.technique.label())
+                        .show_styled(ui, |ui| {
+                            for t in DiversityTechnique::ALL {
+                                if ui.selectable_label(div.technique == t, t.label()).clicked() {
+                                    div.technique = t;
+                                    push_gain(
+                                        cmds,
+                                        SdrPlayConfig::DIV_TECHNIQUE_ELEMENT,
+                                        match t {
+                                            DiversityTechnique::Adaptive => 0.0,
+                                            DiversityTechnique::Decorrelate => 1.0,
+                                            DiversityTechnique::WidebandDecorrelate => 2.0,
+                                        },
+                                    );
+                                }
+                            }
+                        });
+                    ui.end_row();
+
                     ui.label("Its LNA state").on_hover_text(
                         "The second tuner's own front-end attenuation. Set so both aerials \
                          show about the same noise floor: this is the adjustment everything \
@@ -5760,39 +5788,43 @@ pub(in crate::app) fn settings_sdrplay_tab(
                     });
                     ui.end_row();
 
-                    ui.label("Filter length");
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                DragValue::new(&mut div.taps)
-                                    .speed(1.0)
-                                    .range(1..=DIVERSITY_MAX_TAPS)
-                                    .suffix(" taps"),
-                            )
-                            .on_hover_text(
-                                "One tap is a gain and a phase — a null at one frequency \
-                                 that gets worse either side of it, which is all an analogue \
-                                 phaser can do. Each further tap buys one sample period of \
-                                 the path difference between the two aerials that the filter \
-                                 can equalise, which is what turns that notch into a band \
-                                 quiet all the way across.",
-                            )
-                            .changed()
-                        {
-                            push_gain(cmds, SdrPlayConfig::DIV_TAPS_ELEMENT, f64::from(div.taps));
-                        }
-                        ui.label(
-                            RichText::new(diversity_cost_note(
-                                div.taps,
-                                cfg.sdrplay.sample_rate_hz.min(2_000_000.0),
-                            ))
-                            .weak(),
-                        );
-                    });
-                    ui.end_row();
+                    if div.technique == DiversityTechnique::Adaptive {
+                        ui.label("Filter length");
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    DragValue::new(&mut div.taps)
+                                        .speed(1.0)
+                                        .range(1..=DIVERSITY_MAX_TAPS)
+                                        .suffix(" taps"),
+                                )
+                                .on_hover_text(
+                                    "One tap is a gain and a phase — a null at one frequency \
+                                     that gets worse either side of it, which is all an analogue \
+                                     phaser can do. Each further tap buys one sample period of \
+                                     the path difference between the two aerials that the filter \
+                                     can equalise, which is what turns that notch into a band \
+                                     quiet all the way across.",
+                                )
+                                .changed()
+                            {
+                                push_gain(
+                                    cmds,
+                                    SdrPlayConfig::DIV_TAPS_ELEMENT,
+                                    f64::from(div.taps),
+                                );
+                            }
+                            ui.label(
+                                RichText::new(diversity_cost_note(
+                                    div.taps,
+                                    cfg.sdrplay.sample_rate_hz.min(2_000_000.0),
+                                ))
+                                .weak(),
+                            );
+                        });
+                        ui.end_row();
 
-                    ui.label("Adaptation");
-                    ui.horizontal(|ui| {
+                        ui.label("Adaptation rate");
                         if crate::chrome::slider(
                             ui,
                             Slider::new(&mut div.rate, 0.0..=1.0).show_value(false),
@@ -5806,14 +5838,48 @@ pub(in crate::app) fn settings_sdrplay_tab(
                         {
                             push_gain(cmds, SdrPlayConfig::DIV_RATE_ELEMENT, f64::from(div.rate));
                         }
+                        ui.end_row();
+                    }
+
+                    if div.technique == DiversityTechnique::WidebandDecorrelate {
+                        ui.label("Gate").on_hover_text(
+                            "A bin more than this far below the span's own median bin power is \
+                             left alone rather than solved at all — without it, the noise floor's \
+                             thousands of near-silent bins each contribute an essentially \
+                             arbitrary momentary direction, and the null wanders instead of \
+                             holding. Lower catches more (and more marginal) interferers; \
+                             higher is more conservative. 20 dB is a starting point, not a \
+                             measured constant — worth retuning against what this aerial pair \
+                             actually shows.",
+                        );
+                        if crate::chrome::slider(
+                            ui,
+                            Slider::new(&mut div.gate_db, 0.0..=60.0).suffix(" dB"),
+                        )
+                        .changed()
+                        {
+                            push_gain(
+                                cmds,
+                                SdrPlayConfig::DIV_GATE_ELEMENT,
+                                f64::from(div.gate_db),
+                            );
+                        }
+                        ui.end_row();
+                    }
+
+                    ui.label("Hold");
+                    ui.horizontal(|ui| {
                         if ui
                             .checkbox(&mut div.frozen, "Hold")
-                            .on_hover_text(
+                            .on_hover_text(if div.technique == DiversityTechnique::Adaptive {
                                 "Stop the filter moving. Reach for this the moment a null \
                                  appears: a filter left adapting will re-aim itself at \
                                  whatever becomes loudest, which on a quiet band is the \
-                                 station you are listening to.",
-                            )
+                                 station you are listening to."
+                            } else {
+                                "Stop re-solving and hold the current weight (every bin's, for \
+                                 decorrelate per bin) where it is."
+                            })
                             .changed()
                         {
                             push_gain(
@@ -5824,7 +5890,11 @@ pub(in crate::app) fn settings_sdrplay_tab(
                         }
                         if ui
                             .button("Restart")
-                            .on_hover_text("Zero the filter and find the null again.")
+                            .on_hover_text(if div.technique == DiversityTechnique::Adaptive {
+                                "Zero the filter and find the null again."
+                            } else {
+                                "Clear the covariance estimate and solve again from scratch."
+                            })
                             .clicked()
                         {
                             push_gain(cmds, SdrPlayConfig::DIV_RESET_ELEMENT, 1.0);
@@ -5835,12 +5905,13 @@ pub(in crate::app) fn settings_sdrplay_tab(
             );
             ui.label(
                 RichText::new(
-                    "Nothing here can tell a wanted signal from an unwanted one — the filter \
-                     only knows what the two aerials have in common. In Cancel, the second \
-                     aerial wants to hear the noise source and as little of the band as \
-                     possible, or it will dutifully cancel the station too. In Combine, both \
-                     want to hear the same station. How deep the null is going runs to the \
-                     log every few seconds.",
+                    "None of the three techniques above can tell a wanted signal from an \
+                     unwanted one — each only knows what the two aerials have in common. In \
+                     Cancel, the second aerial wants to hear the noise source and as little of \
+                     the band as possible, or it will dutifully cancel the station too. In \
+                     Combine, both want to hear the same station. How it is doing runs to the \
+                     log every few seconds — depth in dB for Cancel, and for decorrelate per \
+                     bin, how many of the FFT's bins are actually being solved.",
                 )
                 .weak(),
             );

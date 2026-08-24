@@ -617,7 +617,20 @@ use sdroxide_types::{
 /// mode keeps its number — but a v88 client handed `Aprs` has no variant to
 /// decode it into and desynchronises on everything after it, rather than
 /// failing on the field itself.
-pub const PROTO_VERSION: u16 = 89;
+///
+/// **90** — the RSPduo's diversity filter (v87) gains two more ways to find
+/// its combining weight, alongside the original adaptive one (issue #153).
+/// [`sdroxide_types::SdrPlayDiversity`] gained `technique`
+/// ([`sdroxide_types::DiversityTechnique`]: `Adaptive`, `Decorrelate`, or
+/// `WidebandDecorrelate`) and `gate_db`, both appended at the tail of the
+/// struct for the same reason `enabled`'s siblings originally landed in
+/// declaration order — a field-order slip in a positional wire format
+/// reconfigures the wrong setting rather than failing outright.
+///
+/// A field appended to the radio configuration, which rides in both a command
+/// and an event, so a v89 peer would read the tail of either as garbage — the
+/// handshake's equality test is what stops it trying.
+pub const PROTO_VERSION: u16 = 90;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1520,6 +1533,8 @@ mod tests {
                     taps: 24,
                     rate: 0.35,
                     frozen: true,
+                    technique: sdroxide_types::DiversityTechnique::WidebandDecorrelate,
+                    gate_db: 14.5,
                 },
                 ..sdroxide_types::SdrPlayConfig::default()
             },

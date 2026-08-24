@@ -2963,6 +2963,54 @@ impl DiversityMode {
     }
 }
 
+/// How the combining weight in [`DiversityMode`] gets found.
+///
+/// Not a mirror of one `sdroxide_dsp` enum the way [`DiversityMode`] mirrors
+/// `DiversityMode` there — it spans a distinction the DSP crate expresses as
+/// two different *components*, not one setting either takes:
+/// `sdroxide_dsp::Diversity` (with its own `DiversityAlgorithm`, `Adaptive`
+/// or `Decorrelate`) versus `sdroxide_dsp::WidebandDecorrelator`, a wholly
+/// separate STFT-based pipeline. Configuration has to pick one of three
+/// things, even though the DSP crate has no single type spanning all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DiversityTechnique {
+    /// The adaptive NLMS filter this feature has always used: converges
+    /// over time, but handles a delay between the two aerials as well as a
+    /// gain and phase — the only one of the three that does.
+    #[default]
+    Adaptive,
+    /// A closed-form solve of the whole passband's covariance, all at once:
+    /// instant, no convergence to wait for, but one weight for every
+    /// frequency — the same limitation a single-tap analogue phaser has.
+    Decorrelate,
+    /// The same solve, independently in every FFT bin: handles several
+    /// interferers at once, each nulled in whichever bin(s) it actually
+    /// occupies, rather than needing one compromise weight for all of them.
+    /// Needs [`SdrPlayDiversity::gate_db`] to keep the noise floor's own
+    /// bins from contributing an arbitrary momentary direction.
+    WidebandDecorrelate,
+}
+
+impl DiversityTechnique {
+    pub const ALL: [DiversityTechnique; 3] = [
+        DiversityTechnique::Adaptive,
+        DiversityTechnique::Decorrelate,
+        DiversityTechnique::WidebandDecorrelate,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DiversityTechnique::Adaptive => "Adaptive filter — converges, handles a delay",
+            DiversityTechnique::Decorrelate => {
+                "Decorrelate — instant, one weight for the whole span"
+            }
+            DiversityTechnique::WidebandDecorrelate => {
+                "Decorrelate per bin — instant, several interferers at once"
+            }
+        }
+    }
+}
+
 /// The second receive chain, and what is done with it.
 ///
 /// Which chain it is is not a setting: there are two, and this is the one
@@ -4743,11 +4791,27 @@ pub struct SdrPlayDiversity {
     /// Only obeyed while the AGC is off.
     pub if_gr_db: i32,
     /// How many taps the adaptive filter has, 1 to [`DIVERSITY_MAX_TAPS`].
+    /// [`DiversityTechnique::Adaptive`] only.
     pub taps: u8,
-    /// How fast the filter adapts, 0 to 1.
+    /// How fast the filter adapts, 0 to 1. [`DiversityTechnique::Adaptive`]
+    /// only.
     pub rate: f32,
-    /// Hold the filter where it is.
+    /// Hold the filter — or, for [`DiversityTechnique::WidebandDecorrelate`],
+    /// every bin's weight — where it is.
     pub frozen: bool,
+    /// Which of the three ways to find the combining weight.
+    ///
+    /// Appended after the fields above rather than inserted among them:
+    /// this rides the wire (`sdroxide_proto`), which is positional, so a new
+    /// field has to go at the end of the struct regardless of where it
+    /// reads best. Live — takes effect immediately, no reopen.
+    pub technique: DiversityTechnique,
+    /// [`DiversityTechnique::WidebandDecorrelate`]'s power gate: a bin more
+    /// than this far below the frame's median bin power is left untouched
+    /// rather than solved. 20 dB is what worked on real material in the
+    /// work this was ported from — a starting point to retune against this
+    /// chain's own noise floor, not a constant to trust unquestioned.
+    pub gate_db: f32,
 }
 
 impl Default for SdrPlayDiversity {
@@ -4762,6 +4826,8 @@ impl Default for SdrPlayDiversity {
             taps: 8,
             rate: 0.7,
             frozen: false,
+            technique: DiversityTechnique::Adaptive,
+            gate_db: 20.0,
         }
     }
 }
@@ -4858,8 +4924,9 @@ impl SdrPlayConfig {
     pub const DAB_NOTCH_ELEMENT: &'static str = "DABNOTCH";
     pub const HDR_ELEMENT: &'static str = "HDR";
     /// The RSPduo's second tuner and the diversity filter, through the same
-    /// door. `DIVMODE` is [`DiversityMode`]'s index; `DIVRESET` is momentary.
-    /// The two gains are carried negated, like the main tuner's.
+    /// door. `DIVMODE` is [`DiversityMode`]'s index, `DIVTECH` is
+    /// [`DiversityTechnique`]'s; `DIVRESET` is momentary. The two gains are
+    /// carried negated, like the main tuner's.
     pub const AUX_LNA_ELEMENT: &'static str = "AUXLNA";
     pub const AUX_IF_GAIN_ELEMENT: &'static str = "AUXIF";
     pub const DIV_MODE_ELEMENT: &'static str = "DIVMODE";
@@ -4867,6 +4934,8 @@ impl SdrPlayConfig {
     pub const DIV_TAPS_ELEMENT: &'static str = "DIVTAPS";
     pub const DIV_FREEZE_ELEMENT: &'static str = "DIVFREEZE";
     pub const DIV_RESET_ELEMENT: &'static str = "DIVRESET";
+    pub const DIV_TECHNIQUE_ELEMENT: &'static str = "DIVTECH";
+    pub const DIV_GATE_ELEMENT: &'static str = "DIVGATE";
 
     /// IF gain reduction limits, in dB, from the API (`NORMAL_MIN_GR` and
     /// `MAX_BB_GR`).

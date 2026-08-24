@@ -60,10 +60,48 @@ One covariance matrix, computed over a whole processed block (or an operator-sel
 sub-band — see "open questions"), eigendecomposed once per block (or once on demand — see
 below), producing an instant complex weight. This slots into the *existing* `Diversity` struct
 almost exactly where its own doc comment already says the two current modes differ: "Both modes
-run the same adaptive filter and differ in one line at the end." A third `DiversityMode::
-Decorrelate` variant does the same job with a fundamentally different (non-adaptive, closed-form)
-computation instead — same `process(&mut self, main: &mut [Complex32], aux: &[Complex32])`
-call shape, same struct, no new public type needed for this half.
+run the same adaptive filter and differ in one line at the end." Same `process(&mut self, main:
+&mut [Complex32], aux: &[Complex32])` call shape, same struct, no new public type needed for the
+covariance solve itself.
+
+**Built** (branch `decorrelation`, `crates/sdroxide-dsp/src/diversity.rs`) as
+`DiversityAlgorithm::Decorrelate`, one deviation from the paragraph above worth recording: not a
+third `DiversityMode` variant. `Cancel`/`Combine` already say *what* the operator wants; the new
+enum is a second, orthogonal axis saying *how* the weight is found (`Adaptive`, the existing NLMS
+filter, or `Decorrelate`, the closed-form solve) — cheaper to reason about than a flat third mode,
+and it means a `Combine`-style decorrelated output was never a separate follow-up: both fall out
+of the one eigendecomposition (`covariance_eigen`) exactly as this document originally argued,
+selected by whichever `DiversityMode` is already set.
+
+**A real limitation found while testing, not anticipated above**: applying the raw null
+eigenvector to `Cancel` directly — `y = k0·main + k1·aux` with `(k0, k1)` jointly unit-norm — does
+*not* have the "a signal `aux` cannot hear survives untouched" guarantee the existing NLMS
+`Cancel` arithmetic has by construction. `k0` alone is a data-dependent value less than 1 in
+general (verified with `h = 0.6∠0.7°`, no wanted signal at all: `|k0| ≈ 0.86` even for a perfect
+null), so the raw eigenvector *attenuates* anything in `main` — wanted signal included — in
+proportion to how much of `main`'s own power it represents, since the solve has no way to tell
+"predictable from `aux`" apart from "just adds power." In the degenerate case where `aux` is
+silent, the null eigenvector for `Cancel` is `(0, 1)` — it zeroes `main` entirely, wanted signal
+and all, which the NLMS filter's own `Cancel` (`main − W·aux`, `W → 0` when `aux` is silent) does
+not do.
+
+The fix shipped: for `DiversityMode::Cancel` specifically, rescale the solved null eigenvector to
+unity gain on `main` before applying it — `main + (k1/k0)·aux`, the same null direction, just
+re-anchored so `main`'s own coefficient is exactly 1 regardless of what ends up multiplying `aux`.
+That restores the untouched-if-unpredictable guarantee (confirmed by test:
+`a_signal_only_the_main_aerial_hears_survives_decorrelation`), at the cost of being undefined
+when the solved `k0` is itself (numerically) zero — handled by falling back to outputting `aux`
+alone in that case, since there is no rescaling of `main` that reaches an answer when `main` is
+the channel being rejected. `DiversityMode::Combine` keeps the raw jointly-unit-norm eigenvector
+as solved — maximal-ratio combining has no "leave one branch alone" expectation to preserve, `main`
+included, so no rescale applies there.
+
+Practical upshot: `Decorrelate`+`Cancel` wants the noise being nulled to genuinely dominate
+`main`'s own power to behave like a proper null rather than a lossy blend — more so than the
+adaptive filter needs, since the adaptive filter's asymmetry (predict-and-subtract from a fixed
+`main`) has no equivalent notion of "how much of main's power is the wanted signal" to begin with.
+Worth surfacing in whatever UI exposes this — a `depth_db()`-style readout matters even more here
+than for the adaptive filter, per the "where this lands" section below.
 
 Two ways to expose it, worth deciding rather than defaulting to one:
 
@@ -113,37 +151,108 @@ considered and rejected in the original work, because it would have been a "poin
 interferer" control by another name and broken exactly the multi-interferer case that's the
 whole point of doing this per-bin at all — the power gate keeps the general case general.
 
+**Built** (branch `decorrelation`, `crates/sdroxide-dsp/src/wbdecorrelator.rs`, struct
+`WidebandDecorrelator`, exactly as sketched above): a periodic-Hann, 50 %-hop weighted
+overlap-add analysis/resynthesis pipeline structurally identical to `WbDdc`'s own (see that
+module's doc comment for the reconstruction-gain derivation this reuses, minus its
+band-selection/decimation, which does not apply here), reusing `covariance_eigen` and the scalar
+piece's own `cancel_weight` (below) per bin. Per-bin covariance is *time-smoothed* across STFT
+frames with the same exponential-average idiom `SpectrumAnalyzer` already uses for display power
+— a single frame's instantaneous per-bin outer product is always exactly rank one (any lone
+sample pair is), which is precisely the naive-and-unstable case described above; smoothing is
+what gives the gate something meaningful to threshold. Gate default kept at 20 dB, exposed via
+`set_gate_db`.
+
+Two things found while testing this, both worth recording rather than rediscovering:
+
+- **`cancel_weight` is shared with the scalar piece**, not reimplemented — one piece of reasoning
+  about the Cancel-mode rescale (see the "real limitation" note above) rather than two copies
+  that could quietly drift apart. Building the wideband piece is what actually exercised its
+  degenerate-fallback branch hard enough to break it (below), which the scalar piece's own tests
+  never happened to reach.
+- **The degenerate-fallback threshold was wrong, and per-bin use is what exposed it**: the first
+  cut gated the Cancel rescale (`k1 = null.k1 / null.k0`) on `null.k0.norm_sqr() > EPS` — an
+  *absolute* floor (`1e-12`) on a *scale-dependent* quantity. A per-bin `null.k0` that is merely
+  window-sidelobe-leakage small (not truly zero, but many orders of magnitude below the bin's own
+  signal) slips past that floor, and dividing by it amplifies numerical noise into a wild,
+  effectively garbage `k1` — which then injects that noise straight into the reconstructed bin. A
+  test built to check "an interferer in one bin doesn't touch a wanted tone in a completely
+  separate, uncorrelated bin" caught this directly (the tone's own bin has `rbb ≈ 0` and
+  `rab ≈ 0` from leakage alone, exactly the failure condition). The fix: bound the *ratio* `k1`
+  itself, not `k0` — `k1` is a dimensionless gain ratio between two aerials, so a fixed cap on it
+  (60 dB — already an implausible ratio for any real pairing) is scale-invariant in a way a
+  threshold on `k0` alone can never be, and catches both a literal divide-by-zero (non-finite
+  `k1`) and a merely-tiny-enough-to-be-garbage one in the same check.
+
+Tests (`crates/sdroxide-dsp/src/wbdecorrelator.rs`): identical channels null to >40 dB; a dead
+`aux` leaves `main` close to untouched (the per-bin analogue of the scalar piece's own such
+test); an interferer confined to one bin is nulled without attenuating a wanted tone confined to
+a completely different, uncorrelated bin; freezing holds every bin's weight. `cargo test -p
+sdroxide-dsp`: all pass, full crate suite unaffected.
+
+**Real-air verification has now happened** (RSPduo, both tuners, serial 1905037B32, 1130 kHz
+local mediumwave broadcast, `2048`-point FFT at 2 Msps) and confirms the core claim this whole
+document rests on: scalar decorrelation and the adaptive filter behave the same way on real
+interference (one compromise weight for the whole span, same limitation a single-tap analogue
+phaser has — "not very useful for the most part," in the tester's own words, matching what the
+per-branch trade-off in "Two ways to expose it" above predicted), while decorrelate *per bin*
+produced "a massive null vs. strong signal" by ear — the qualitative version of the 22–26 dB vs.
+28–38 dB gap this document opened with, now reproduced on different hardware and a different
+signal chain than the one the numbers were originally measured on.
+
+One real gap the test surfaced, since fixed: the log's `depth_db()` reads misleadingly shallow
+for the per-bin technique — 1.4–2.4 dB on the session that produced an audibly "massive" null.
+The reason is exactly what `depth_db()`'s own doc now says: it averages *the whole span* (all
+2048 bins), so one narrow, deep null gets diluted by however many of the other ~2000 bins had
+nothing to remove at all. Fixed by adding `WidebandDecorrelator::peak_depth_db()` — the single
+deepest null among the bins that actually passed the power gate, computed from the same
+closed-form output-variance quadratic form `covariance_eigen`'s own tests already verify, just
+evaluated at the rescaled Cancel weight instead of the raw eigenvector. `SdrPlaySource::log_depth`
+now reports both numbers together (`"N dB peak null (M dB span average)"`), since they answer
+genuinely different questions rather than one being a rougher version of the other. Regression
+test added in `wbdecorrelator.rs`'s existing one-bin-interferer test: peak reads a real null
+(&gt;14 dB) while the whole-span average reads at least 6 dB lower for the identical scenario —
+the synthetic version of exactly what real air showed.
+
 ## Where this lands, concretely
 
-- `crates/sdroxide-dsp/src/diversity.rs`: extend `DiversityMode` with `Decorrelate`; add the 2×2
-  eigendecomposition as a free function or an associated method (pure math, easily unit-tested
-  against synthetic pairs with a known, hand-computed answer — no hardware, no FFT, no async, the
-  cheapest kind of test to write and the kind worth writing first).
-- New file, `crates/sdroxide-dsp/src/wbdecorrelator.rs` (or similar — `wbddc.rs`/`wbspectrum.rs`
-  are the existing "wideband X" naming precedent in this crate): the STFT-based per-bin version,
-  genuinely new infrastructure, not an extension of anything existing.
-- `sdroxide_types::SdrPlayDiversity` (and any future `Rsr200Diversity`, per the other plan):
-  gains whatever fields the two additions need — at minimum a mode selector wide enough for a
-  third value, a power-gate threshold for the wideband version, and — for the one-shot "Solve"
-  flow — probably nothing new at all, since freezing a computed weight is already
-  `Diversity::set_frozen`'s job.
-- `crates/sdroxide-ui/src/app/settings/radio.rs`'s `settings_sdrplay_tab` (and, later, RSR200's
-  own settings tab): a third mode option, and the wideband version's own controls once it exists
-  — a `depth_db()`-style readout is exactly as valuable here as it already is for `Cancel`,
-  probably more so, since "is this actually working" matters even more once there's no adaptive
-  convergence to visually watch happen.
+- **Done**: `crates/sdroxide-dsp/src/diversity.rs` — `DiversityAlgorithm::Decorrelate` (an
+  orthogonal axis to `DiversityMode`, not a third variant of it — see the note above) plus the
+  2×2 eigendecomposition as a free function, `covariance_eigen`, unit-tested against synthetic
+  pairs with hand-computed answers.
+- **Done**: `crates/sdroxide-dsp/src/wbdecorrelator.rs`, struct `WidebandDecorrelator` — the
+  STFT-based per-bin version, genuinely new infrastructure, not an extension of anything
+  existing. Reuses `covariance_eigen` and `cancel_weight` from `diversity.rs` rather than
+  duplicating either.
+- **Done**: `sdroxide_types::SdrPlayDiversity` gained `technique` (`DiversityTechnique`:
+  `Adaptive`/`Decorrelate`/`WidebandDecorrelate` — a new, RSPduo-config-level enum, since the
+  distinction spans two different DSP *components*, not one setting either takes) and `gate_db`.
+  `Rsr200Diversity`, per the other plan, does not exist yet — nothing has started there.
+- **Done**: `crates/sdroxide-ui/src/app/settings/radio.rs`'s `settings_sdrplay_tab` — a "How to
+  find it" technique selector under the existing mode selector, a gate-dB slider (wideband only),
+  Filter length/Adaptation rate (adaptive only), Hold/Restart shared by all three. RSR200's own
+  settings tab still doesn't exist (the backend itself hasn't been started — see
+  `RSR200_PLAN.md`), but this is now the template for it.
+- **Done, then found wanting, then fixed**: a `depth_db()`-style readout existed for the wideband
+  technique from the start, but real-air testing showed it alone is actively misleading (see
+  above) — `peak_depth_db()` is the fix, and the pair of them together is what actually answers
+  "is this doing anything."
 
 ## Suggested order
 
-1. **Scalar decorrelation inside `Diversity`** — smallest, self-contained, immediately useful on
-   the RSPduo today, and unblocks `RSR200_PLAN.md`'s own hardware-diversity step regardless of
-   how much of the rest of that plan has landed yet.
-2. **Real-air verification against actual antennas** — before touching the wideband version,
-   confirm the ported math produces a real, holdable null on real interference here, the same way
-   the original work verified synthetically first and then on real air before ever building the
-   per-bin version on top of it.
-3. **Wideband/per-bin decorrelation**, power-gated from the start rather than discovering the
-   instability the hard way a second time.
+1. **Done. Scalar decorrelation inside `Diversity`** — smallest, self-contained, immediately
+   useful on the RSPduo today, and unblocks `RSR200_PLAN.md`'s own hardware-diversity step
+   regardless of how much of the rest of that plan has landed yet.
+2. **Done, out of order — real-air verification actually happened *after* the wideband version was
+   already built and wired into the settings UI, not before it as this list originally suggested.**
+   That turned out fine: the wideband implementation's own synthetic tests (one-bin-interferer,
+   dead-aux) gave enough confidence to build and ship the UI ahead of hardware time, and real air
+   confirmed the core claim once it was available rather than catching a fundamental problem that
+   would have been cheaper to find first. Worth recording as a real data point on how load-bearing
+   "verify on real air before building the next piece" actually was here — not very, this time —
+   without overgeneralizing from a single instance.
+3. **Done. Wideband/per-bin decorrelation**, power-gated from the start rather than discovering
+   the instability the hard way a second time.
 
 ## Open questions
 
@@ -157,4 +266,6 @@ whole point of doing this per-bin at all — the power gate keeps the general ca
   gets without touching a setting is a real UX choice, not obviously either way.
 - Whether the 20 dB power-gate default is even the right starting point for sdroxide's own noise
   floor/AGC chain, which may not match the other program's closely enough to inherit the number
-  unchanged.
+  unchanged. First real-air data point: left at the 20 dB default, on the RSPduo, it produced an
+  audibly deep null on a real mediumwave interferer — evidence the default is *usable*, not
+  evidence it is *optimal*. No deliberate A/B against other thresholds has happened yet.

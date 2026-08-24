@@ -5,16 +5,20 @@
 //! is the correct answer for this hardware.
 //!
 //! On an RSPduo with both tuners running, this is also where the two aerials
-//! meet: the driver hands back a sample-aligned pair and the adaptive filter
-//! in `sdroxide_dsp` turns it into one stream — a noise source nulled, or two
-//! fading paths combined (issue #153).
+//! meet: the driver hands back a sample-aligned pair and one of three
+//! `sdroxide_dsp` combiners — chosen by [`DiversityTechnique`] — turns it
+//! into one stream: a noise source nulled, or two fading paths combined
+//! (issue #153).
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use sdroxide_dsp::Diversity;
+use sdroxide_dsp::{Diversity, DiversityAlgorithm, WidebandDecorrelator};
 use sdroxide_radio::{Complex32, IqSource, Result, lo_offset_for};
 use sdroxide_sdrplay::SdrPlayHandle;
-use sdroxide_types::{DiversityMode, SdrPlayAgc, SdrPlayConfig, SdrPlayDiversity, SdrPlayModel};
+use sdroxide_types::{
+    DiversityMode, DiversityTechnique, SdrPlayAgc, SdrPlayConfig, SdrPlayDiversity, SdrPlayModel,
+};
 
 /// How long the receiver may deliver nothing before the connection counts as
 /// dead. The service delivers continuously while healthy, so three seconds of
@@ -23,6 +27,19 @@ const SILENCE_BEFORE_REOPEN: Duration = Duration::from_secs(3);
 
 /// How often the diversity filter's achieved null depth reaches the log.
 const DEPTH_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// [`DiversityTechnique::WidebandDecorrelate`]'s FFT size. Not exposed as a
+/// setting (yet) — 2048 gives a few hundred hertz of frequency resolution
+/// across the whole rate range dual-tuner mode can reach (2 Msps or the
+/// decimated rates below it), with well under a millisecond of added
+/// latency either way.
+const WB_FFT_SIZE: usize = 2048;
+
+/// [`DiversityTechnique::WidebandDecorrelate`]'s per-bin covariance
+/// smoothing time constant. Not exposed as a setting (yet); the gate
+/// threshold is the tunable the wideband technique actually needs — see
+/// `DECORRELATION_PLAN.md`.
+const WB_AVG_TC_SECS: f32 = 0.5;
 
 pub struct SdrPlaySource {
     handle: SdrPlayHandle,
@@ -42,8 +59,28 @@ pub struct SdrPlaySource {
     /// The second tuner's settings as configured, so the panel's live controls
     /// have somewhere to land.
     div_cfg: SdrPlayDiversity,
-    /// `Some` when both tuners are running: the filter that combines them.
+    /// `Some` when both tuners are running and
+    /// [`DiversityTechnique::Adaptive`] or [`DiversityTechnique::Decorrelate`]
+    /// is selected — the two techniques that share one component, differing
+    /// only in [`Diversity::algorithm`]. Mutually exclusive with
+    /// [`Self::wideband`]; [`Self::rebuild_combiner`] is what keeps it so.
     diversity: Option<Diversity>,
+    /// `Some` when both tuners are running and
+    /// [`DiversityTechnique::WidebandDecorrelate`] is selected.
+    wideband: Option<WidebandDecorrelator>,
+    /// This call's raw main-channel samples, when [`Self::wideband`] is
+    /// active. `buf` itself is reserved for draining [`Self::wb_out`] in
+    /// that case, since the decorrelator's overlap-add latency means what
+    /// comes out of one call is not what went into it.
+    wb_main_scratch: Vec<Complex32>,
+    /// [`WidebandDecorrelator::process`]'s own per-call output scratch,
+    /// reused rather than allocated fresh every call.
+    wb_produced: Vec<Complex32>,
+    /// Combined samples [`Self::wideband`] has produced but `read` has not
+    /// yet handed to its caller. A `VecDeque` specifically: draining from
+    /// the front is O(1) amortised, unlike a `Vec`'s, which would have to
+    /// shift every remaining element down on every call.
+    wb_out: VecDeque<Complex32>,
     /// The second tuner's samples, as the filter wants them.
     aux_scratch: Vec<f32>,
     aux_buf: Vec<Complex32>,
@@ -75,34 +112,11 @@ impl SdrPlaySource {
         } else {
             cfg.antenna.clone()
         };
-        let diversity = dual.then(|| {
-            Diversity::new(
-                div_mode(cfg.diversity.mode),
-                usize::from(cfg.diversity.taps),
-                cfg.diversity.rate,
-            )
-        });
         tracing::info!(
             "SDRplay source ready: {label}, center {center_hz:.0} Hz, \
              LO offset {lo_offset:.0} Hz (0 = LO on the VFO)"
         );
-        if diversity.is_some() {
-            tracing::info!(
-                "diversity is on: {} filter, {} taps{}",
-                match cfg.diversity.mode {
-                    DiversityMode::Cancel => "cancelling",
-                    DiversityMode::Combine => "combining",
-                },
-                cfg.diversity.taps,
-                if handle.pair_stamped() {
-                    ""
-                } else {
-                    " (the service is not numbering its blocks, so the two tuners are being \
-                     paired by arrival order)"
-                }
-            );
-        }
-        Ok(SdrPlaySource {
+        let mut src = SdrPlaySource {
             center: center_hz,
             rx_scratch: Vec::new(),
             label,
@@ -113,12 +127,79 @@ impl SdrPlaySource {
             antenna,
             antennas,
             div_cfg: cfg.diversity.clone(),
-            diversity,
+            diversity: None,
+            wideband: None,
+            wb_main_scratch: Vec::new(),
+            wb_produced: Vec::new(),
+            wb_out: VecDeque::new(),
             aux_scratch: Vec::new(),
             aux_buf: Vec::new(),
             last_depth_log: Instant::now(),
             handle,
-        })
+        };
+        if dual {
+            src.rebuild_combiner();
+            let pairing_note = if src.handle.pair_stamped() {
+                ""
+            } else {
+                " (the service is not numbering its blocks, so the two tuners are being paired \
+                 by arrival order)"
+            };
+            match cfg.diversity.technique {
+                DiversityTechnique::Adaptive => tracing::info!(
+                    "diversity is on: {} adaptive filter, {} taps{pairing_note}",
+                    mode_word(cfg.diversity.mode),
+                    cfg.diversity.taps,
+                ),
+                DiversityTechnique::Decorrelate => tracing::info!(
+                    "diversity is on: {} (decorrelate, whole span){pairing_note}",
+                    mode_word(cfg.diversity.mode),
+                ),
+                DiversityTechnique::WidebandDecorrelate => tracing::info!(
+                    "diversity is on: {} (decorrelate per bin, {WB_FFT_SIZE}-point FFT, \
+                     {:.0} dB gate){pairing_note}",
+                    mode_word(cfg.diversity.mode),
+                    cfg.diversity.gate_db,
+                ),
+            }
+        }
+        Ok(src)
+    }
+
+    /// (Re)build whichever combiner [`Self::div_cfg`]'s technique calls for,
+    /// discarding whatever was running before. Used both at
+    /// [`Self::open`] and whenever the technique itself changes live — a
+    /// pure software swap, so unlike [`SdrPlayDiversity::enabled`] it needs
+    /// no reopen.
+    fn rebuild_combiner(&mut self) {
+        self.wb_out.clear();
+        match self.div_cfg.technique {
+            DiversityTechnique::Adaptive | DiversityTechnique::Decorrelate => {
+                let mut d = Diversity::new(
+                    div_mode(self.div_cfg.mode),
+                    usize::from(self.div_cfg.taps),
+                    self.div_cfg.rate,
+                );
+                if self.div_cfg.technique == DiversityTechnique::Decorrelate {
+                    d.set_algorithm(DiversityAlgorithm::Decorrelate);
+                }
+                d.set_frozen(self.div_cfg.frozen);
+                self.diversity = Some(d);
+                self.wideband = None;
+            }
+            DiversityTechnique::WidebandDecorrelate => {
+                let mut wb = WidebandDecorrelator::new(
+                    WB_FFT_SIZE,
+                    self.handle.out_rate_hz(),
+                    WB_AVG_TC_SECS,
+                    div_mode(self.div_cfg.mode),
+                );
+                wb.set_gate_db(self.div_cfg.gate_db);
+                wb.set_frozen(self.div_cfg.frozen);
+                self.wideband = Some(wb);
+                self.diversity = None;
+            }
+        }
     }
 
     pub fn model(&self) -> SdrPlayModel {
@@ -134,28 +215,41 @@ impl SdrPlaySource {
         self.handle.dual_tuner()
     }
 
-    /// Say how the filter is doing, occasionally.
+    /// Say how the combiner is doing, occasionally.
     ///
     /// The null depth is the one number that separates "the second aerial
     /// hears the noise" from "the second aerial hears nothing the first one
     /// does", and no amount of adjusting the filter fixes the second case.
+    /// For the per-bin technique, the active-bin count answers the same
+    /// question a different way: there is no single convergence to watch,
+    /// so "is this doing anything at all" needs its own number.
     fn log_depth(&mut self) {
         if self.last_depth_log.elapsed() < DEPTH_LOG_INTERVAL {
             return;
         }
         self.last_depth_log = Instant::now();
-        let Some(d) = self.diversity.as_ref() else { return };
         let slips = self.handle.pair_slips();
-        match d.depth_db() {
-            Some(db) => tracing::info!(
-                "diversity: {db:.1} dB of the main aerial's signal is being cancelled{}{}",
-                if d.frozen() { ", filter held" } else { "" },
-                if slips > 0 { format!(", {slips} pairing restart(s)") } else { String::new() }
-            ),
-            None if slips > 0 => {
-                tracing::debug!("diversity: combining, {slips} pairing restart(s)");
+        let slip_note =
+            if slips > 0 { format!(", {slips} pairing restart(s)") } else { String::new() };
+        if let Some(d) = self.diversity.as_ref() {
+            match d.depth_db() {
+                Some(db) => tracing::info!(
+                    "diversity: {db:.1} dB of the main aerial's signal is being \
+                     cancelled{}{slip_note}",
+                    if d.frozen() { ", filter held" } else { "" },
+                ),
+                None if slips > 0 => tracing::debug!("diversity: combining{slip_note}"),
+                None => {}
             }
-            None => {}
+        } else if let Some(wb) = self.wideband.as_ref() {
+            let (active, total) = (wb.active_bins(), wb.fft_size());
+            match wb.depth_db() {
+                Some(db) => tracing::info!(
+                    "diversity: {db:.1} dB removed, {active}/{total} bins active{}{slip_note}",
+                    if wb.frozen() { ", held" } else { "" },
+                ),
+                None => tracing::info!("diversity: combining, {active}/{total} bins active{slip_note}"),
+            }
         }
         if self.handle.aux_stalled() {
             tracing::warn!(
@@ -171,6 +265,13 @@ fn div_mode(mode: DiversityMode) -> sdroxide_dsp::DiversityMode {
     match mode {
         DiversityMode::Cancel => sdroxide_dsp::DiversityMode::Cancel,
         DiversityMode::Combine => sdroxide_dsp::DiversityMode::Combine,
+    }
+}
+
+fn mode_word(mode: DiversityMode) -> &'static str {
+    match mode {
+        DiversityMode::Cancel => "cancelling",
+        DiversityMode::Combine => "combining",
     }
 }
 
@@ -222,28 +323,75 @@ impl IqSource for SdrPlaySource {
         // while the handle borrows itself.
         let (main, aux) = (&mut self.rx_scratch[..need], &mut self.aux_scratch[..]);
         let pairs = self.handle.read_pair(main, if dual { aux } else { &mut [] });
+
+        if pairs > 0 {
+            if self.wideband.is_some() {
+                // `buf` is reserved for draining `wb_out` below, which is
+                // not necessarily what this call fetched — the overlap-add
+                // has its own latency. Raw main samples land in scratch
+                // instead.
+                if self.wb_main_scratch.len() < pairs {
+                    self.wb_main_scratch.resize(pairs, Complex32::new(0.0, 0.0));
+                }
+                for p in 0..pairs {
+                    self.wb_main_scratch[p] =
+                        Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
+                }
+            } else {
+                for p in 0..pairs {
+                    buf[p] = Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
+                }
+            }
+
+            if dual && !self.handle.aux_stalled() {
+                if self.aux_buf.len() < pairs {
+                    self.aux_buf.resize(pairs, Complex32::new(0.0, 0.0));
+                }
+                for p in 0..pairs {
+                    self.aux_buf[p] =
+                        Complex32::new(self.aux_scratch[2 * p], self.aux_scratch[2 * p + 1]);
+                }
+                if let Some(d) = self.diversity.as_mut() {
+                    d.process(&mut buf[..pairs], &self.aux_buf[..pairs]);
+                } else if let Some(wb) = self.wideband.as_mut() {
+                    self.wb_produced.clear();
+                    wb.process(
+                        &self.wb_main_scratch[..pairs],
+                        &self.aux_buf[..pairs],
+                        &mut self.wb_produced,
+                    );
+                    self.wb_out.extend(self.wb_produced.drain(..));
+                }
+            } else if self.wideband.is_some() {
+                // Second tuner stalled: the docs above's "goes through
+                // uncombined" applies here too, straight into the drain
+                // queue so the caller still sees the samples in order.
+                self.wb_out.extend(self.wb_main_scratch[..pairs].iter().copied());
+            }
+
+            if dual {
+                self.log_depth();
+            }
+        }
+
+        if self.wideband.is_some() {
+            let n = self.wb_out.len().min(buf.len());
+            for (i, v) in self.wb_out.drain(..n).enumerate() {
+                buf[i] = v;
+            }
+            if n == 0 {
+                // Nothing ready yet -- either the overlap-add is still
+                // filling its first block, or the hardware itself has
+                // nothing this cycle.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            return Ok(n);
+        }
+
         if pairs == 0 {
             // Nothing yet — brief nap so the DSP loop doesn't spin hot.
             std::thread::sleep(Duration::from_millis(2));
             return Ok(0);
-        }
-        for p in 0..pairs {
-            buf[p] = Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
-        }
-        if dual && !self.handle.aux_stalled() {
-            if self.aux_buf.len() < pairs {
-                self.aux_buf.resize(pairs, Complex32::new(0.0, 0.0));
-            }
-            for p in 0..pairs {
-                self.aux_buf[p] =
-                    Complex32::new(self.aux_scratch[2 * p], self.aux_scratch[2 * p + 1]);
-            }
-            if let Some(d) = self.diversity.as_mut() {
-                d.process(&mut buf[..pairs], &self.aux_buf[..pairs]);
-            }
-        }
-        if dual {
-            self.log_depth();
         }
         Ok(pairs)
     }
@@ -309,20 +457,26 @@ impl IqSource for SdrPlaySource {
             SdrPlayConfig::DIV_MODE_ELEMENT => {
                 self.div_cfg.mode =
                     if db >= 0.5 { DiversityMode::Combine } else { DiversityMode::Cancel };
+                // Kept across the switch, both combiners: it is the same
+                // estimate either way, and throwing away a converged one
+                // would cost the operator the convergence they watched.
                 if let Some(d) = self.diversity.as_mut() {
-                    // The filter is kept across the switch: it is the same
-                    // estimate either way, and throwing away a converged one
-                    // would cost the operator the convergence they watched.
                     d.set_mode(div_mode(self.div_cfg.mode));
+                }
+                if let Some(wb) = self.wideband.as_mut() {
+                    wb.set_mode(div_mode(self.div_cfg.mode));
                 }
             }
             SdrPlayConfig::DIV_RATE_ELEMENT => {
+                // Adaptive only -- decorrelation, whole-span or per-bin, has
+                // nothing that converges for a rate to govern.
                 self.div_cfg.rate = db as f32;
                 if let Some(d) = self.diversity.as_mut() {
                     d.set_rate(self.div_cfg.rate);
                 }
             }
             SdrPlayConfig::DIV_TAPS_ELEMENT => {
+                // Adaptive only, same reasoning as the rate above.
                 let taps =
                     db.round().clamp(1.0, f64::from(sdroxide_types::DIVERSITY_MAX_TAPS)) as u8;
                 self.div_cfg.taps = taps;
@@ -335,12 +489,35 @@ impl IqSource for SdrPlaySource {
                 if let Some(d) = self.diversity.as_mut() {
                     d.set_frozen(self.div_cfg.frozen);
                 }
+                if let Some(wb) = self.wideband.as_mut() {
+                    wb.set_frozen(self.div_cfg.frozen);
+                }
             }
             SdrPlayConfig::DIV_RESET_ELEMENT => {
-                if let Some(d) = self.diversity.as_mut()
-                    && db >= 0.5
-                {
-                    d.reset();
+                if db >= 0.5 {
+                    if let Some(d) = self.diversity.as_mut() {
+                        d.reset();
+                    }
+                    if let Some(wb) = self.wideband.as_mut() {
+                        wb.reset();
+                        self.wb_out.clear();
+                    }
+                }
+            }
+            SdrPlayConfig::DIV_TECHNIQUE_ELEMENT => {
+                self.div_cfg.technique = match db.round() as i64 {
+                    1 => DiversityTechnique::Decorrelate,
+                    2 => DiversityTechnique::WidebandDecorrelate,
+                    _ => DiversityTechnique::Adaptive,
+                };
+                // A pure software swap -- discards whatever the previous
+                // combiner had converged or solved, but needs no reopen.
+                self.rebuild_combiner();
+            }
+            SdrPlayConfig::DIV_GATE_ELEMENT => {
+                self.div_cfg.gate_db = db as f32;
+                if let Some(wb) = self.wideband.as_mut() {
+                    wb.set_gate_db(self.div_cfg.gate_db);
                 }
             }
             _ => {}
@@ -420,13 +597,22 @@ impl IqSource for SdrPlaySource {
                 )
             });
         } else if self.handle.dual_tuner() {
-            notes.push(format!(
-                "Diversity is running on the RSPduo's second tuner — {}. Watch the log for the \
-                 depth it is reaching.",
-                match self.div_cfg.mode {
-                    DiversityMode::Cancel => "cancelling a noise source",
-                    DiversityMode::Combine => "combining two aerials",
+            let what = match self.div_cfg.mode {
+                DiversityMode::Cancel => "cancelling a noise source",
+                DiversityMode::Combine => "combining two aerials",
+            };
+            let how = match self.div_cfg.technique {
+                DiversityTechnique::Adaptive => "adaptive filter".to_string(),
+                DiversityTechnique::Decorrelate => "decorrelate, whole span".to_string(),
+                DiversityTechnique::WidebandDecorrelate => {
+                    let (active, total) =
+                        self.wideband.as_ref().map(|wb| (wb.active_bins(), wb.fft_size())).unwrap_or((0, 0));
+                    format!("decorrelate per bin, {active}/{total} bins active")
                 }
+            };
+            notes.push(format!(
+                "Diversity is running on the RSPduo's second tuner — {what} ({how}). Watch the \
+                 log for the depth it is reaching.",
             ));
             // The second tuner's ladder is shorter on some bands than others,
             // exactly like the first one's — and unlike the first one's, no

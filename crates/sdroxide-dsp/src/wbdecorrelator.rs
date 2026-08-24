@@ -89,6 +89,11 @@ pub struct WidebandDecorrelator {
     /// Per-bin solved weight, held across frames while [`Self::frozen`].
     k0: Vec<Complex32>,
     k1: Vec<Complex32>,
+    /// Whether each bin passed the power gate on the last solve — kept
+    /// separately from "`k0`/`k1` happen to sit at identity" so
+    /// [`Self::peak_depth_db`] can tell a gated-out bin (nothing there to
+    /// null) apart from a solved bin whose own answer genuinely was unity.
+    active: Vec<bool>,
     power_scratch: Vec<f32>,
     active_bins: usize,
 
@@ -156,6 +161,7 @@ impl WidebandDecorrelator {
             primed: false,
             k0: vec![Complex32::new(1.0, 0.0); fft_size],
             k1: vec![Complex32::default(); fft_size],
+            active: vec![false; fft_size],
             power_scratch: vec![0.0; fft_size],
             active_bins: 0,
             in_pow: 0.0,
@@ -212,11 +218,56 @@ impl WidebandDecorrelator {
 
     /// Same meaning as [`crate::Diversity::depth_db`]: how much quieter the
     /// output is than `main` was, in dB, `Cancel` only.
+    ///
+    /// Averaged over the *whole* span, which is a genuinely different
+    /// number from [`Self::peak_depth_db`], not just a rougher version of
+    /// it: a narrow, deep null in the handful of bins one interferer
+    /// actually occupies gets diluted here by however many of the other
+    /// [`Self::fft_size`] bins had nothing to remove at all — measured
+    /// against real interference, this read a couple of dB while the
+    /// per-bin peak read as a solid null on the thing actually being
+    /// nulled. Reach for [`Self::peak_depth_db`] to answer "how deep is the
+    /// null on what I'm nulling"; this one answers "how much of the whole
+    /// span's own power changed."
     pub fn depth_db(&self) -> Option<f32> {
         if self.mode != DiversityMode::Cancel || self.in_pow <= 0.0 || self.out_pow <= 0.0 {
             return None;
         }
         Some(10.0 * (self.in_pow / self.out_pow).log10())
+    }
+
+    /// The single deepest null among this frame's *active* (gated-in) bins,
+    /// in dB — `Cancel` only, `None` if nothing has been solved or nothing
+    /// passed the gate. See [`Self::depth_db`]'s doc for why this is a
+    /// genuinely different, usually much larger, number.
+    ///
+    /// Computed from the closed-form output variance for the rescaled
+    /// Cancel weight (`k0` fixed at 1 — see `cancel_weight`), not by
+    /// re-running the FFT on anything: `main`'s own coefficient is always
+    /// 1, so the output power at bin `i` is `raa[i] + |k1[i]|²·rbb[i] +
+    /// 2·Re[conj(k1[i])·rab[i]]`, the same quadratic form
+    /// `covariance_eigen`'s own tests already verify reproduces an
+    /// eigenvalue for the *unrescaled* eigenvector — here evaluated at the
+    /// rescaled one instead, which is no different in kind.
+    pub fn peak_depth_db(&self) -> Option<f32> {
+        if self.mode != DiversityMode::Cancel {
+            return None;
+        }
+        let mut best: Option<f32> = None;
+        for i in 0..self.n {
+            if !self.active[i] || self.raa[i] <= 0.0 {
+                continue;
+            }
+            let out_p = self.raa[i]
+                + self.k1[i].norm_sqr() * self.rbb[i]
+                + 2.0 * (self.k1[i].conj() * self.rab[i]).re;
+            if out_p <= 0.0 {
+                continue;
+            }
+            let depth = 10.0 * (self.raa[i] / out_p).log10();
+            best = Some(best.map_or(depth, |b| b.max(depth)));
+        }
+        best
     }
 
     /// Clear all overlap, smoothing and solved-weight state — the answer
@@ -232,6 +283,7 @@ impl WidebandDecorrelator {
         self.primed = false;
         self.k0.fill(Complex32::new(1.0, 0.0));
         self.k1.fill(Complex32::default());
+        self.active.fill(false);
         self.active_bins = 0;
         self.in_pow = 0.0;
         self.out_pow = 0.0;
@@ -346,9 +398,11 @@ impl WidebandDecorrelator {
                 // module doc.
                 self.k0[i] = Complex32::new(1.0, 0.0);
                 self.k1[i] = Complex32::default();
+                self.active[i] = false;
                 continue;
             }
             active += 1;
+            self.active[i] = true;
             let (null, combine): (Eigenpair, Eigenpair) =
                 covariance_eigen(self.raa[i], self.rbb[i], self.rab[i]);
             let (k0, k1) = match self.mode {
@@ -472,6 +526,17 @@ mod tests {
 
         let qrm_kept = kept_fraction(&qrm_in_main_tail, (0.5 * h.norm()).max(1e-6));
         assert!(qrm_kept < 0.2, "the interferer survived at {qrm_kept:.3} of its amplitude, not nulled");
+
+        // This is the exact shape depth_db()'s own doc warns about: one
+        // narrow, deep null diluted by ~500 other bins with nothing to
+        // remove. peak_depth_db() should read like a real null (the
+        // amplitude check above already implies >14 dB); depth_db()'s
+        // whole-span average should read much smaller, not because the
+        // null is shallow but because it is one bin out of many.
+        let peak = d.peak_depth_db().expect("a bin was actively nulled");
+        let avg = d.depth_db().expect("Cancel mode reports a whole-span average");
+        assert!(peak > 14.0, "peak per-bin depth only {peak:.1} dB");
+        assert!(peak > avg + 6.0, "peak {peak:.1} dB isn't meaningfully deeper than the {avg:.1} dB average");
     }
 
     /// Gating out the quiet bins should leave a genuinely dead `aux`

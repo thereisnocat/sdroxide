@@ -243,12 +243,19 @@ impl SdrPlaySource {
             }
         } else if let Some(wb) = self.wideband.as_ref() {
             let (active, total) = (wb.active_bins(), wb.fft_size());
-            match wb.depth_db() {
-                Some(db) => tracing::info!(
-                    "diversity: {db:.1} dB removed, {active}/{total} bins active{}{slip_note}",
+            // depth_db() alone reads misleadingly shallow here: it is the
+            // whole span's own average, diluted by however many of `total`
+            // bins had nothing to remove -- peak_depth_db() is the number
+            // that actually answers "how deep is the null on whatever is
+            // actually being nulled." Both together tell the fuller story;
+            // neither alone does.
+            match (wb.depth_db(), wb.peak_depth_db()) {
+                (Some(avg), Some(peak)) => tracing::info!(
+                    "diversity: {peak:.1} dB peak null ({avg:.1} dB span average), \
+                     {active}/{total} bins active{}{slip_note}",
                     if wb.frozen() { ", held" } else { "" },
                 ),
-                None => tracing::info!("diversity: combining, {active}/{total} bins active{slip_note}"),
+                _ => tracing::info!("diversity: combining, {active}/{total} bins active{slip_note}"),
             }
         }
         if self.handle.aux_stalled() {

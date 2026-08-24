@@ -5366,6 +5366,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdroxide-rsr200"
+version = "1.5.0"
+dependencies = [
+ "num-complex",
+]
+
+[[package]]
 name = "sdroxide-rtlsdr"
 version = "1.5.1"
 dependencies = [

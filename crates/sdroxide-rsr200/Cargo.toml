@@ -1,0 +1,11 @@
+[package]
+name = "sdroxide-rsr200"
+version.workspace = true
+edition.workspace = true
+
+# Reuter RSR200(B) support. This crate starts with `protocol` — pure wire-format
+# math, no I/O, no sdroxide-types dependency (see that module's own doc) — per
+# RSR200_PLAN.md's suggested build order, step 1. Transport (`usb`/`lan`) and
+# the rest of the backend land in later steps.
+[dependencies]
+num-complex.workspace = true

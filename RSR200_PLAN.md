@@ -293,10 +293,17 @@ Each stage independently useful and independently testable, matching this worksp
 apparent convention (and the SDR++ project's, which phased USB/LAN/dual-channel/extras
 separately and shipped each as it landed):
 
-1. **`sdroxide-rsr200::protocol`**, fully unit-tested against the DP manual's own worked
-   examples and figures, no hardware needed — this is the one piece of the SDR++ implementation
-   that's nearly transliterable rather than merely analogous, since it's pure wire-format math
-   with no C++-vs-Rust architectural difference to bridge.
+1. **Done. `sdroxide-rsr200::protocol`** (branch `rsr200`) — a faithful port of the already-tested
+   `rsr200_protocol.h`, all 19 of its worked-example checks transliterated 1:1 as Rust `#[test]`s
+   and passing on the first run: block geometry (LAN and USB), status header parsing, sample
+   unpacking (16/24-bit, sign extension, per-channel Auto-ATT gain), block resync, every command
+   builder, reply parsing (including the BCD firmware-version decode), Nyquist-zone tuning against
+   the OM's own three worked examples, and the hardware-diversity weight conversion (§4) including
+   its quantisation-through-the-wire-format round trip. No hardware needed, none used — exactly
+   the point of doing this piece first. `cargo test -p sdroxide-rsr200`: 19/19 pass; `cargo clippy`:
+   clean. Mechanical adaptations from the C++ original only (`u32::to/from_le_bytes` instead of
+   hand-rolled byte shuffling, `Option<Reply>` instead of an out-parameter, `#[repr(u8)]` enums
+   cast with `as u8` at the call sites) — no wire-format or semantic changes.
 2. **LAN transport + `device.rs`**, single channel, 16-bit — first light. Proves command
    sequencing, the not-synchronous-acknowledgement handling, block resync/framing.
 3. **`Backend::Rsr200` registration**: config struct, `open_rsr200_source()`, settings tab —

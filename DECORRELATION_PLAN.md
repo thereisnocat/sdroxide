@@ -151,25 +151,70 @@ considered and rejected in the original work, because it would have been a "poin
 interferer" control by another name and broken exactly the multi-interferer case that's the
 whole point of doing this per-bin at all — the power gate keeps the general case general.
 
+**Built** (branch `decorrelation`, `crates/sdroxide-dsp/src/wbdecorrelator.rs`, struct
+`WidebandDecorrelator`, exactly as sketched above): a periodic-Hann, 50 %-hop weighted
+overlap-add analysis/resynthesis pipeline structurally identical to `WbDdc`'s own (see that
+module's doc comment for the reconstruction-gain derivation this reuses, minus its
+band-selection/decimation, which does not apply here), reusing `covariance_eigen` and the scalar
+piece's own `cancel_weight` (below) per bin. Per-bin covariance is *time-smoothed* across STFT
+frames with the same exponential-average idiom `SpectrumAnalyzer` already uses for display power
+— a single frame's instantaneous per-bin outer product is always exactly rank one (any lone
+sample pair is), which is precisely the naive-and-unstable case described above; smoothing is
+what gives the gate something meaningful to threshold. Gate default kept at 20 dB, exposed via
+`set_gate_db`.
+
+Two things found while testing this, both worth recording rather than rediscovering:
+
+- **`cancel_weight` is shared with the scalar piece**, not reimplemented — one piece of reasoning
+  about the Cancel-mode rescale (see the "real limitation" note above) rather than two copies
+  that could quietly drift apart. Building the wideband piece is what actually exercised its
+  degenerate-fallback branch hard enough to break it (below), which the scalar piece's own tests
+  never happened to reach.
+- **The degenerate-fallback threshold was wrong, and per-bin use is what exposed it**: the first
+  cut gated the Cancel rescale (`k1 = null.k1 / null.k0`) on `null.k0.norm_sqr() > EPS` — an
+  *absolute* floor (`1e-12`) on a *scale-dependent* quantity. A per-bin `null.k0` that is merely
+  window-sidelobe-leakage small (not truly zero, but many orders of magnitude below the bin's own
+  signal) slips past that floor, and dividing by it amplifies numerical noise into a wild,
+  effectively garbage `k1` — which then injects that noise straight into the reconstructed bin. A
+  test built to check "an interferer in one bin doesn't touch a wanted tone in a completely
+  separate, uncorrelated bin" caught this directly (the tone's own bin has `rbb ≈ 0` and
+  `rab ≈ 0` from leakage alone, exactly the failure condition). The fix: bound the *ratio* `k1`
+  itself, not `k0` — `k1` is a dimensionless gain ratio between two aerials, so a fixed cap on it
+  (60 dB — already an implausible ratio for any real pairing) is scale-invariant in a way a
+  threshold on `k0` alone can never be, and catches both a literal divide-by-zero (non-finite
+  `k1`) and a merely-tiny-enough-to-be-garbage one in the same check.
+
+Tests (`crates/sdroxide-dsp/src/wbdecorrelator.rs`): identical channels null to >40 dB; a dead
+`aux` leaves `main` close to untouched (the per-bin analogue of the scalar piece's own such
+test); an interferer confined to one bin is nulled without attenuating a wanted tone confined to
+a completely different, uncorrelated bin; freezing holds every bin's weight. `cargo test -p
+sdroxide-dsp`: all pass, full crate suite unaffected.
+
+Real-air verification (this section's own suggested order, step 2) has not happened — everything
+above is synthetic-signal testing only, same caveat as the scalar piece.
+
 ## Where this lands, concretely
 
-- `crates/sdroxide-dsp/src/diversity.rs`: extend `DiversityMode` with `Decorrelate`; add the 2×2
-  eigendecomposition as a free function or an associated method (pure math, easily unit-tested
-  against synthetic pairs with a known, hand-computed answer — no hardware, no FFT, no async, the
-  cheapest kind of test to write and the kind worth writing first).
-- New file, `crates/sdroxide-dsp/src/wbdecorrelator.rs` (or similar — `wbddc.rs`/`wbspectrum.rs`
-  are the existing "wideband X" naming precedent in this crate): the STFT-based per-bin version,
-  genuinely new infrastructure, not an extension of anything existing.
-- `sdroxide_types::SdrPlayDiversity` (and any future `Rsr200Diversity`, per the other plan):
-  gains whatever fields the two additions need — at minimum a mode selector wide enough for a
-  third value, a power-gate threshold for the wideband version, and — for the one-shot "Solve"
-  flow — probably nothing new at all, since freezing a computed weight is already
-  `Diversity::set_frozen`'s job.
-- `crates/sdroxide-ui/src/app/settings/radio.rs`'s `settings_sdrplay_tab` (and, later, RSR200's
-  own settings tab): a third mode option, and the wideband version's own controls once it exists
-  — a `depth_db()`-style readout is exactly as valuable here as it already is for `Cancel`,
-  probably more so, since "is this actually working" matters even more once there's no adaptive
-  convergence to visually watch happen.
+- **Done**: `crates/sdroxide-dsp/src/diversity.rs` — `DiversityAlgorithm::Decorrelate` (an
+  orthogonal axis to `DiversityMode`, not a third variant of it — see the note above) plus the
+  2×2 eigendecomposition as a free function, `covariance_eigen`, unit-tested against synthetic
+  pairs with hand-computed answers.
+- **Done**: `crates/sdroxide-dsp/src/wbdecorrelator.rs`, struct `WidebandDecorrelator` — the
+  STFT-based per-bin version, genuinely new infrastructure, not an extension of anything
+  existing. Reuses `covariance_eigen` and `cancel_weight` from `diversity.rs` rather than
+  duplicating either.
+- **Not started**: `sdroxide_types::SdrPlayDiversity` (and any future `Rsr200Diversity`, per the
+  other plan) — gains whatever fields expose the two additions to config: at minimum an algorithm
+  selector (`Adaptive`/`Decorrelate`) alongside the existing mode selector, a gate-threshold field
+  for the wideband version, and — for the one-shot "Solve" flow — probably nothing new at all,
+  since freezing a computed weight is already `Diversity::set_frozen`'s (and
+  `WidebandDecorrelator::set_frozen`'s) job.
+- **Not started**: `crates/sdroxide-ui/src/app/settings/radio.rs`'s `settings_sdrplay_tab` (and,
+  later, RSR200's own settings tab) — an algorithm selector, and the wideband version's own
+  controls (gate dB, active-bin-count readout) once wired up. A `depth_db()`-style readout is
+  exactly as valuable here as it already is for `Cancel`, probably more so, since "is this
+  actually working" matters even more once there's no adaptive convergence to visually watch
+  happen — both `Diversity` and `WidebandDecorrelator` already expose one.
 
 ## Suggested order
 

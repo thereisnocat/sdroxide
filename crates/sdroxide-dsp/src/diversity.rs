@@ -176,6 +176,57 @@ pub fn covariance_eigen(raa: f32, rbb: f32, rab: Complex32) -> (Eigenpair, Eigen
     )
 }
 
+/// Turns a null [`Eigenpair`] into a `Cancel`-style weight: unity gain on
+/// `main`, i.e. `main + k1·aux` rather than the raw jointly-unit-norm
+/// `null.k0·main + null.k1·aux`. See [`Diversity::process`]'s own comment on
+/// why the rescale matters — a signal `aux` has no part of stays untouched
+/// only in this form, not the raw eigenvector.
+///
+/// Shared by [`Diversity`] and [`crate::wbdecorrelator::WidebandDecorrelator`]
+/// (one global weight, one per FFT bin) so the degenerate case below is one
+/// piece of reasoning, not two copies that could quietly drift apart.
+///
+/// Degenerate case: when `null.k0` is itself (numerically) zero, `main`
+/// carries essentially none of the null direction — `aux` is the quieter,
+/// uncorrelated channel here. The rescale is undefined (dividing by zero),
+/// and the tempting answer — "output `aux` alone, it *is* the null" — is a
+/// trap: it is only a sensible null if `aux` actually has power to offer.
+/// Nothing here distinguishes "`aux` is quiet because it is genuinely a
+/// clean reference" from "`aux` is quiet because it is dead" — for the
+/// global scalar case a dead `aux` is a whole-band silence an operator
+/// would notice immediately, but for the per-bin case it would show up as
+/// scattered, easy-to-miss silent holes wherever `aux` happens to be a
+/// touch quieter than `main`. Identity — leave `main` alone — is the safe
+/// default in both cases: failing to null a bin is a smaller failure than
+/// silencing it.
+///
+/// The guard is on the *ratio* `k1`, not on `null.k0` against some absolute
+/// floor like [`EPS`] — a first cut of this function did that and it broke
+/// under real use: a per-bin caller (`WidebandDecorrelator`) can hand in a
+/// `k0` that is only *window-sidelobe-leakage* small, not truly zero —
+/// bigger than any fixed epsilon, but still small enough that dividing by
+/// it amplifies numerical noise into a wild, effectively garbage `k1`,
+/// which then injects that noise into the reconstructed bin. `k1` is a
+/// dimensionless gain ratio, so a fixed bound on *it* is scale-invariant in
+/// a way a threshold on `k0` alone can never be: dividing by an exact zero
+/// yields a non-finite `k1` (caught by `is_finite`), and dividing by a
+/// merely-tiny-but-nonzero one yields a `k1` so large it is not physically
+/// a real antenna pairing's gain ratio either way (caught by the bound).
+pub fn cancel_weight(null: Eigenpair) -> (Complex32, Complex32) {
+    let k1 = null.k1 / null.k0;
+    if k1.norm_sqr().is_finite() && k1.norm_sqr() <= MAX_CANCEL_RATIO * MAX_CANCEL_RATIO {
+        (Complex32::new(1.0, 0.0), k1)
+    } else {
+        (Complex32::new(1.0, 0.0), Complex32::new(0.0, 0.0))
+    }
+}
+
+/// Bound on `|k1|` in [`cancel_weight`]'s rescaled output: a 60 dB gain
+/// ratio between two aerials is already implausible for any real pairing,
+/// so treating anything past it as numerical noise rather than a real
+/// solve costs nothing genuine.
+const MAX_CANCEL_RATIO: f32 = 1.0e3;
+
 /// Slowest and fastest normalised step size the rate control reaches.
 ///
 /// The bottom is a filter that takes tens of seconds to settle and then sits
@@ -500,22 +551,10 @@ impl Diversity {
                     // itself by less than one -- unlike the adaptive filter's
                     // `main - W*aux`, which leaves a signal `aux` cannot hear
                     // untouched by construction. Rescaling to unity gain on
-                    // `main` (dividing through by `k0`, the same null
-                    // direction, just re-anchored) restores that guarantee:
-                    // `main`'s own coefficient is 1 regardless of what ends
-                    // up in `w`, so anything `aux` has no part of survives
-                    // exactly, the same promise this mode makes everywhere
-                    // else in the module.
-                    if null.k0.norm_sqr() > EPS {
-                        self.decorr_k0 = Complex32::new(1.0, 0.0);
-                        self.decorr_k1 = null.k1 / null.k0;
-                    } else {
-                        // `main` carries none of the null direction -- it is
-                        // the noisier channel, and `aux` alone already is
-                        // the answer no rescaling of `main` can reach.
-                        self.decorr_k0 = Complex32::new(0.0, 0.0);
-                        self.decorr_k1 = Complex32::new(1.0, 0.0);
-                    }
+                    // `main` restores that guarantee -- see `cancel_weight`.
+                    let (k0, k1) = cancel_weight(null);
+                    self.decorr_k0 = k0;
+                    self.decorr_k1 = k1;
                 }
                 // Combining has no such expectation -- both branches are
                 // meant to be weighted by quality, `main` included -- so the
@@ -900,5 +939,22 @@ mod tests {
         let aux = noise(n, 2);
         d.process(&mut main, &aux);
         assert!(d.decorrelated_weight().is_some(), "a block was processed");
+    }
+
+    /// The degenerate case `cancel_weight` exists to get right: a dead `aux`
+    /// gives a null direction with essentially no `main` component. The safe
+    /// answer is to leave `main` alone, not to output the (silent) `aux`.
+    #[test]
+    fn a_dead_auxiliary_channel_leaves_main_untouched_in_cancel_mode() {
+        let n = 20_000;
+        let original = noise(n, 0xd00d);
+        let mut main = original.clone();
+        let aux = vec![Complex32::new(0.0, 0.0); n];
+
+        let mut d = Diversity::new(DiversityMode::Cancel, 1, 0.5);
+        d.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d.process(&mut main, &aux);
+
+        assert_eq!(main, original, "a dead aux channel should leave main untouched");
     }
 }

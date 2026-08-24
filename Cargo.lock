@@ -5370,6 +5370,7 @@ name = "sdroxide-rsr200"
 version = "1.5.0"
 dependencies = [
  "num-complex",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

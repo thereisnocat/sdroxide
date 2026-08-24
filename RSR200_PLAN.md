@@ -304,8 +304,26 @@ separately and shipped each as it landed):
    clean. Mechanical adaptations from the C++ original only (`u32::to/from_le_bytes` instead of
    hand-rolled byte shuffling, `Option<Reply>` instead of an out-parameter, `#[repr(u8)]` enums
    cast with `as u8` at the call sites) — no wire-format or semantic changes.
-2. **LAN transport + `device.rs`**, single channel, 16-bit — first light. Proves command
-   sequencing, the not-synchronous-acknowledgement handling, block resync/framing.
+2. **Done. LAN transport + `device.rs`** (branch `rsr200`) — `sdroxide-rsr200::device` (the
+   `Transport` trait, `Config`, `Device`'s full configuration-ordering/command-numbering/
+   acknowledgement-and-retry/frame-parsing state machine) and `sdroxide-rsr200::lan`
+   (`LanTcpTransport`, over `std::net::TcpStream` per `sdroxide-rtlsdr`'s own `tcp/mod.rs`
+   precedent, not the C++ original's raw BSD sockets). One structural adaptation from the C++
+   reference worth recording: `Device` takes `&mut dyn Transport` as a parameter on every method
+   that needs one rather than storing it, and returns what `pump()` found directly rather than
+   invoking stored `onSamples`/`onReply`/`onError` closures — both are genuine Rust ownership
+   constraints (a stored transport can't also be held by a caller wanting to inspect it; a stored
+   closure can't safely read the buffers it would need to while also being called from inside
+   `self`), not stylistic changes, and were only found once the direct 1:1 port stopped compiling.
+   All 11 of the reference `test_device.cpp`'s test scenarios ported 1:1 (configuration order,
+   stream-stop-before-reconfigure, tuning, ack/retry/give-up, embedded-reply de-duplication,
+   frame parsing, spectrum-inversion tracking the live tuning, Auto-ATT gain compensation and
+   resend timing, USB framing sharing the same `Device`) plus three new tests against a real
+   `TcpListener` on localhost for `lan.rs` itself (connect failure, mid-stream resync, cross-thread
+   `stop()` unblocking a pending read without a full close) — 33/33 pass, `cargo clippy`: clean,
+   the three socket tests stable across repeated runs. Single channel, 16-bit is what's been
+   exercised (no radio, and no USB transport, exists yet to try 24-bit or dual-channel against);
+   the format-handling code itself is generic across both, per the plan's own crate-layout intent.
 3. **`Backend::Rsr200` registration**: config struct, `open_rsr200_source()`, settings tab —
    even a minimal one, to get real spectrum on screen and close the loop on whether everything
    above actually works against the real radio, not just against a protocol-level test harness.

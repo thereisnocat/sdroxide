@@ -60,10 +60,48 @@ One covariance matrix, computed over a whole processed block (or an operator-sel
 sub-band — see "open questions"), eigendecomposed once per block (or once on demand — see
 below), producing an instant complex weight. This slots into the *existing* `Diversity` struct
 almost exactly where its own doc comment already says the two current modes differ: "Both modes
-run the same adaptive filter and differ in one line at the end." A third `DiversityMode::
-Decorrelate` variant does the same job with a fundamentally different (non-adaptive, closed-form)
-computation instead — same `process(&mut self, main: &mut [Complex32], aux: &[Complex32])`
-call shape, same struct, no new public type needed for this half.
+run the same adaptive filter and differ in one line at the end." Same `process(&mut self, main:
+&mut [Complex32], aux: &[Complex32])` call shape, same struct, no new public type needed for the
+covariance solve itself.
+
+**Built** (branch `decorrelation`, `crates/sdroxide-dsp/src/diversity.rs`) as
+`DiversityAlgorithm::Decorrelate`, one deviation from the paragraph above worth recording: not a
+third `DiversityMode` variant. `Cancel`/`Combine` already say *what* the operator wants; the new
+enum is a second, orthogonal axis saying *how* the weight is found (`Adaptive`, the existing NLMS
+filter, or `Decorrelate`, the closed-form solve) — cheaper to reason about than a flat third mode,
+and it means a `Combine`-style decorrelated output was never a separate follow-up: both fall out
+of the one eigendecomposition (`covariance_eigen`) exactly as this document originally argued,
+selected by whichever `DiversityMode` is already set.
+
+**A real limitation found while testing, not anticipated above**: applying the raw null
+eigenvector to `Cancel` directly — `y = k0·main + k1·aux` with `(k0, k1)` jointly unit-norm — does
+*not* have the "a signal `aux` cannot hear survives untouched" guarantee the existing NLMS
+`Cancel` arithmetic has by construction. `k0` alone is a data-dependent value less than 1 in
+general (verified with `h = 0.6∠0.7°`, no wanted signal at all: `|k0| ≈ 0.86` even for a perfect
+null), so the raw eigenvector *attenuates* anything in `main` — wanted signal included — in
+proportion to how much of `main`'s own power it represents, since the solve has no way to tell
+"predictable from `aux`" apart from "just adds power." In the degenerate case where `aux` is
+silent, the null eigenvector for `Cancel` is `(0, 1)` — it zeroes `main` entirely, wanted signal
+and all, which the NLMS filter's own `Cancel` (`main − W·aux`, `W → 0` when `aux` is silent) does
+not do.
+
+The fix shipped: for `DiversityMode::Cancel` specifically, rescale the solved null eigenvector to
+unity gain on `main` before applying it — `main + (k1/k0)·aux`, the same null direction, just
+re-anchored so `main`'s own coefficient is exactly 1 regardless of what ends up multiplying `aux`.
+That restores the untouched-if-unpredictable guarantee (confirmed by test:
+`a_signal_only_the_main_aerial_hears_survives_decorrelation`), at the cost of being undefined
+when the solved `k0` is itself (numerically) zero — handled by falling back to outputting `aux`
+alone in that case, since there is no rescaling of `main` that reaches an answer when `main` is
+the channel being rejected. `DiversityMode::Combine` keeps the raw jointly-unit-norm eigenvector
+as solved — maximal-ratio combining has no "leave one branch alone" expectation to preserve, `main`
+included, so no rescale applies there.
+
+Practical upshot: `Decorrelate`+`Cancel` wants the noise being nulled to genuinely dominate
+`main`'s own power to behave like a proper null rather than a lossy blend — more so than the
+adaptive filter needs, since the adaptive filter's asymmetry (predict-and-subtract from a fixed
+`main`) has no equivalent notion of "how much of main's power is the wanted signal" to begin with.
+Worth surfacing in whatever UI exposes this — a `depth_db()`-style readout matters even more here
+than for the adaptive filter, per the "where this lands" section below.
 
 Two ways to expose it, worth deciding rather than defaulting to one:
 

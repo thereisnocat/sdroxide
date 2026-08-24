@@ -87,6 +87,95 @@ pub enum DiversityMode {
     Combine,
 }
 
+/// How the combining weight in [`DiversityMode`] gets computed. Orthogonal to
+/// the mode: both answer *what* the two channels should become, this answers
+/// *how* the weight that gets them there is found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiversityAlgorithm {
+    /// The adaptive filter documented at the top of this module: multi-tap,
+    /// so it can follow a delay as well as a gain and phase, at the cost of
+    /// having to converge toward the answer rather than landing on it.
+    #[default]
+    Adaptive,
+    /// A closed-form solve of the two channels' 2×2 covariance matrix — see
+    /// [`covariance_eigen`]. One complex weight, no delay compensation, but
+    /// no convergence to wait for either: [`DiversityMode::Cancel`] and
+    /// [`DiversityMode::Combine`] both fall out of the *same* solve (the
+    /// smaller and larger eigenvalue respectively), rather than needing two
+    /// different filters the way `Adaptive` effectively does. See
+    /// `DECORRELATION_PLAN.md` for the fuller case for this, including the
+    /// real-air numbers that motivated it.
+    Decorrelate,
+}
+
+/// One eigenpair of a 2×2 Hermitian covariance matrix: a unit-norm combining
+/// weight `(k0, k1)` — `y = k0·main + k1·aux` — together with the variance
+/// that combination produces. Unit norm is what makes that variance come out
+/// exactly equal to `eigenvalue`: [`Diversity::depth_db`]'s existing
+/// `10·log10(in/out)` needs no extra scaling to work for this weight too.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Eigenpair {
+    pub eigenvalue: f32,
+    pub k0: Complex32,
+    pub k1: Complex32,
+}
+
+/// Eigendecomposition of the 2×2 Hermitian matrix `[[raa, rab], [conj(rab),
+/// rbb]]` — `raa`/`rbb` the two channels' own (real, non-negative) mean
+/// powers, `rab` their cross-covariance `E[main·conj(aux)]`. Closed-form: a
+/// 2×2 Hermitian matrix's eigenvalues are always real, and are the roots of
+/// its characteristic polynomial, `((raa+rbb) ± √((raa−rbb)² + 4|rab|²)) / 2`;
+/// each eigenvector is `(rab, λ−raa)` (normalised), except when `rab` is
+/// (numerically) zero, where the channels are already uncorrelated and the
+/// eigenvectors are the trivial `(1,0)`/`(0,1)` basis.
+///
+/// Returns `(min, max)`: the smaller eigenvalue's pair first — the
+/// combination as decorrelated from itself as this pair of channels allows,
+/// i.e. the null — then the larger — the combination as correlated as
+/// possible, i.e. maximal-ratio combining.
+pub fn covariance_eigen(raa: f32, rbb: f32, rab: Complex32) -> (Eigenpair, Eigenpair) {
+    let sum = raa + rbb;
+    let disc = ((raa - rbb) * (raa - rbb) + 4.0 * rab.norm_sqr()).max(0.0).sqrt();
+    let lo = (sum - disc) * 0.5;
+    let hi = (sum + disc) * 0.5;
+
+    if rab.norm_sqr() < EPS {
+        // Already diagonal: the trivial basis vectors, ordered by which
+        // channel is quieter (that one's own axis is the null).
+        let (one, zero) = (Complex32::new(1.0, 0.0), Complex32::new(0.0, 0.0));
+        return if raa <= rbb {
+            (
+                Eigenpair { eigenvalue: lo, k0: one, k1: zero },
+                Eigenpair { eigenvalue: hi, k0: zero, k1: one },
+            )
+        } else {
+            (
+                Eigenpair { eigenvalue: lo, k0: zero, k1: one },
+                Eigenpair { eigenvalue: hi, k0: one, k1: zero },
+            )
+        };
+    }
+
+    let vec_for = |lambda: f32| -> (Complex32, Complex32) {
+        let k1 = lambda - raa;
+        let norm = (rab.norm_sqr() + k1 * k1).sqrt().max(EPS);
+        // `(rab, k1)` solves `M·v = λ·v` (verified against the characteristic
+        // polynomial in the module's own commit history). But the
+        // combination that actually *produces* variance `λ` is the Hermitian
+        // form `v^H·M·v`, i.e. `conj(v0)·main + conj(v1)·aux` -- so what gets
+        // returned here, meant to be applied directly as `k0·main + k1·aux`,
+        // is that conjugate: `k1` is already real (self-conjugate), only
+        // `k0` needs it.
+        (rab.conj() / norm, Complex32::new(k1 / norm, 0.0))
+    };
+    let (k0_lo, k1_lo) = vec_for(lo);
+    let (k0_hi, k1_hi) = vec_for(hi);
+    (
+        Eigenpair { eigenvalue: lo, k0: k0_lo, k1: k1_lo },
+        Eigenpair { eigenvalue: hi, k0: k0_hi, k1: k1_hi },
+    )
+}
+
 /// Slowest and fastest normalised step size the rate control reaches.
 ///
 /// The bottom is a filter that takes tens of seconds to settle and then sits
@@ -121,6 +210,7 @@ const POWER_DECAY: f32 = 0.9;
 
 pub struct Diversity {
     mode: DiversityMode,
+    algorithm: DiversityAlgorithm,
     mu: f32,
     frozen: bool,
     /// The filter, `w[0]` multiplying the newest auxiliary sample.
@@ -136,6 +226,13 @@ pub struct Diversity {
     pow: f32,
     in_pow: f32,
     out_pow: f32,
+    /// The last weight [`Self::process_decorrelate`] solved — held across
+    /// blocks so a frozen decorrelator has something to reuse, the same
+    /// meaning [`Self::frozen`] already has for `w` above.
+    decorr_k0: Complex32,
+    decorr_k1: Complex32,
+    /// Distinguishes "never solved yet" from a genuinely all-zero weight.
+    decorr_solved: bool,
 }
 
 impl Diversity {
@@ -145,6 +242,7 @@ impl Diversity {
         let taps = taps.clamp(1, Self::MAX_TAPS);
         Diversity {
             mode,
+            algorithm: DiversityAlgorithm::Adaptive,
             mu: Self::mu_for_rate(rate),
             frozen: false,
             w: vec![Complex32::new(0.0, 0.0); taps],
@@ -154,6 +252,9 @@ impl Diversity {
             pow: 0.0,
             in_pow: 0.0,
             out_pow: 0.0,
+            decorr_k0: Complex32::new(0.0, 0.0),
+            decorr_k1: Complex32::new(0.0, 0.0),
+            decorr_solved: false,
         }
     }
 
@@ -182,6 +283,18 @@ impl Diversity {
     /// the convergence they just watched happen.
     pub fn set_mode(&mut self, mode: DiversityMode) {
         self.mode = mode;
+    }
+
+    pub fn algorithm(&self) -> DiversityAlgorithm {
+        self.algorithm
+    }
+
+    /// Switching does *not* reset either state: `w` (the adaptive filter) and
+    /// `decorr_k0`/`decorr_k1` (the decorrelator) are unrelated
+    /// representations, so crossing between them just leaves whichever one
+    /// is not currently selected alone, unused, wherever it was.
+    pub fn set_algorithm(&mut self, algorithm: DiversityAlgorithm) {
+        self.algorithm = algorithm;
     }
 
     pub fn taps(&self) -> usize {
@@ -227,6 +340,21 @@ impl Diversity {
         self.pow = 0.0;
         self.in_pow = 0.0;
         self.out_pow = 0.0;
+        self.decorr_k0 = Complex32::new(0.0, 0.0);
+        self.decorr_k1 = Complex32::new(0.0, 0.0);
+        self.decorr_solved = false;
+    }
+
+    /// The weight [`Self::process_decorrelate`] last solved, `(k0, k1)` such
+    /// that `y = k0·main + k1·aux` — `None` when [`Self::algorithm`] is not
+    /// [`DiversityAlgorithm::Decorrelate`] or nothing has been solved yet.
+    /// What a hardware combiner (an RSR200's, say) would read to turn a
+    /// software solve into a command of its own.
+    pub fn decorrelated_weight(&self) -> Option<(Complex32, Complex32)> {
+        if self.algorithm != DiversityAlgorithm::Decorrelate || !self.decorr_solved {
+            return None;
+        }
+        Some((self.decorr_k0, self.decorr_k1))
     }
 
     /// How much quieter the output is than the main channel was, in dB.
@@ -253,6 +381,10 @@ impl Diversity {
     /// as it came, which is the right answer for a chain that has stalled: no
     /// cancellation beats cancellation against the wrong samples.
     pub fn process(&mut self, main: &mut [Complex32], aux: &[Complex32]) {
+        if self.algorithm == DiversityAlgorithm::Decorrelate {
+            self.process_decorrelate(main, aux);
+            return;
+        }
         let n = main.len().min(aux.len());
         if n == 0 {
             return;
@@ -333,6 +465,77 @@ impl Diversity {
         }
 
         self.pos = pos;
+        let inv = 1.0 / n as f32;
+        self.in_pow = self.in_pow * POWER_DECAY + in_acc * inv * (1.0 - POWER_DECAY);
+        self.out_pow = self.out_pow * POWER_DECAY + out_acc * inv * (1.0 - POWER_DECAY);
+    }
+
+    /// The [`DiversityAlgorithm::Decorrelate`] half of [`Self::process`].
+    /// Unlike the adaptive filter, there is nothing to converge: one
+    /// covariance matrix over the whole block, solved once, applied
+    /// uniformly to every sample in it. While [`Self::frozen`] the solve is
+    /// skipped and the last weight reused instead — the same meaning
+    /// freezing already has for the adaptive filter's `w`.
+    fn process_decorrelate(&mut self, main: &mut [Complex32], aux: &[Complex32]) {
+        let n = main.len().min(aux.len());
+        if n == 0 {
+            return;
+        }
+
+        if !self.frozen {
+            let mut raa = 0.0f32;
+            let mut rbb = 0.0f32;
+            let mut rab = Complex32::new(0.0, 0.0);
+            for i in 0..n {
+                raa += main[i].norm_sqr();
+                rbb += aux[i].norm_sqr();
+                rab += main[i] * aux[i].conj();
+            }
+            let inv = 1.0 / n as f32;
+            let (null, combine) = covariance_eigen(raa * inv, rbb * inv, rab * inv);
+            match self.mode {
+                DiversityMode::Cancel => {
+                    // The raw null eigenvector is jointly unit-norm across
+                    // *both* channels, so applied directly it scales `main`
+                    // itself by less than one -- unlike the adaptive filter's
+                    // `main - W*aux`, which leaves a signal `aux` cannot hear
+                    // untouched by construction. Rescaling to unity gain on
+                    // `main` (dividing through by `k0`, the same null
+                    // direction, just re-anchored) restores that guarantee:
+                    // `main`'s own coefficient is 1 regardless of what ends
+                    // up in `w`, so anything `aux` has no part of survives
+                    // exactly, the same promise this mode makes everywhere
+                    // else in the module.
+                    if null.k0.norm_sqr() > EPS {
+                        self.decorr_k0 = Complex32::new(1.0, 0.0);
+                        self.decorr_k1 = null.k1 / null.k0;
+                    } else {
+                        // `main` carries none of the null direction -- it is
+                        // the noisier channel, and `aux` alone already is
+                        // the answer no rescaling of `main` can reach.
+                        self.decorr_k0 = Complex32::new(0.0, 0.0);
+                        self.decorr_k1 = Complex32::new(1.0, 0.0);
+                    }
+                }
+                // Combining has no such expectation -- both branches are
+                // meant to be weighted by quality, `main` included -- so the
+                // raw maximal-ratio eigenvector is applied as solved.
+                DiversityMode::Combine => {
+                    self.decorr_k0 = combine.k0;
+                    self.decorr_k1 = combine.k1;
+                }
+            }
+            self.decorr_solved = true;
+        }
+
+        let mut in_acc = 0.0f32;
+        let mut out_acc = 0.0f32;
+        for i in 0..n {
+            let m = main[i];
+            main[i] = self.decorr_k0 * m + self.decorr_k1 * aux[i];
+            in_acc += m.norm_sqr();
+            out_acc += main[i].norm_sqr();
+        }
         let inv = 1.0 / n as f32;
         self.in_pow = self.in_pow * POWER_DECAY + in_acc * inv * (1.0 - POWER_DECAY);
         self.out_pow = self.out_pow * POWER_DECAY + out_acc * inv * (1.0 - POWER_DECAY);
@@ -508,5 +711,194 @@ mod tests {
         for i in 4..16 {
             assert_eq!(main[i], Complex32::new(i as f32, 0.0), "sample {i} was touched");
         }
+    }
+
+    // --- covariance_eigen: pure math, hand-computed answers -----------------
+
+    /// An already-diagonal matrix (uncorrelated channels): the trivial basis,
+    /// no division by `rab` involved at all.
+    #[test]
+    fn covariance_eigen_of_a_diagonal_matrix_is_the_trivial_basis() {
+        let (lo, hi) = covariance_eigen(4.0, 9.0, Complex32::new(0.0, 0.0));
+        assert!((lo.eigenvalue - 4.0).abs() < 1e-6);
+        assert_eq!(lo.k0, Complex32::new(1.0, 0.0));
+        assert_eq!(lo.k1, Complex32::new(0.0, 0.0));
+        assert!((hi.eigenvalue - 9.0).abs() < 1e-6);
+        assert_eq!(hi.k0, Complex32::new(0.0, 0.0));
+        assert_eq!(hi.k1, Complex32::new(1.0, 0.0));
+
+        // Same matrix, channels swapped: the null follows the quieter one.
+        let (lo2, _) = covariance_eigen(9.0, 4.0, Complex32::new(0.0, 0.0));
+        assert_eq!(lo2.k0, Complex32::new(0.0, 0.0));
+        assert_eq!(lo2.k1, Complex32::new(1.0, 0.0));
+    }
+
+    /// Two equal-power channels correlated by a real 0.5: hand-computable by
+    /// the textbook 2×2 formula, worked through in `DECORRELATION_PLAN.md`'s
+    /// own commit message. `Var[(A−B)/√2] = (Var A + Var B − 2·Re[Cov])/2 =
+    /// (1+1−1)/2 = 0.5`, which is exactly the smaller eigenvalue.
+    #[test]
+    fn covariance_eigen_matches_a_hand_computed_pair() {
+        let (lo, hi) = covariance_eigen(1.0, 1.0, Complex32::new(0.5, 0.0));
+        assert!((lo.eigenvalue - 0.5).abs() < 1e-6, "{lo:?}");
+        assert!((hi.eigenvalue - 1.5).abs() < 1e-6, "{hi:?}");
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((lo.k0 - Complex32::new(s, 0.0)).norm() < 1e-5, "{lo:?}");
+        assert!((lo.k1 - Complex32::new(-s, 0.0)).norm() < 1e-5, "{lo:?}");
+        assert!((hi.k0 - Complex32::new(s, 0.0)).norm() < 1e-5, "{hi:?}");
+        assert!((hi.k1 - Complex32::new(s, 0.0)).norm() < 1e-5, "{hi:?}");
+    }
+
+    /// General correctness check, not tied to one hand-worked case: for any
+    /// covariance matrix, applying eigenpair `(k0, k1)` to samples with that
+    /// exact covariance must reproduce its own eigenvalue as the output
+    /// power, and the two eigenvectors must be orthogonal (a property of any
+    /// Hermitian matrix's eigenvectors, for distinct eigenvalues).
+    #[test]
+    fn covariance_eigen_pairs_are_orthogonal_and_reproduce_their_eigenvalue() {
+        for &(raa, rbb, rab) in &[
+            (1.0f32, 1.0f32, Complex32::new(0.3, 0.4)),
+            (5.0, 1.0, Complex32::new(-0.2, 1.1)),
+            (0.2, 7.0, Complex32::new(0.9, -0.1)),
+        ] {
+            let (lo, hi) = covariance_eigen(raa, rbb, rab);
+            let inner = lo.k0.conj() * hi.k0 + lo.k1.conj() * hi.k1;
+            assert!(inner.norm() < 1e-5, "eigenvectors not orthogonal: {inner:?}");
+            for pair in [lo, hi] {
+                let unit = pair.k0.norm_sqr() + pair.k1.norm_sqr();
+                assert!((unit - 1.0).abs() < 1e-5, "not unit norm: {pair:?}");
+                // y = k0*A + k1*B has variance k0*conj(k0)*raa + k1*conj(k1)*rbb
+                //   + k0*conj(k1)*rab + conj(k0)*k1*conj(rab) -- which for the
+                // pre-conjugated (k0, k1) this function returns comes out to
+                // exactly the eigenvalue, by construction.
+                let var = pair.k0.norm_sqr() * raa
+                    + pair.k1.norm_sqr() * rbb
+                    + (pair.k0 * pair.k1.conj() * rab).re
+                    + (pair.k0.conj() * pair.k1 * rab.conj()).re;
+                assert!(
+                    (var - pair.eigenvalue).abs() < 1e-3,
+                    "eigenpair {pair:?} produced variance {var}, not its own eigenvalue"
+                );
+            }
+        }
+    }
+
+    // --- Diversity, DiversityAlgorithm::Decorrelate --------------------------
+
+    /// The case scalar decorrelation *can* handle: a noise source reaching
+    /// both aerials with a pure complex gain between them, no delay. Unlike
+    /// `a_delayed_and_rotated_noise_source_is_nulled`, there is no `delay`
+    /// here — a single weight has no way to equalise one, which is exactly
+    /// the trade this algorithm makes for not having to converge.
+    #[test]
+    fn a_pure_gain_noise_source_is_nulled_by_decorrelation() {
+        let n = 50_000;
+        let qrm = noise(n, 0x1234);
+        let h = Complex32::from_polar(0.6, 0.7);
+        let mut main: Vec<Complex32> = qrm.iter().map(|q| q * h).collect();
+
+        let mut d = Diversity::new(DiversityMode::Cancel, 1, 0.5);
+        d.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d.process(&mut main, &qrm);
+
+        let depth = d.depth_db().expect("Cancel mode reports a depth");
+        assert!(depth > 60.0, "only {depth:.1} dB of the noise source was removed");
+    }
+
+    /// A wanted signal the auxiliary aerial cannot hear survives the null,
+    /// same requirement as the adaptive filter's own version of this test.
+    #[test]
+    fn a_signal_only_the_main_aerial_hears_survives_decorrelation() {
+        let n = 50_000;
+        let qrm = noise(n, 0xbeef);
+        let h = Complex32::from_polar(0.8, -1.2);
+        let want: Vec<Complex32> = (0..n)
+            .map(|i| Complex32::from_polar(0.3, std::f32::consts::TAU * i as f32 / 12.0))
+            .collect();
+        let mut main: Vec<Complex32> = (0..n).map(|i| want[i] + qrm[i] * h).collect();
+
+        let mut d = Diversity::new(DiversityMode::Cancel, 1, 0.5);
+        d.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d.process(&mut main, &qrm);
+
+        let corr: Complex32 = (0..n)
+            .map(|i| main[i] * want[i].conj())
+            .fold(Complex32::new(0.0, 0.0), |a, b| a + b);
+        let kept = corr.norm() / (n as f32 * 0.3 * 0.3);
+        assert!(kept > 0.9, "the wanted tone came through at {kept:.3} of its amplitude");
+    }
+
+    /// Same measurement as `two_equal_branches_combine_for_about_three_decibels`,
+    /// checked against the decorrelator instead of the adaptive filter — the
+    /// claim in `DECORRELATION_PLAN.md` that `Cancel` and `Combine` are the
+    /// same solve read two different ways, not two different filters.
+    #[test]
+    fn two_equal_branches_decorrelate_combine_for_about_three_decibels() {
+        let n = 400_000;
+        let sig = noise(n, 0xa11ce);
+        let n1 = noise(n, 0x1111);
+        let n2 = noise(n, 0x2222);
+        let h1 = Complex32::from_polar(1.0, 0.3);
+        let h2 = Complex32::from_polar(1.0, -2.1);
+        let noise_amp = 0.316f32;
+        let mut main: Vec<Complex32> = (0..n).map(|i| sig[i] * h1 + n1[i] * noise_amp).collect();
+        let aux: Vec<Complex32> = (0..n).map(|i| sig[i] * h2 + n2[i] * noise_amp).collect();
+
+        let mut d = Diversity::new(DiversityMode::Combine, 1, 0.5);
+        d.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d.process(&mut main, &aux);
+
+        let refs: Vec<Complex32> = (0..n).map(|i| sig[i] * h1).collect();
+        let g: Complex32 = main
+            .iter()
+            .zip(&refs)
+            .map(|(o, r)| o * r.conj())
+            .fold(Complex32::new(0.0, 0.0), |a, b| a + b)
+            / refs.iter().map(|r| r.norm_sqr()).sum::<f32>();
+        let resid: Vec<Complex32> = main.iter().zip(&refs).map(|(o, r)| o - r * g).collect();
+        let snr_out = 10.0 * ((g.norm_sqr() * power(&refs)) / power(&resid)).log10();
+        let own: Vec<Complex32> = (0..n).map(|i| n1[i] * noise_amp).collect();
+        let snr_in = 10.0 * (power(&refs) / power(&own)).log10();
+        let gain = snr_out - snr_in;
+        assert!(
+            (2.5..3.5).contains(&gain),
+            "combining two equal branches gained {gain:.2} dB, not about 3"
+        );
+    }
+
+    /// Freezing holds the decorrelation weight, the same guarantee
+    /// `freezing_stops_the_filter_moving` makes for the adaptive filter.
+    #[test]
+    fn freezing_stops_the_decorrelation_weight_moving() {
+        let n = 20_000;
+        let qrm = noise(n, 7);
+        let mut main: Vec<Complex32> = qrm.iter().map(|q| q * 0.5).collect();
+        let mut d = Diversity::new(DiversityMode::Cancel, 1, 0.5);
+        d.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d.process(&mut main, &qrm);
+        let held = d.decorrelated_weight().expect("solved once");
+
+        d.set_frozen(true);
+        let other = noise(n, 99);
+        let mut main2: Vec<Complex32> = other.iter().map(|q| q * 3.0).collect();
+        d.process(&mut main2, &other);
+        assert_eq!(d.decorrelated_weight(), Some(held), "the weight moved while frozen");
+    }
+
+    /// `decorrelated_weight()` is honest about not having an answer yet, and
+    /// about which algorithm it belongs to.
+    #[test]
+    fn decorrelated_weight_is_none_until_solved_and_for_the_other_algorithm() {
+        let mut d = Diversity::new(DiversityMode::Cancel, 4, 0.5);
+        assert_eq!(d.decorrelated_weight(), None, "adaptive filter has no decorrelation weight");
+
+        d.set_algorithm(DiversityAlgorithm::Decorrelate);
+        assert_eq!(d.decorrelated_weight(), None, "nothing solved yet");
+
+        let n = 100;
+        let mut main: Vec<Complex32> = noise(n, 1);
+        let aux = noise(n, 2);
+        d.process(&mut main, &aux);
+        assert!(d.decorrelated_weight().is_some(), "a block was processed");
     }
 }

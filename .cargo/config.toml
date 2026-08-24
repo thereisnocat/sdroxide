@@ -13,3 +13,14 @@
 # wholesale rather than adding to it — CI deliberately sets none.
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "link-arg=-static-libgcc"]
+
+# audiopus_sys vendors Opus's own CMakeLists.txt, which declares
+# `cmake_minimum_required(2.8...)` — support for anything below 3.5 was
+# removed in CMake 4.0, so a from-scratch build on a machine with a current
+# CMake fails before it ever gets to compiling anything. This is CMake's own
+# documented escape hatch for exactly this situation (equivalent to passing
+# `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` on every invocation): it doesn't touch
+# Opus's actual build, just tells CMake to accept the old minimum-version
+# declaration rather than refuse to configure at all.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

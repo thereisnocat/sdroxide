@@ -711,6 +711,10 @@ impl SdroxideApp {
         // the library is absent. Offered unconditionally for that reason: a
         // greyed-out entry would not say what to install.
         iface_opts.push(sdroxide_types::Backend::Lime);
+        // Pure Rust over std::net, like TCI/IcomNet/RtlTcp above — no vendor
+        // SDK, no ExtIO — so it too is in every build variant. New, and not
+        // yet run against a real RSR200; `settings_rsr200_tab` says so.
+        iface_opts.push(sdroxide_types::Backend::Rsr200);
         // Case-folded so HackRF lands under H beside HPSDR rather than after
         // it, which a byte-order sort would do.
         iface_opts.sort_by_key(|b| b.label().to_ascii_lowercase());

@@ -105,6 +105,26 @@ const SERVICE_INTERVAL: Duration = Duration::from_millis(100);
 /// there is a real network between here and the radio.
 const SILENCE_BEFORE_DROP: Duration = Duration::from_secs(5);
 
+/// Whether the wire format is 2-channel: true for `Separate` and
+/// `HardwareDiversity`, false for `Single` and `Serial` alike (Serial folds
+/// both ADCs' time-interleaved samples into *one* stream, not two — see the
+/// comment on `run()`'s own `dual`/`op_mode` construction for the full
+/// reasoning). The single source of truth for this, used by both `spawn()`
+/// (ring sizing, the `Rsr200Handle::dual` flag `rsr200_source.rs` reads to
+/// decide whether to build a software combiner) and `run()` (the actual wire
+/// `Config`) — a real bug, found on real hardware, came from these two
+/// having drifted apart: `spawn()`'s own copy predated `Serial` and still
+/// read `channel_mode != Single`, which is true for `Serial` too, so it
+/// sized the ring for dual-channel framing and told `rsr200_source.rs` to
+/// read a second channel and combine it in software against a stream `run()`
+/// was correctly configuring as single-channel — a producer/consumer width
+/// mismatch that scrambled Serial mode's audio into a garbled, sped-up mess
+/// with dropouts, and spuriously logged "diversity is on" for a mode with
+/// nothing to combine.
+fn is_dual(channel_mode: Rsr200ChannelMode) -> bool {
+    matches!(channel_mode, Rsr200ChannelMode::Separate | Rsr200ChannelMode::HardwareDiversity)
+}
+
 /// Connect, configure, and start the stream thread. Blocks until the
 /// connection is up and the radio has been configured, or has failed — so a
 /// wrong address or a radio that is not listening comes back as an ordinary
@@ -121,7 +141,7 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
         last_rx_ms: AtomicU64::new(0),
         status: std::sync::Mutex::new(crate::protocol::Status::default()),
     });
-    let dual = cfg.channel_mode != Rsr200ChannelMode::Single;
+    let dual = is_dual(cfg.channel_mode);
     let channel_mode = cfg.channel_mode;
     let (rx_prod, rx_cons) = ring_for(cfg.sample_rate_hz(), if dual { QUAD } else { 2 });
 
@@ -209,7 +229,7 @@ fn run(
     // "Operating mode: Parallel (ADC1 + ADC2)") -- this step's fix is
     // simply to stop overriding that default with something invalid for
     // `Single` specifically.
-    let dual = matches!(cfg.channel_mode, Rsr200ChannelMode::Separate | Rsr200ChannelMode::HardwareDiversity);
+    let dual = is_dual(cfg.channel_mode);
     let op_mode = match cfg.channel_mode {
         Rsr200ChannelMode::Single => OpMode::ParallelAdd,
         Rsr200ChannelMode::Separate => OpMode::Independent,

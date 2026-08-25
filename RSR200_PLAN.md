@@ -691,12 +691,50 @@ separately and shipped each as it landed):
 
    Both fixes verified by `cargo test -p sdroxide-rsr200` (38/38 still pass) and `cargo build`/
    `cargo clippy` across every crate this step touched (`sdroxide-types`, `sdroxide-rsr200`,
-   `sdroxide-ui`, `sdroxide`, `sdroxide-proto`) — no new warnings introduced. **Not yet done**: no
-   standalone real-hardware probe example exists yet for Serial mode, Auto-ATT, VHF/preamp
+   `sdroxide-ui`, `sdroxide`, `sdroxide-proto`) — no new warnings introduced. At the time, no
+   standalone real-hardware probe example existed yet for Serial mode, Auto-ATT, VHF/preamp
    switching, or swap-channels, matching the `usb_status_probe.rs`/`usb_hwdiv_probe.rs`/
    `usb_dual_probe.rs` precedent every step from 5 onward set — this step shipped on protocol-level
    confidence (the underlying commands were already hardware-verified at step 1) and code review
-   against the DP, not a fresh real-hardware run of its own new surface area.
+   against the DP, not a fresh real-hardware run of its own new surface area. **That gap mattered**
+   — see the real bug found the next day, below.
+
+   **A third real bug, found the next day (2026-08-25) via Ralph's own real-hardware test of
+   exactly the untested surface area flagged above.** Serial mode played back "at double speed
+   with gaps in the spaces left" — audibly scrambled, not subtly wrong. Root cause: `stream.rs`
+   had **two independently-computed `dual` flags that had drifted apart**. `run()`'s (fixed
+   earlier in this same step) correctly excludes `Serial` from the dual-channel wire shape. But
+   `spawn()` — which decides the ring buffer's width and sets `Rsr200Handle::dual`, the flag
+   `rsr200_source.rs` reads to decide whether to read a second channel and build a software
+   `Diversity` combiner — still had its original, pre-Serial-mode line: `cfg.channel_mode !=
+   Rsr200ChannelMode::Single`. Since `Serial != Single`, that's `true` for Serial mode too. The
+   result: the radio was correctly told single-channel, but the app-side ring was sized for
+   dual-channel (`QUAD`-wide) framing and `rsr200_source.rs` spuriously built a software combiner
+   and tried to read a second channel that was never on the wire — a producer/consumer width
+   mismatch that scrambled the sample stream, audible as sped-up, gappy audio, and visible in the
+   log as a spurious `"diversity is on: combining"` line for a mode with nothing to combine.
+   Fixed by extracting one `is_dual()` function, used by both `spawn()` and `run()`, so this
+   specific class of the two copies drifting apart again is no longer possible. Diagnosed by
+   relaunching the app from a terminal (it had been running as a double-clicked, log-less `.app`
+   bundle) to capture `tracing` output live, which showed the spurious combiner line immediately.
+   Confirmed fixed the same session: Ralph reports Serial mode audio "sounds normal now."
+   `cargo build`/`cargo test -p sdroxide-rsr200` (38/38) and `cargo clippy` clean after the fix.
+
+   **A fourth item, tested the same day, not a bug**: "Solve for hardware diversity" on a real
+   local station (÷64, the narrowest available span) reported `"not representable in the radio's
+   0.001..8x range"` — the covariance solve found essentially zero correlation between the two
+   antennas for that signal, which the eigendecomposition math confirms is a real, meaningful
+   answer (see `covariance_eigen`'s degenerate-fallback case), not a software fault. Two genuinely
+   separate antennas, each with their own local noise, are not guaranteed to show a usable
+   correlation for every signal — that is an antenna-siting question, not one code can solve.
+   Because the solve failed, the Hardware diversity fields were never updated from their saved
+   default (unity, 1.0/0°) when Ralph then switched into Hardware Diversity mode, which explains
+   the "no signal change" report: switching into an unsolved, unity weight is a near no-op by
+   construction. sdroxide's own hardware-diversity code was checked against the two real bugs the
+   SDR++ sibling implementation hit building the identical feature (`format.channels` wrongly
+   special-cased to 1 for hardware diversity; a GUI lock-then-join deadlock, not applicable here)
+   and does not have either — `format.channels` is already unconditionally 2 for `HardwareDiversity`
+   via the same `is_dual()` fixed above, and channel A is already the one read as output.
 
 ## 8. Open questions
 

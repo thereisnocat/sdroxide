@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::ffi;
+use crate::trace::Trace;
 
 /// What the board says it is.
 #[derive(Debug, Clone, Default)]
@@ -27,6 +28,12 @@ pub struct DevCtl {
     api: Arc<ffi::Api>,
     dev: ffi::Device,
     channel: usize,
+    /// The session's diagnostic trace. Every state-changing call here writes
+    /// one line into it, which is what the settings panel's **Copy diagnostic
+    /// report** button hands to an issue: this backend cannot be desk-checked
+    /// against hardware, so what was asked for and what LimeSuite said has to
+    /// survive the session that did it.
+    trace: Trace,
 }
 
 // The pointer is only ever reachable through `&mut self`, and the type is not
@@ -34,8 +41,19 @@ pub struct DevCtl {
 unsafe impl Send for DevCtl {}
 
 impl DevCtl {
-    pub(crate) fn new(api: Arc<ffi::Api>, dev: ffi::Device, channel: usize) -> DevCtl {
-        DevCtl { api, dev, channel }
+    pub(crate) fn new(
+        api: Arc<ffi::Api>,
+        dev: ffi::Device,
+        channel: usize,
+        trace: Trace,
+    ) -> DevCtl {
+        DevCtl { api, dev, channel, trace }
+    }
+
+    /// The session's trace, for the callers that record something this type
+    /// did not do itself — the streams, and the LimeRFE's board link.
+    pub(crate) fn trace(&self) -> &Trace {
+        &self.trace
     }
 
     pub(crate) fn api(&self) -> &Arc<ffi::Api> {
@@ -52,15 +70,46 @@ impl DevCtl {
 
     /// Every call here funnels through this: LimeSuite reports failure as `-1`
     /// and puts the reason somewhere else entirely.
+    ///
+    /// A failure is traced whatever the call was, including the read-back ones
+    /// — a refusal is always worth a line. A *success* is traced only by
+    /// [`Self::checked`], because the periodic reads would otherwise fill the
+    /// ring and push the interesting half of the session out of it.
     fn check(&self, call: &'static str, rc: std::ffi::c_int) -> Result<()> {
-        if rc == ffi::OK { Ok(()) } else { Err(Error::api(call, self.api.err_text())) }
+        if rc == ffi::OK {
+            return Ok(());
+        }
+        let e = Error::api(call, self.api.err_text());
+        self.trace.call(call, "", format!("FAILED: {e}"));
+        Err(e)
+    }
+
+    /// The same, for a call that changes the state of the chip: traced whether
+    /// it worked or not, with what it was asked for.
+    ///
+    /// "It answered every command and passed no signal" is the report this
+    /// backend gets, and it is only answerable from a record of what the
+    /// commands were.
+    fn checked(
+        &self,
+        call: &'static str,
+        detail: impl AsRef<str>,
+        rc: std::ffi::c_int,
+    ) -> Result<()> {
+        if rc == ffi::OK {
+            self.trace.call(call, detail, "ok");
+            return Ok(());
+        }
+        let e = Error::api(call, self.api.err_text());
+        self.trace.call(call, detail, format!("FAILED: {e}"));
+        Err(e)
     }
 
     /// Put the chip into the state LimeSuite calls "ready for operation". Must
     /// come before anything else — the datasheet default is not it.
     pub fn init(&mut self) -> Result<()> {
         let rc = unsafe { (self.api.init)(self.dev) };
-        self.check("LMS_Init", rc)
+        self.checked("LMS_Init", "", rc)
     }
 
     pub fn num_channels(&self, tx: bool) -> usize {
@@ -78,7 +127,11 @@ impl DevCtl {
     /// same call against [`Self::channel`].
     pub fn enable_channel_on(&mut self, tx: bool, channel: usize, on: bool) -> Result<()> {
         let rc = unsafe { (self.api.enable_channel)(self.dev, tx, channel, on) };
-        self.check("LMS_EnableChannel", rc)
+        self.checked(
+            "LMS_EnableChannel",
+            format!("{} ch{} {}", dir(tx), channel + 1, if on { "on" } else { "off" }),
+            rc,
+        )
     }
 
     /// Set the host sample rate for every channel at once — LimeSuite has no
@@ -86,7 +139,11 @@ impl DevCtl {
     /// tree anyway.
     pub fn set_sample_rate(&mut self, rate: f64, oversample: u8) -> Result<()> {
         let rc = unsafe { (self.api.set_sample_rate)(self.dev, rate, oversample as usize) };
-        self.check("LMS_SetSampleRate", rc)
+        self.checked(
+            "LMS_SetSampleRate",
+            format!("{:.4} Msps, oversample {oversample}", rate / 1e6),
+            rc,
+        )
     }
 
     /// The rate actually in force, host side. Worth reading back rather than
@@ -109,7 +166,7 @@ impl DevCtl {
 
     pub fn set_lo(&mut self, tx: bool, hz: f64) -> Result<()> {
         let rc = unsafe { (self.api.set_lo_frequency)(self.dev, tx, self.channel, hz) };
-        self.check("LMS_SetLOFrequency", rc)
+        self.checked("LMS_SetLOFrequency", format!("{} {:.6} MHz", dir(tx), hz / 1e6), rc)
     }
 
     pub fn lo(&self, tx: bool) -> Result<f64> {
@@ -186,7 +243,11 @@ impl DevCtl {
                 Error::api("LMS_SetAntenna", format!("this board has no port called {name:?}"))
             })?;
         let rc = unsafe { (self.api.set_antenna)(self.dev, tx, channel, idx) };
-        self.check("LMS_SetAntenna", rc)
+        self.checked(
+            "LMS_SetAntenna",
+            format!("{} ch{} {} (index {idx})", dir(tx), channel + 1, name.trim()),
+            rc,
+        )
     }
 
     pub fn antenna(&self, tx: bool) -> String {
@@ -219,7 +280,7 @@ impl DevCtl {
             .clamp(sdroxide_types::LimeConfig::GAIN_MIN_DB, sdroxide_types::LimeConfig::GAIN_MAX_DB)
             as u32;
         let rc = unsafe { (self.api.set_gain_db)(self.dev, tx, channel, g) };
-        self.check("LMS_SetGaindB", rc)
+        self.checked("LMS_SetGaindB", format!("{} ch{} {g} dB", dir(tx), channel + 1), rc)
     }
 
     pub fn gain_db(&self, tx: bool) -> Option<f64> {
@@ -238,7 +299,11 @@ impl DevCtl {
 
     pub fn set_lpf_bw_on(&mut self, tx: bool, channel: usize, hz: f64) -> Result<()> {
         let rc = unsafe { (self.api.set_lpf_bw)(self.dev, tx, channel, hz) };
-        self.check("LMS_SetLPFBW", rc)
+        self.checked(
+            "LMS_SetLPFBW",
+            format!("{} ch{} {:.3} MHz", dir(tx), channel + 1, hz / 1e6),
+            rc,
+        )
     }
 
     pub fn lpf_range(&self, tx: bool) -> Result<ffi::Range> {
@@ -256,7 +321,11 @@ impl DevCtl {
 
     pub fn calibrate_on(&mut self, tx: bool, channel: usize, bw_hz: f64) -> Result<()> {
         let rc = unsafe { (self.api.calibrate)(self.dev, tx, channel, bw_hz, ffi::CAL_FLAGS_NONE) };
-        self.check("LMS_Calibrate", rc)
+        self.checked(
+            "LMS_Calibrate",
+            format!("{} ch{} bw {:.3} MHz", dir(tx), channel + 1, bw_hz / 1e6),
+            rc,
+        )
     }
 
     pub fn chip_temp_c(&self) -> Option<f64> {
@@ -303,6 +372,12 @@ impl Drop for DevCtl {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// The word for a direction, so a traced line reads the way the operator
+/// thinks rather than as `tx: true`.
+fn dir(tx: bool) -> &'static str {
+    if tx { "transmit" } else { "receive" }
 }
 
 /// The analog filter width to use for a given sample rate, when the operator

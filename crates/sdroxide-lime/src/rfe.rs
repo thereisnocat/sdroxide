@@ -88,6 +88,24 @@ impl BoardTransport {
             Err(RfeError::from_board(rc as i8 as u8))
         }
     }
+
+    /// Put one LimeRFE transaction in the radio's diagnostic report.
+    ///
+    /// The front end is the half of this path that has no report of its own on
+    /// the board link — it *is* the radio, electrically — and "the amplifier
+    /// answered and passed nothing" is not answerable without knowing which
+    /// channel and which connector it was told to use.
+    fn record(&self, call: &'static str, detail: impl AsRef<str>, out: &RfeResult<()>) {
+        let dev = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
+        dev.trace().call(
+            call,
+            detail,
+            match out {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("FAILED: {e}"),
+            },
+        );
+    }
 }
 
 impl RfeTransport for BoardTransport {
@@ -124,7 +142,20 @@ impl RfeTransport for BoardTransport {
             let _dev = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
             unsafe { f(self.rfe, st) }
         };
-        self.check(rc)
+        let out = self.check(rc);
+        self.record(
+            "RFE_ConfigureState",
+            format!(
+                "{} in on {}, {} out on {}, {}",
+                state.channel_rx.label(),
+                state.port_rx.label(),
+                state.channel_tx.label(),
+                state.port_tx.label(),
+                state.mode.label()
+            ),
+            &out,
+        );
+        out
     }
 
     fn set_mode(&mut self, mode: RfeMode) -> RfeResult<()> {
@@ -133,7 +164,9 @@ impl RfeTransport for BoardTransport {
             let _dev = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
             unsafe { f(self.rfe, std::ffi::c_int::from(mode.code())) }
         };
-        self.check(rc)
+        let out = self.check(rc);
+        self.record("RFE_Mode", mode.label(), &out);
+        out
     }
 
     fn set_fan(&mut self, on: bool) -> RfeResult<()> {
@@ -142,7 +175,9 @@ impl RfeTransport for BoardTransport {
             let _dev = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
             unsafe { f(self.rfe, std::ffi::c_int::from(on)) }
         };
-        self.check(rc)
+        let out = self.check(rc);
+        self.record("RFE_Fan", if on { "on" } else { "off" }, &out);
+        out
     }
 
     fn round_trip(&self) -> Duration {

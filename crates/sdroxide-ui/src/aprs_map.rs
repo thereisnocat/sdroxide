@@ -23,7 +23,7 @@ use sdroxide_types::{AprsEntryKind, AprsPosition, AprsStation};
 
 use crate::aprs_icons::AprsIcons;
 use crate::theme;
-use crate::widgets::worldmap::{MapView, alpha, draw_land, interact, wrap180};
+use crate::widgets::worldmap::{MapView, alpha, draw_base, interact, wrap180};
 
 /// Below this height the map is not worth drawing.
 pub const MIN_HEIGHT: f32 = 90.0;
@@ -159,7 +159,7 @@ pub fn show(
     let lat_span = lon_span * aspect;
     let manual = view.manual;
 
-    let dot_r = draw_land(&p, rect, clat, clon, lon_span, lat_span, map.land);
+    let dot_r = draw_base(&p, rect, clat, clon, lon_span, lat_span, map);
 
     let project = |lat: f64, lon: f64| {
         let dlon = wrap180(lon - clon);

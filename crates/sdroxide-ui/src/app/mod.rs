@@ -903,6 +903,9 @@ impl SdroxideApp {
         if let Some(rs) = &wgpu_render_state {
             waterfall_gpu::init(rs);
         }
+        // The world under the flat maps, decoded off the UI thread while the
+        // window is still coming up (see `crate::basemap`).
+        crate::basemap::prime();
         // Radio 0 keeps the historical key, so an existing installation keeps
         // its saved layout.
         let view_key = if radio_id == 0 { "view".to_string() } else { format!("view:{radio_id}") };

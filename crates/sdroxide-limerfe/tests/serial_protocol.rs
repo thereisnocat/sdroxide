@@ -223,3 +223,39 @@ fn a_silent_port_gives_up_rather_than_hanging() {
     // Ten attempts, 200 ms apart, plus the reads between them.
     assert!(started.elapsed() < Duration::from_secs(15), "gave up in {:?}", started.elapsed());
 }
+
+/// An over, from the driver's own thread, ends up in the diagnostic report.
+///
+/// The field report this answers is "I receive on every band but the power
+/// meter never moves", and the only way to act on it is to know what the front
+/// end was told: which channel, which connector, and which way the relays went
+/// at key-down. On the board's own serial cable none of that passes through
+/// LimeSuite, so this record is the only one there is.
+#[test]
+fn what_the_board_was_told_survives_for_a_report() {
+    let fake = Fake::start();
+    let transport = SerialTransport::open(&fake.path).expect("the handshake completes");
+    let cfg = sdroxide_types::LimeRfeConfig {
+        link: sdroxide_types::RfeLink::Serial,
+        serial: sdroxide_types::SerialConfig { path: fake.path.clone(), ..Default::default() },
+        ..Default::default()
+    };
+    let handle = sdroxide_limerfe::spawn(Box::new(transport), cfg);
+    handle.set_rx_hz(145.5e6);
+    handle.set_tx_hz(145.5e6);
+    // The opening configuration goes out at once; the relays wait for the
+    // key-down. Both are one short transaction on this link.
+    std::thread::sleep(Duration::from_millis(400));
+    handle.set_keyed(true);
+    std::thread::sleep(Duration::from_millis(400));
+    handle.set_keyed(false);
+    std::thread::sleep(Duration::from_millis(400));
+
+    let report = sdroxide_limerfe::diagnostics().expect("a board has been driven");
+    assert!(report.contains("firmware 4"), "the link identifies itself:\n{report}");
+    assert!(report.contains("2 m (140 – 150 MHz)"), "the band it resolved to:\n{report}");
+    assert!(report.contains("J4 (TX)"), "the connector transmit leaves by:\n{report}");
+    assert!(report.contains("relays Transmit"), "and the key-down itself:\n{report}");
+    assert!(report.contains("keyed"), "with the operator's request beside it:\n{report}");
+    drop(handle);
+}

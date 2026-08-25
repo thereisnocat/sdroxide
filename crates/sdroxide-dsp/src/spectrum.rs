@@ -31,6 +31,13 @@ pub struct SpectrumAnalyzer {
     seq: u32,
     /// Hide the hardware DC/LO-leakage spike in emitted frames.
     dc_suppress: bool,
+    /// Transforms folded into the average since this analyser was built.
+    ///
+    /// The rate this climbs at is the *real* update rate of anything drawn
+    /// from it: emitted frames carry a fresh `seq` whether or not a new
+    /// transform landed between them, so a lane can publish at 30 fps while
+    /// showing the same numbers for a tenth of a second. Diagnostic only.
+    transforms: u64,
 }
 
 impl SpectrumAnalyzer {
@@ -75,6 +82,7 @@ impl SpectrumAnalyzer {
             primed: false,
             peak_abs: 0.0,
             seq: 0,
+            transforms: 0,
             dc_suppress: true,
         };
         analyzer.set_avg_tc(avg_tc_secs, sample_rate);
@@ -138,8 +146,15 @@ impl SpectrumAnalyzer {
                 }
                 self.primed = true;
             }
+            self.transforms = self.transforms.wrapping_add(1);
             self.pending.drain(..self.hop);
         }
+    }
+
+    /// Transforms folded in since this analyser was built — see
+    /// [`Self::transforms`](#structfield.transforms).
+    pub fn transforms(&self) -> u64 {
+        self.transforms
     }
 
     /// Peak input magnitude (dBFS) since the last call; resets on read.

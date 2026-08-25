@@ -6609,6 +6609,22 @@ pub(in crate::app) fn settings_lime_tab(
             }
             ui.end_row();
         });
+        // The drive default is the bottom of the range, on purpose — an armed
+        // transmitter should not be able to surprise anybody. Left there it is
+        // a radio that keys, reports no error and puts out microwatts, which
+        // reads downstream as a transmitter that does not work at all.
+        if cfg.lime.tx_gain_db < LimeConfig::LOW_DRIVE_DB {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Transmit gain is {:.0} dB, at the bottom of its range — a few microwatts \
+                     out of the board, which will read as nothing on a power meter whatever is \
+                     downstream of it. That is the default so that an armed transmitter cannot \
+                     surprise you; raise it before you key.",
+                    cfg.lime.tx_gain_db
+                ))
+                .color(egui::Color32::from_rgb(220, 170, 70)),
+            );
+        }
         ui.label(
             egui::RichText::new(
                 "A LimeSDR transmits from about 100 kHz to 3.8 GHz with no filtering of its \
@@ -6747,6 +6763,13 @@ pub(in crate::app) fn settings_lime_tab(
         if let Some(note) = cfg.lime.rfe.switching_note() {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(note).color(egui::Color32::from_rgb(220, 170, 70)));
+        }
+        // Not amber: two connectors is what the board is for, and the default.
+        // It is said at all because with one antenna it is also the quietest
+        // way to have a transmitter that reaches nothing.
+        if let Some(note) = cfg.lime.rfe.connector_note() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(note).weak());
         }
         if let Some(refusal) = cfg.lime.rfe.tx_refusal() {
             ui.add_space(4.0);

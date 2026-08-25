@@ -54,9 +54,9 @@ impl Trace {
     }
 
     /// What this session is talking to — the library version and the board.
-    pub fn set_identity(&self, identity: &str) {
+    pub fn set_identity(&self, identity: impl AsRef<str>) {
         let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        i.identity = identity.to_string();
+        i.identity = identity.as_ref().to_string();
     }
 
     /// Record one library call.

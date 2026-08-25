@@ -13,6 +13,8 @@
 
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, RenderState, ScreenDescriptor, wgpu};
 
+use crate::basemap::{BORDER_PNG, CITY_PNG, LAND_PNG, RIVER_PNG};
+
 use super::mesh;
 use super::scene::{DrawData, Flashes, Globals, LineInst, Prim, Scene, SpriteInst};
 
@@ -96,6 +98,8 @@ pub struct SolarResources {
 
     land_view: wgpu::TextureView,
     border_view: wgpu::TextureView,
+    river_view: wgpu::TextureView,
+    city_view: wgpu::TextureView,
     body_map_view: wgpu::TextureView,
     sun_tex: wgpu::Texture,
     sun_view: wgpu::TextureView,
@@ -220,6 +224,8 @@ fn build(rs: &RenderState) -> SolarResources {
             tex_entry(7),
             uniform_entry(8, false, std::mem::size_of::<Flashes>() as u64),
             tex_entry(9),
+            tex_entry(10),
+            tex_entry(11),
         ],
     });
     let draw_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -526,8 +532,13 @@ fn build(rs: &RenderState) -> SolarResources {
 
     // ── Textures ────────────────────────────────────────────────────────────
     let map_dim = MAX_MAP_DIM.min(limits.max_texture_dimension_2d);
+    // Coastline and borders are the map; rivers and the urban areas the night
+    // side is lit by are detail on it, and give first when the budget is tight.
     let land = upload_map(device, &rs.queue, "solar-land-mask", LAND_PNG, map_dim);
     let border_view = upload_map(device, &rs.queue, "solar-borders", BORDER_PNG, map_dim);
+    let detail_dim = MAX_DETAIL_DIM.min(limits.max_texture_dimension_2d);
+    let river_view = upload_map(device, &rs.queue, "solar-rivers", RIVER_PNG, detail_dim);
+    let city_view = upload_map(device, &rs.queue, "solar-cities", CITY_PNG, detail_dim);
     let body_maps = upload_body_maps(device, &rs.queue);
     let sun_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("solar-sun-tex"),
@@ -641,6 +652,8 @@ fn build(rs: &RenderState) -> SolarResources {
         &sun_view,
         &aurora_view,
         &border_view,
+        &river_view,
+        &city_view,
         &body_maps,
         &cloud_view,
         &prop_view,
@@ -692,6 +705,8 @@ fn build(rs: &RenderState) -> SolarResources {
         star_count: stars.len() as u32,
         land_view: land,
         border_view,
+        river_view,
+        city_view,
         body_map_view: body_maps,
         sun_tex,
         sun_view,
@@ -723,6 +738,8 @@ fn make_scene_bg(
     sun: &wgpu::TextureView,
     aurora: &wgpu::TextureView,
     borders: &wgpu::TextureView,
+    rivers: &wgpu::TextureView,
+    cities: &wgpu::TextureView,
     body_maps: &wgpu::TextureView,
     clouds: &wgpu::TextureView,
     prop: &wgpu::TextureView,
@@ -755,6 +772,14 @@ fn make_scene_bg(
             },
             wgpu::BindGroupEntry { binding: 8, resource: flashes.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(prop) },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(rivers),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(cities),
+            },
         ],
     })
 }
@@ -777,24 +802,6 @@ fn make_draw_bg(
         }],
     })
 }
-
-/// The globe's coastline and border maps.
-///
-/// Both are equirectangular and rasterised from Natural Earth 1:10m by
-/// `assets/earth/make_earth_maps.py`, sharing the flat FT8 map's coordinate
-/// convention exactly (x = −180°…180°, y = +90°…−90°) so a QTH marker lands on
-/// the same shoreline in both views.
-///
-/// Land is 8192×4096 (1/22.75°, ~4.9 km) and holds *coverage* rather than a
-/// 1-bit mask: the fraction of each texel that is land. The shader strokes the
-/// shoreline along that field's ½ contour, which bilinear filtering places to a
-/// fraction of a texel — so the coast stays a clean curve when the camera flies
-/// down to it, instead of the texel staircase a thresholded mask would give.
-/// Borders are 4320×2160 (1/12°): they are one-texel lines rather than a filled
-/// region, so there is no contour to sharpen and the extra grid would only cost
-/// memory.
-const LAND_PNG: &[u8] = include_bytes!("../../assets/earth/land.png");
-const BORDER_PNG: &[u8] = include_bytes!("../../assets/earth/borders.png");
 
 /// The bodies drawn from real imagery rather than procedurally, in the layer
 /// order the shader's `STYLE`/`MAP_*` constants use. All 2048×1024
@@ -828,6 +835,17 @@ const BODY_MAPS: [(&str, &[u8]); 4] = [
 const MAX_MAP_DIM: u32 = 8192;
 #[cfg(target_arch = "wasm32")]
 const MAX_MAP_DIM: u32 = 2160;
+
+/// The same, for the rivers and the city lights.
+///
+/// Natively they are structure like everything else and go up whole. In the
+/// browser they are the first thing to give: they are detail *on* a globe that
+/// is rarely more than a panel wide there, and at their own 4320 the pair would
+/// cost a tab as much again as the coastline and the borders together.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_DETAIL_DIM: u32 = 4320;
+#[cfg(target_arch = "wasm32")]
+const MAX_DETAIL_DIM: u32 = 1080;
 
 /// Decode one of those maps into an R8 texture with a full mip chain, with the
 /// base level no larger than `max_dim`.
@@ -1156,6 +1174,8 @@ impl SolarResources {
                 &self.sun_view,
                 &self.aurora_view,
                 &self.border_view,
+                &self.river_view,
+                &self.city_view,
                 &self.body_map_view,
                 &self.cloud_view,
                 &self.prop_view,

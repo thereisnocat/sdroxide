@@ -21,6 +21,8 @@
 
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, RenderState, ScreenDescriptor, wgpu};
 
+use crate::basemap::{BORDER_PNG, LAND_PNG};
+
 /// Live contacts at once. Also the array length in the shader — the two must
 /// agree, which the test at the bottom of this file checks.
 pub const MAX_ARCS: usize = 16;
@@ -175,7 +177,7 @@ impl Sky {
         for _ in 0..64 {
             let lon = self.range(-180.0, 180.0);
             let lat = self.range(-56.0, 68.0);
-            if sdroxide_types::is_land(lon as f64, lat as f64) {
+            if crate::basemap::is_land(lon as f64, lat as f64) {
                 return ecef(lon, lat);
             }
         }
@@ -296,7 +298,7 @@ fn norm(v: [f32; 3]) -> [f32; 3] {
 
 /// Degrees of longitude and latitude to the unit vector the maps are indexed
 /// by: +X at (0°N, 0°E), +Z at the north pole — the convention
-/// `solar3d::mesh::sphere` builds and `worldmask` is rasterised in.
+/// `solar3d::mesh::sphere` builds and `crate::basemap` is rasterised in.
 fn ecef(lon_deg: f32, lat_deg: f32) -> [f32; 3] {
     let (lon, lat) = (lon_deg.to_radians(), lat_deg.to_radians());
     [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
@@ -649,9 +651,6 @@ impl CallbackTrait for GlobeCallback {
 
 // ── Map upload ───────────────────────────────────────────────────────────────
 
-const LAND_PNG: &[u8] = include_bytes!("../assets/earth/land.png");
-const BORDER_PNG: &[u8] = include_bytes!("../assets/earth/borders.png");
-
 /// Decode a map, reduce it to `max_dim`, and upload it with a mip chain.
 ///
 /// The reduction is the point: the source is 8192×4096, this globe is blurred,
@@ -791,7 +790,7 @@ mod tests {
                 let lat = p[2].clamp(-1.0, 1.0).asin().to_degrees();
                 let lon = p[1].atan2(p[0]).to_degrees();
                 assert!(
-                    sdroxide_types::is_land(lon as f64, lat as f64),
+                    crate::basemap::is_land(lon as f64, lat as f64),
                     "station at {lon:.1},{lat:.1} is in the sea"
                 );
             }

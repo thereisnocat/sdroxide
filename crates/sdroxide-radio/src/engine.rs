@@ -2467,6 +2467,17 @@ fn engine_thread(
     let mut dbuf: Vec<Complex32> = Vec::new();
     let mut next_frame = Instant::now();
     let mut next_meters = Instant::now();
+    // Panadapter rate diagnostics. Three numbers, because they fail
+    // differently: samples/s says whether the front end is delivering, fft/s
+    // is the rate the picture actually changes at, and frames/s is only the
+    // rate it is *published* at — a frame carries a fresh `seq` whether or not
+    // a transform landed behind it, so the two part company on any slow lane.
+    // A 24 kHz front end through a 4096-point window hopped by half fills one
+    // every 85 ms, which is 11.7 fft/s against 30 frames/s.
+    let mut lane_at = Instant::now();
+    let mut lane_samples: u64 = 0;
+    let mut lane_frames: u64 = 0;
+    let mut lane_ffts = 0u64;
     let mut next_rds = Instant::now();
     let mut next_drm = Instant::now();
     let mut next_session = Instant::now() + SESSION_SAVE_INTERVAL;
@@ -2583,8 +2594,12 @@ fn engine_thread(
         } else {
             match engine.source.read(&mut buf) {
                 Ok(0) => continue, // timeout
-                Ok(n) if engine.audio_mode => engine.run_audio_mode(&buf[..n]),
+                Ok(n) if engine.audio_mode => {
+                    lane_samples += n as u64;
+                    engine.run_audio_mode(&buf[..n]);
+                }
                 Ok(n) => {
+                    lane_samples += n as u64;
                     // Blanking comes first, at the device rate: an impulse is
                     // only an impulse before the anti-alias filter smears it
                     // over a filter length, and after decimation there would be
@@ -2612,6 +2627,34 @@ fn engine_thread(
         if now >= next_frame {
             next_frame = now + Duration::from_secs_f64(1.0 / engine.cfg.fps.max(1) as f64);
             spec_in.write(engine.make_spectrum_frame());
+            lane_frames += 1;
+        }
+        // Once a second, and only where somebody asked for it: this is the
+        // measurement that tells a starved front end from a lane that is
+        // simply running at its own rate.
+        if now.duration_since(lane_at) >= Duration::from_secs(1) {
+            let secs = now.duration_since(lane_at).as_secs_f64();
+            // Saturating, not wrapping: the analyser is rebuilt whenever the
+            // rate, the FFT size or the decimation changes, and a rebuild puts
+            // its counter back to zero. Subtracting the old baseline from that
+            // wrapped to 1.8e19 and printed it as a rate.
+            let ffts = engine.analyzer.transforms();
+            let ffts_delta = ffts.saturating_sub(lane_ffts);
+            debug!(
+                target: "sdroxide::panadapter",
+                samples_per_s = lane_samples as f64 / secs,
+                fft_per_s = ffts_delta as f64 / secs,
+                frames_per_s = lane_frames as f64 / secs,
+                rate_hz = engine.state.sample_rate,
+                fft_size = engine.cfg.fft_size,
+                zoom = engine.zoom.is_some(),
+                audio_mode = engine.audio_mode,
+                "panadapter rates",
+            );
+            lane_at = now;
+            lane_samples = 0;
+            lane_frames = 0;
+            lane_ffts = ffts;
         }
         if let Some(frame) = engine.make_wide_frame() {
             wide_in.write(frame);

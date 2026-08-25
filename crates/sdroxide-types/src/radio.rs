@@ -3259,6 +3259,20 @@ impl LimeConfig {
     pub const GAIN_MIN_DB: f64 = 0.0;
     pub const GAIN_MAX_DB: f64 = 73.0;
 
+    /// Below this much transmit gain, an over is worth saying something about.
+    ///
+    /// Not a threshold with a datasheet behind it: [`Self::tx_gain_db`]
+    /// defaults to the bottom of the range on purpose, so that arming the
+    /// transmitter cannot by itself put anything on the air, and left there it
+    /// produces a radio that keys, reports no error and emits microwatts.
+    /// Downstream of the antenna that is indistinguishable from a transmitter
+    /// that does not work — which is the report it exists to answer.
+    ///
+    /// One number rather than two because the settings panel and the driver
+    /// both apply it, and a panel that stayed quiet while the log complained
+    /// would be worse than either alone.
+    pub const LOW_DRIVE_DB: f64 = 10.0;
+
     /// Pseudo-elements carrying settings that are not gains at all.
     ///
     /// They ride the existing `SetGain` command so this backend needs no new

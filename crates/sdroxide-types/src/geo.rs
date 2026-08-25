@@ -98,22 +98,6 @@ pub fn great_circle_points(
         .collect()
 }
 
-/// True if the (lon, lat) point in degrees is over land, from the baked
-/// NASA Blue Marble land/ocean bitmap ([`crate::worldmask`]).
-pub fn is_land(lon: f64, lat: f64) -> bool {
-    crate::worldmask::is_land(lon, lat)
-}
-
-/// Direct access to the land bitmap cell (col, row) for map rendering.
-pub fn land_cell(col: usize, row: usize) -> bool {
-    crate::worldmask::land_at(col, row)
-}
-
-/// Dimensions of the land bitmap (columns, rows).
-pub fn land_mask_dims() -> (usize, usize) {
-    (crate::worldmask::MASK_W, crate::worldmask::MASK_H)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,13 +120,5 @@ mod tests {
         // FN42 (Boston) to JO53 (Hamburg) ≈ 6000 km.
         let d = grid_distance_km("FN42", "JO53").unwrap();
         assert!((5500.0..6600.0).contains(&d), "{d}");
-    }
-
-    #[test]
-    fn land_mask_hits_continents() {
-        assert!(is_land(-100.0, 40.0)); // USA
-        assert!(is_land(10.0, 50.0)); // Europe
-        assert!(!is_land(-140.0, 0.0)); // mid-Pacific
-        assert!(!is_land(-30.0, 30.0)); // mid-Atlantic
     }
 }

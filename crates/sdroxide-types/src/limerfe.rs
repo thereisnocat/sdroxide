@@ -449,6 +449,33 @@ impl LimeRfeConfig {
         })
     }
 
+    /// Which connector each direction is on, when they are not the same one.
+    ///
+    /// A statement rather than a warning, and it earns its place because the
+    /// default cabling is the split one and the failure it produces is silent:
+    /// receive comes in on J3 and transmit leaves by J4, so a station with one
+    /// antenna in J3 hears the band perfectly and radiates into an open
+    /// connector. Nothing refuses, nothing errors, and every meter downstream
+    /// of the antenna reads zero — which is exactly the report this exists to
+    /// answer.
+    ///
+    /// `None` on a shared connector, where [`Self::switching_note`] has more
+    /// to say and says it, and none of this arises.
+    pub fn connector_note(&self) -> Option<String> {
+        if self.link == RfeLink::Off || self.needs_ptt_switching() {
+            return None;
+        }
+        Some(format!(
+            "Receive comes in on {} and transmit goes out of {} — two different connectors, \
+             which is what the board is for. With a single antenna it has to be on {}, and \
+             transmit moved there with it: nothing transmitted reaches a connector the \
+             amplifier is not driving.",
+            self.port_rx.label(),
+            self.port_tx.label(),
+            self.port_rx.label(),
+        ))
+    }
+
     pub fn atten_db(&self) -> f64 {
         f64::from(self.atten_steps.min(RFE_ATTEN_MAX_STEPS) * RFE_ATTEN_STEP_DB)
     }
@@ -691,6 +718,31 @@ mod tests {
         };
         assert_eq!(cfg.rx_mode(), RfeMode::Rx);
         assert_eq!(cfg.tx_mode(), Some(RfeMode::Tx));
+    }
+
+    /// The default cabling splits the two directions across two connectors,
+    /// and a station with one antenna gets no warning from the hardware — so
+    /// it gets one here. The report it answers: receives on every band,
+    /// transmits into nothing.
+    #[test]
+    fn split_connectors_are_stated_because_one_antenna_cannot_be_on_both() {
+        let split = LimeRfeConfig { link: RfeLink::Serial, ..Default::default() };
+        assert_eq!(split.port_rx, RfePort::J3, "the default");
+        assert_eq!(split.port_tx, RfePort::J4, "the default");
+        let note = split.connector_note().expect("the default cabling says which is which");
+        assert!(note.contains("J3 (TX/RX)"), "{note}");
+        assert!(note.contains("J4 (TX)"), "{note}");
+        assert_eq!(split.switching_note(), None, "and it is not the switching note's business");
+
+        // One connector for both directions has nothing to say here — the
+        // switching note covers that cabling in full.
+        let shared =
+            LimeRfeConfig { port_tx: RfePort::J3, link: RfeLink::Serial, ..Default::default() };
+        assert_eq!(shared.connector_note(), None);
+        assert!(shared.switching_note().is_some());
+
+        // And no board means no notes at all.
+        assert_eq!(LimeRfeConfig::default().connector_note(), None, "no board, nothing to say");
     }
 
     /// A board pinned to receive cannot transmit, and says so before anything

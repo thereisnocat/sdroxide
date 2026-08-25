@@ -31,6 +31,7 @@ use crate::auxrx::AuxRx;
 use crate::device::{self, DevCtl, DevInfo};
 use crate::error::{Error, Result};
 use crate::ffi;
+use crate::trace::{self, Trace};
 
 // The zero-copy receive below hands LimeSuite a `&mut [Complex32]` as its
 // interleaved-f32 buffer. `num_complex::Complex<T>` is `#[repr(C)]`, so that is
@@ -111,6 +112,14 @@ pub struct LimeHandle {
     /// Set once [`LimeHandle::close`] has run: the streams are destroyed and
     /// the device is closed, so nothing here may touch either again.
     closed: bool,
+    /// This session's diagnostic trace, shared with [`DevCtl`]. Held here as
+    /// well because the stream and transmit calls do not go through the device
+    /// lock and so cannot reach it that way.
+    trace: Trace,
+    /// The last transmit path described in the log, so an FT8 station keying
+    /// every fifteen seconds says it once rather than four times a minute. Any
+    /// change — band, port, drive — says it again.
+    last_tx_summary: String,
 }
 
 impl LimeHandle {
@@ -134,9 +143,25 @@ impl LimeHandle {
     /// setting depends on), then the analog filter, then the synthesiser, then
     /// gains and ports, then calibration, then the streams.
     pub fn open(cfg: &LimeConfig, center_hz: f64) -> Result<LimeHandle> {
-        let (api, dev, listed) = crate::api::open(&cfg.device)?;
+        // Remembered before the first call, not after the last one: an open
+        // that fails half way is precisely the session worth reporting, and it
+        // never reaches the bottom of this function. The trace is shared, so
+        // everything recorded from here on lands in what was remembered.
+        let trace = Trace::new();
+        trace::remember(&trace);
+        let (api, dev, listed) = match crate::api::open(&cfg.device) {
+            Ok(v) => v,
+            Err(e) => {
+                let want =
+                    if cfg.device.trim().is_empty() { "(first found)" } else { cfg.device.trim() };
+                trace.call("LMS_Open", want, format!("FAILED: {e}"));
+                return Err(e);
+            }
+        };
+        trace.set_identity(format!("LimeSuite {}, {}", api.version(), listed.label()));
+        trace.call("LMS_Open", listed.info.as_str(), "ok");
         let channel = usize::from(cfg.channel);
-        let mut ctl = DevCtl::new(Arc::clone(&api), dev, channel);
+        let mut ctl = DevCtl::new(Arc::clone(&api), dev, channel, trace.clone());
 
         let n_rx = ctl.num_channels(false);
         if channel >= n_rx {
@@ -253,6 +278,22 @@ impl LimeHandle {
             }
             let _ = ctl.set_gain_db(false, cfg.rx_gain_db);
             let _ = ctl.set_lpf_bw(false, analog_bw);
+            // And the transmit chain, for exactly the same reason. It was
+            // missing here: the calibration drives the chip's own test tone
+            // through a loopback in *both* directions, and a transmit path
+            // left on the wrong band or at the wrong gain by a run that
+            // stopped half way is a radio that receives perfectly and puts
+            // nothing on the air — with no error anywhere to say so.
+            if want_tx {
+                if !antenna_tx.is_empty() {
+                    let _ = ctl.set_antenna_named(true, &antenna_tx);
+                }
+                let _ = ctl.set_gain_db(true, cfg.tx_gain_db);
+                if tx_lpf_applied > 0.0 {
+                    let _ = ctl.set_lpf_bw(true, tx_lpf_applied);
+                }
+                let _ = ctl.set_lo(true, center_hz);
+            }
         }
 
         // Both streams while the device is idle — see the module doc.
@@ -270,8 +311,15 @@ impl LimeHandle {
         };
         let rc = unsafe { (api.setup_stream)(dev, &mut rx) };
         if rc != ffi::OK {
-            return Err(Error::api("LMS_SetupStream", api.err_text()));
+            let text = api.err_text();
+            trace.call("LMS_SetupStream", "receive", format!("FAILED: {text}"));
+            return Err(Error::api("LMS_SetupStream", text));
         }
+        trace.call(
+            "LMS_SetupStream",
+            format!("receive ch{}, FIFO {}k", cfg.channel + 1, cfg.fifo_ksamples.max(16)),
+            "ok",
+        );
         // The second chain, if it has been given a job. Best-effort throughout:
         // an operator who came to listen must not lose their receiver because
         // the diversity aerial's chain would not start, so every failure here
@@ -308,13 +356,20 @@ impl LimeHandle {
             let rc = unsafe { (api.setup_stream)(dev, &mut s) };
             if rc != ffi::OK {
                 let text = api.err_text();
+                trace.call("LMS_SetupStream", "transmit", format!("FAILED: {text}"));
                 unsafe { (api.destroy_stream)(dev, &mut rx) };
                 return Err(Error::api("LMS_SetupStream (tx)", text));
             }
+            trace.call("LMS_SetupStream", format!("transmit ch{}", cfg.channel + 1), "ok");
             tx = Some(s);
         }
 
         let rc = unsafe { (api.start_stream)(&mut rx) };
+        trace.call(
+            "LMS_StartStream",
+            "receive",
+            if rc == ffi::OK { "ok".to_string() } else { format!("FAILED: {}", api.err_text()) },
+        );
         if rc != ffi::OK {
             let text = api.err_text();
             unsafe { (api.destroy_stream)(dev, &mut rx) };
@@ -346,6 +401,14 @@ impl LimeHandle {
 
         let info = ctl.info();
         let label = if info.name.is_empty() { listed.label() } else { info.name.clone() };
+        trace.set_identity(format!(
+            "LimeSuite {}, {label} serial {} (firmware {}, hardware {}, gateware {})",
+            api.version(),
+            info.serial,
+            info.firmware,
+            info.hardware,
+            info.gateware
+        ));
         let rx_gain_db = ctl.gain_db(false).unwrap_or(cfg.rx_gain_db);
         let tx_gain_db = ctl.gain_db(true).unwrap_or(cfg.tx_gain_db);
 
@@ -395,6 +458,8 @@ impl LimeHandle {
             note: aux_note,
             cal_note,
             closed: false,
+            trace,
+            last_tx_summary: String::new(),
         })
     }
 
@@ -751,16 +816,31 @@ impl LimeHandle {
         } else {
             Ok(())
         };
-        // Whatever happened above, put the receive chain back where it was —
-        // the calibration reprograms it to hear the chip's own test tone
-        // through a loopback, and a run that stopped part way is the case
-        // where its own restore is least to be relied on.
+        // Whatever happened above, put both chains back where they were — the
+        // calibration reprograms them to hear the chip's own test tone through
+        // a loopback, and a run that stopped part way is the case where its own
+        // restore is least to be relied on. The transmit half matters just as
+        // much as the receive one and is harder to notice: a port or a gain
+        // left somewhere else is a radio that still receives and puts nothing
+        // on the air.
         let (antenna, gain, analog) = (self.antenna_rx.clone(), self.rx_gain_db, self.analog_bw);
         if !antenna.is_empty() {
             let _ = self.ctl().set_antenna_named(false, &antenna);
         }
         let _ = self.ctl().set_gain_db(false, gain);
         let _ = self.ctl().set_lpf_bw(false, analog);
+        if self.tx.is_some() {
+            let (port, drive, filter, center) =
+                (self.antenna_tx.clone(), self.tx_gain_db, self.tx_lpf_applied, self.tx_center);
+            if !port.is_empty() {
+                let _ = self.ctl().set_antenna_named(true, &port);
+            }
+            let _ = self.ctl().set_gain_db(true, drive);
+            if filter > 0.0 {
+                let _ = self.ctl().set_lpf_bw(true, filter);
+            }
+            let _ = self.ctl().set_lo(true, center);
+        }
         rx?;
         tx?;
         // A calibration that ran is the answer to the note left at open.
@@ -998,11 +1078,58 @@ impl LimeHandle {
         if !self.tx_running {
             let rc = unsafe { (self.api.start_stream)(tx) };
             if rc != ffi::OK {
-                return Err(Error::api("LMS_StartStream", self.api.err_text()));
+                let text = self.api.err_text();
+                self.trace.call("LMS_StartStream", "transmit", format!("FAILED: {text}"));
+                return Err(Error::api("LMS_StartStream", text));
             }
             self.tx_running = true;
         }
+        self.announce_tx(center_hz);
         Ok(self.ctl().sample_rate(true).unwrap_or(self.rate))
+    }
+
+    /// Say what this over is actually going out through.
+    ///
+    /// "No output on the power meter" is the report a transmitter that answers
+    /// every command gets, and the four things that decide whether any RF
+    /// leaves the board — the frequency, the socket, the drive and the filter —
+    /// are not visible anywhere else. Said in full the first time and again
+    /// whenever any of them changes; an FT8 station keying every fifteen
+    /// seconds is otherwise four lines a minute, so an unchanged path is
+    /// repeated at debug only.
+    ///
+    /// The trace gets it every time regardless: a report about one over should
+    /// not be missing the line for that over because an earlier one matched.
+    fn announce_tx(&mut self, center_hz: f64) {
+        let summary = format!(
+            "{:.6} MHz out of {}, drive {} dB, filter {:.2} MHz",
+            center_hz / 1e6,
+            LimeConfig::port_label(self.cfg.channel, &self.antenna_tx, true),
+            self.tx_gain_db,
+            self.tx_lpf_applied / 1e6
+        );
+        self.trace.call("transmit", &summary, "keyed");
+        if summary == self.last_tx_summary {
+            tracing::debug!("LimeSDR transmitting: {summary}");
+            return;
+        }
+        self.last_tx_summary = summary.clone();
+        tracing::info!("LimeSDR transmitting: {summary}");
+        // The drive is a real setting with a real default, and the default is
+        // the bottom of the range — deliberately, so an armed transmitter
+        // cannot surprise anybody. What it must not do is stay there silently:
+        // at 0 dB the LMS7002M puts out microwatts, a LimeRFE amplifies
+        // microwatts, and every meter downstream reads zero.
+        if self.tx_gain_db < LimeConfig::LOW_DRIVE_DB {
+            tracing::warn!(
+                "the LimeSDR's transmit gain is {} dB, at the bottom of its 0–{} dB range — \
+                 that is a few microwatts out of the board, and will read as nothing on a \
+                 power meter whatever is downstream of it. Raise Transmit gain in \
+                 Settings → Radio.",
+                self.tx_gain_db,
+                LimeConfig::GAIN_MAX_DB
+            );
+        }
     }
 
     /// Write one block of modulated baseband.
@@ -1078,8 +1205,11 @@ impl LimeHandle {
             let rc = unsafe { (self.api.stop_stream)(tx) };
             self.tx_running = false;
             if rc != ffi::OK {
-                return Err(Error::api("LMS_StopStream", self.api.err_text()));
+                let text = self.api.err_text();
+                self.trace.call("LMS_StopStream", "transmit", format!("FAILED: {text}"));
+                return Err(Error::api("LMS_StopStream", text));
             }
+            self.trace.call("transmit", "", "unkeyed");
         }
         Ok(())
     }

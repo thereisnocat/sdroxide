@@ -135,10 +135,34 @@ fn report(kind: ReportKind) -> String {
              run `cargo run -p sdroxide-elad --example probe`."
                 .to_string()
         }),
-        ReportKind::Lime => sdroxide_lime::diagnostics().unwrap_or_else(|| {
-            "No LimeSDR session has run yet — press Apply / reconnect first, or \
-             run `cargo run -p sdroxide-lime --example probe`."
-                .to_string()
-        }),
+        ReportKind::Lime => lime_report(),
     }
+}
+
+/// The LimeSDR's report, and the LimeRFE's beside it.
+///
+/// Two crates because they are two devices: on the front end's own USB cable
+/// nothing it does passes through LimeSuite, so a report built from the radio's
+/// trace alone would contain the whole session and not one word about the
+/// amplifier — which is the half of the path that decides whether anything
+/// reaches the antenna. Either section may be absent; the hint is what an
+/// operator who has pressed the button too early needs.
+fn lime_report() -> String {
+    let mut out = String::new();
+    if let Some(radio) = sdroxide_lime::diagnostics() {
+        out.push_str(&radio);
+    }
+    if let Some(rfe) = sdroxide_limerfe::diagnostics() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("### LimeRFE front end\n");
+        out.push_str(&rfe);
+    }
+    if out.is_empty() {
+        return "No LimeSDR session has run yet — press Apply / reconnect first, or \
+                run `cargo run -p sdroxide-lime --example probe`."
+            .to_string();
+    }
+    format!("{out}\n{}\n", sdroxide_lime::trace::FIELD_REPORT_HINT)
 }

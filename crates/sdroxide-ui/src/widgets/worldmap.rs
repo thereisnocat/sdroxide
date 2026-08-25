@@ -1,6 +1,14 @@
 //! A small pixel/dot-matrix world map for the FT8 QSO panel: renders the
-//! continents as glowing dots and marks the home + DX locations with a
-//! great-circle path between them, cyberpunk style.
+//! continents as glowing dots — with their borders, their rivers and the
+//! cities that fit — and marks the home + DX locations with a great-circle
+//! path between them, cyberpunk style.
+//!
+//! The ground under it all comes from [`crate::basemap`], which is the same
+//! Natural Earth data the 3D globe is textured with. That is deliberate: the
+//! two views have to agree about where a shoreline is, and one set of assets
+//! for both is how they do. The land arrives as a coverage raster and the lines
+//! as the polylines they were digitised as — the two halves of the map that
+//! want opposite things from their data.
 //!
 //! The map is centred on the operator's home grid (the world wraps around it
 //! rather than being shifted) and smoothly auto-zooms to frame home plus every
@@ -13,7 +21,7 @@
 use eframe::egui::{
     Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Response, Sense, Ui, Vec2, pos2, vec2,
 };
-use sdroxide_types::{great_circle_points, land_cell, land_mask_dims};
+use sdroxide_types::great_circle_points;
 
 use crate::theme;
 
@@ -25,9 +33,13 @@ pub const MIN_HEIGHT: f32 = 72.0;
 /// contact doesn't blow the map up to street level.
 const MIN_LON_SPAN: f64 = 30.0;
 /// The floor for a zoom the user asked for by hand — lower than the auto-fit's,
-/// because "show me that corner of Europe" is a real request, but not unlimited:
-/// below this the land bitmap (1/6° per cell) is showing its own pixels.
-const MIN_USER_LON_SPAN: f64 = 5.0;
+/// because "show me that corner of Europe" is a real request. A degree across
+/// is about a hundred kilometres, which is past what the land raster resolves
+/// (1/22.75°, ~4.9 km) but not past what the map *draws*: the coastline is
+/// stroked along that field's contour and the borders and rivers come from
+/// geometry, so both stay clean lines at any zoom. What this buys, past the
+/// point where new detail arrives, is room between the markers.
+const MIN_USER_LON_SPAN: f64 = 1.0;
 /// Fraction of extra margin left around the outermost contact.
 const PAD: f64 = 1.4;
 /// Per-frame ease toward the target view (0..1); smaller = slower/smoother.
@@ -233,47 +245,241 @@ fn target_view(home: Option<(f64, f64)>, contacts: &[(f64, f64)], aspect: f64) -
     (clat, clon, lon_span)
 }
 
-/// The continents, as a dot grid sized to the available pixels (about one dot
-/// every ~4 px), sampling the high-res land bitmap for crisp coastlines. Each
-/// cell maps to a (lat, lon) in the current view; longitude wraps.
+/// Pitch of the dot matrix, in points. The grid the whole map is drawn on, and
+/// so the map's resolution: coarse enough that the dots still read as a stipple
+/// rather than as a fill, and no coarser. Every dot is a `circle_filled`, so
+/// this is quadratic in what it costs — three points is about twice the work of
+/// four and is where the two stop trading against each other.
+const DOT_PITCH: f32 = 3.0;
+
+/// How solid a land dot is, from the coverage under it.
+///
+/// Zoomed out, coverage very nearly *is* the alpha: a cell half full of Denmark
+/// comes out a half-lit dot, and a coast reads as an edge rather than as a
+/// staircase. Zoomed in past the grid the same field is contrast-stretched
+/// about its ½ contour instead — which is where the coastline actually is — so
+/// the shore stays a drawn line instead of dissolving into a gradient. That is
+/// the flat map's version of the `fwidth` stroke `solar_body.wgsl` puts on the
+/// globe, and it is why both show the same shoreline at the same sharpness.
+fn land_ink(cov: f32, mag: f32) -> f32 {
+    ((cov - 0.5) * 1.4 * mag.max(1.0) + 0.5).clamp(0.0, 1.0)
+}
+
+/// Walk one line layer onto the dot grid, marking every cell a line passes
+/// through with that line's rank plus one.
+///
+/// This is what a flat map does instead of sampling `borders.png`. A border is
+/// one texel wide there, so once the map is zoomed in far enough for a texel to
+/// cover several dots, no threshold on the interpolated coverage gives a line
+/// back: a low one draws the interpolation's skirt as well and the border comes
+/// out a band four dots across, a high one breaks the same border into
+/// fragments wherever it happens to fall between two texels. Walking the
+/// geometry has neither failure: the line is one cell wide because it is drawn
+/// one cell at a time, and it is where it was digitised.
+///
+/// Marking rather than drawing, because a line crosses its own cells over and
+/// over — every vertex of a meander inside one cell would otherwise stack a
+/// dozen half-transparent dots on top of each other and burn that cell white.
+fn stamp_lines(
+    layer: &crate::basemap::LineLayer,
+    (clat, clon, lon_span, lat_span): (f64, f64, f64, f64),
+    (cols, rows): (usize, usize),
+    marks: &mut [u8],
+) {
+    let level = layer.level(lon_span / cols as f64);
+    let (half_lon, half_lat) = (lon_span * 0.5, lat_span * 0.5);
+    // Grid coordinates, in cells: (0,0) is the middle of the top-left one.
+    let project = |lat: f64, lon: f64| {
+        (
+            (0.5 + wrap180(lon - clon) / lon_span) * cols as f64 - 0.5,
+            (0.5 - (lat - clat) / lat_span) * rows as f64 - 0.5,
+        )
+    };
+    for part in &level.parts {
+        // Whole parts first, on the box each was measured into: at a continent
+        // a time this is most of the world's rivers rejected on two subtractions.
+        if wrap180(part.mid.1 - clon).abs() > half_lon + part.half.1
+            || (part.mid.0 - clat).abs() > half_lat + part.half.0
+        {
+            continue;
+        }
+        let mut prev = project(f64::from(part.pts[0].0), f64::from(part.pts[0].1));
+        for point in &part.pts[1..] {
+            let cur = project(f64::from(point.0), f64::from(point.1));
+            // A segment that leaves the map and comes back the other side is
+            // the date line under the projection's wrap; drawn straight it
+            // would be a scar across the whole map.
+            let (dx, dy) = (cur.0 - prev.0, cur.1 - prev.1);
+            if dx.abs() < cols as f64 {
+                // Step along it half a cell at a time — half, so a diagonal
+                // leaves no gaps at the corners.
+                let steps = (dx.abs().max(dy.abs()) * 2.0).ceil().max(1.0);
+                for k in 0..=(steps as usize) {
+                    let f = k as f64 / steps;
+                    let (x, y) = (prev.0 + dx * f, prev.1 + dy * f);
+                    let (col, row) = (x.round(), y.round());
+                    if col >= 0.0 && row >= 0.0 && col < cols as f64 && row < rows as f64 {
+                        let i = row as usize * cols + col as usize;
+                        marks[i] = marks[i].max(part.rank + 1);
+                    }
+                }
+            }
+            prev = cur;
+        }
+    }
+}
+
+/// The world itself: land, rivers, borders and the cities that fit, as a dot
+/// matrix sized to the available pixels (about one dot every [`DOT_PITCH`]
+/// points). Each cell maps to a (lat, lon) in the current view; longitude
+/// wraps.
+///
+/// The land comes from the coverage raster the 3D globe is textured with
+/// ([`crate::basemap`]), so a coastline is in the same place in both views; the
+/// lines come from the polylines behind that raster, walked onto this same
+/// grid — see [`stamp_lines`].
 ///
 /// Returns the dot radius, which is the scale the callers draw their own
 /// markers against.
-pub(crate) fn draw_land(
+pub(crate) fn draw_base(
     p: &eframe::egui::Painter,
     rect: eframe::egui::Rect,
     clat: f64,
     clon: f64,
     lon_span: f64,
     lat_span: f64,
-    land: Color32,
+    map: &theme::MapPalette,
 ) -> f32 {
-    let (mw, mh) = land_mask_dims();
-    let cols = ((rect.width() / 4.0) as usize).clamp(80, mw);
-    let rows = ((rect.height() / 4.0) as usize).clamp(40, mh);
+    let cols = ((rect.width() / DOT_PITCH) as usize).max(24);
+    let rows = ((rect.height() / DOT_PITCH) as usize).max(12);
     let cell_w = rect.width() / cols as f32;
     let cell_h = rect.height() / rows as f32;
     let dot_r = (cell_w.min(cell_h) * 0.44).max(0.7);
+    let at = |col: usize, row: usize| {
+        pos2(rect.left() + (col as f32 + 0.5) * cell_w, rect.top() + (row as f32 + 0.5) * cell_h)
+    };
 
+    // One sampler for the whole grid: the zoom is what picks the mip level, and
+    // it is the same for every cell.
+    let cell_deg = lon_span / cols as f64;
+    let land = crate::basemap::land().sampler(cell_deg);
+    let land_mag = land.magnification();
     for row in 0..rows {
         let fy = (row as f64 + 0.5) / rows as f64; // 0 top .. 1 bottom
         let lat = clat + (0.5 - fy) * lat_span;
         if !(-90.0..=90.0).contains(&lat) {
             continue; // beyond a pole → open space, no land
         }
-        let mrow = (((90.0 - lat) / 180.0 * mh as f64) as usize).min(mh - 1);
         for col in 0..cols {
             let fx = (col as f64 + 0.5) / cols as f64; // 0 left .. 1 right
-            let lonw = wrap180(clon + (fx - 0.5) * lon_span);
-            let mcol = ((lonw + 180.0) / 360.0 * mw as f64) as usize % mw;
-            if land_cell(mcol, mrow) {
-                let x = rect.left() + (col as f32 + 0.5) * cell_w;
-                let y = rect.top() + (row as f32 + 0.5) * cell_h;
-                p.circle_filled(pos2(x, y), dot_r, land);
+            let lon = wrap180(clon + (fx - 0.5) * lon_span);
+            let ground = land_ink(land.at(lon, lat), land_mag);
+            if ground > 0.02 {
+                p.circle_filled(at(col, row), dot_r, alpha(map.land, 255.0 * ground));
             }
         }
     }
+
+    // Rivers under borders: where the two run together — and they often do,
+    // because a border is frequently a river somebody agreed on — the political
+    // line is the one a callsign is looked up in.
+    let view = (clat, clon, lon_span, lat_span);
+    let mut marks = vec![0u8; cols * rows];
+    let lines = crate::basemap::lines();
+    // A river is drawn by the size Natural Earth ranks it at, so at a glance
+    // the Danube reads as a different kind of thing from the brook feeding it.
+    // A frontier has no such scale — a border is a border — so borders take the
+    // whole layer at one weight.
+    for (layer, ink, weight, base, spread) in [
+        (&lines.rivers, map.river, 215.0, 0.42, 0.58),
+        (&lines.borders, map.border, 195.0, 0.62, 0.0),
+    ] {
+        marks.fill(0);
+        stamp_lines(layer, view, (cols, rows), &mut marks);
+        for (i, &rank) in marks.iter().enumerate() {
+            if rank == 0 {
+                continue;
+            }
+            let a = base + spread * (f32::from(rank - 1) / 12.0).min(1.0);
+            p.circle_filled(at(i % cols, i / cols), dot_r, alpha(ink, weight * a));
+        }
+    }
+    draw_cities(p, rect, clat, clon, lon_span, lat_span, dot_r, map);
     dot_r
+}
+
+/// The cities that fit, biggest first.
+///
+/// [`crate::basemap::cities`] is sorted by population, so "which cities show"
+/// needs no threshold: walk the list, draw what falls inside the view, and stop
+/// once the map holds as many as it has room for. Zooming in shrinks the view
+/// faster than it exhausts the list, so smaller places arrive on their own.
+///
+/// Labels are the part that has to be earned — they cost far more room than the
+/// dot does. One goes on only if the map is big enough to carry text at all and
+/// the name misses every label already placed; the dot stays either way, so a
+/// city crowded out of its name is still a mark on the map.
+#[allow(clippy::too_many_arguments)]
+fn draw_cities(
+    p: &eframe::egui::Painter,
+    rect: eframe::egui::Rect,
+    clat: f64,
+    clon: f64,
+    lon_span: f64,
+    lat_span: f64,
+    dot_r: f32,
+    map: &theme::MapPalette,
+) {
+    // How many cities the map has room for, by area: a 600×300 panel map takes
+    // twenty, a full-window one a hundred and forty.
+    let budget = ((rect.width() * rect.height()) / 9000.0) as usize;
+    let budget = budget.clamp(6, 150);
+    // Under this there is no room for a name next to the dot, and a map of
+    // unlabelled specks says less than one without them.
+    let label = rect.width() >= 260.0 && rect.height() >= 140.0;
+    let font = FontId::proportional(9.5);
+
+    let mut placed: Vec<Pos2> = Vec::with_capacity(budget);
+    let mut labels: Vec<eframe::egui::Rect> = Vec::new();
+    for city in crate::basemap::cities() {
+        if placed.len() >= budget {
+            break;
+        }
+        let dlon = wrap180(city.lon - clon);
+        if dlon.abs() > lon_span / 2.0 || (city.lat - clat).abs() > lat_span / 2.0 {
+            continue;
+        }
+        let c = pos2(
+            rect.left() + (0.5 + (dlon / lon_span) as f32) * rect.width(),
+            rect.top() + (0.5 - ((city.lat - clat) / lat_span) as f32) * rect.height(),
+        );
+        // Two cities a few points apart are one smudge; the bigger one wins.
+        if placed.iter().any(|q| q.distance(c) < 7.0) {
+            continue;
+        }
+        placed.push(c);
+        // The dot grows with the place, by decade of population: a map that
+        // draws Tokyo and a county town the same size has thrown away the one
+        // thing it knows about both. Capitals get a ring instead of a size —
+        // a capital is not necessarily big, and this is the mark that says so.
+        let r = dot_r.max(1.0) + 0.35 * ((city.pop.max(1) as f32).log10() - 4.0).clamp(0.0, 3.5);
+        p.circle_filled(c, r + 1.2, alpha(map.city, 45.0));
+        p.circle_filled(c, r, map.city);
+        if city.capital {
+            p.circle_stroke(c, r + 2.0, (0.7, alpha(map.city, 150.0)));
+        }
+        if !label {
+            continue;
+        }
+        let galley = p.layout_no_wrap(city.name.to_owned(), font.clone(), map.city_label);
+        let at = pos2(c.x + r + 3.0, c.y - galley.size().y / 2.0);
+        let area = eframe::egui::Rect::from_min_size(at, galley.size()).expand(1.0);
+        if !rect.contains_rect(area) || labels.iter().any(|l| l.intersects(area)) {
+            continue;
+        }
+        labels.push(area);
+        p.galley(at, galley, map.city_label);
+    }
 }
 
 /// Draw the map filling the available width (2:1 aspect). `view` carries the
@@ -396,7 +602,7 @@ pub fn show(
         }
     }
 
-    let dot_r = draw_land(&p, rect, clat, clon, lon_span, lat_span, map.land);
+    let dot_r = draw_base(&p, rect, clat, clon, lon_span, lat_span, map);
 
     // Project (lat, lon) to screen using the current view; longitude wraps.
     let project = |lat: f64, lon: f64| -> Pos2 {
@@ -515,6 +721,81 @@ mod tests {
     /// Aspect of a typical map: half as tall as it is wide.
     const ASPECT: f64 = 0.5;
 
+    /// Coverage is the alpha while the map is zoomed out, so a coast is an edge
+    /// rather than a staircase — and becomes a hard line at the ½ contour once
+    /// the dots have outrun the texels, so it does not dissolve into a gradient
+    /// instead.
+    #[test]
+    fn the_coast_sharpens_as_the_map_zooms_in() {
+        assert!((land_ink(0.5, 0.2) - 0.5).abs() < 1e-6);
+        assert!(land_ink(0.75, 0.2) > 0.7 && land_ink(0.25, 0.2) < 0.3);
+        assert!(land_ink(0.55, 20.0) > 0.99, "the coast blurred out at full zoom");
+        assert!(land_ink(0.45, 20.0) < 0.01);
+        // Open sea is never lit and solid ground always is, at any zoom.
+        for mag in [0.05, 1.0, 30.0] {
+            assert_eq!(land_ink(0.0, mag), 0.0);
+            assert_eq!(land_ink(1.0, mag), 1.0);
+        }
+    }
+
+    /// A border comes out one dot wide however far in the map is zoomed —
+    /// which the raster this replaced could not manage: thresholded low it drew
+    /// a band four dots across, thresholded high the same border broke into
+    /// fragments wherever it fell between two texels.
+    #[test]
+    fn a_border_is_a_hairline_at_every_zoom() {
+        let (cols, rows) = (200usize, 80usize);
+        for span in [0.5, 2.0, 8.0, 40.0, 360.0] {
+            let mut marks = vec![0u8; cols * rows];
+            // Lake Constance, where Germany, Austria and Switzerland meet:
+            // a frontier crosses the view at every one of these spans, and a
+            // dozen of them do at the widest.
+            let view = (47.55, 9.6, span, span * rows as f64 / cols as f64);
+            stamp_lines(&crate::basemap::lines().borders, view, (cols, rows), &mut marks);
+            let on = |c: isize, r: isize| {
+                (0..cols as isize).contains(&c)
+                    && (0..rows as isize).contains(&r)
+                    && marks[r as usize * cols + c as usize] != 0
+            };
+            let (mut drawn, mut buried, mut lonely) = (0usize, 0usize, 0usize);
+            for row in 0..rows as isize {
+                for col in 0..cols as isize {
+                    if !on(col, row) {
+                        continue;
+                    }
+                    drawn += 1;
+                    let around = (-1..=1)
+                        .flat_map(|dr| (-1..=1).map(move |dc| (dc, dr)))
+                        .filter(|d| *d != (0, 0))
+                        .filter(|(dc, dr)| on(col + dc, row + dr))
+                        .count();
+                    // Every cell inside a band is surrounded by more band...
+                    buried += usize::from(around == 8);
+                    // ...and a fragmented line is dots with nothing beside them.
+                    lonely += usize::from(around == 0);
+                }
+            }
+            assert!(drawn > 40, "{span}°: only {drawn} cells drawn");
+            assert!(buried * 50 < drawn, "{span}°: {buried} of {drawn} cells are inside a band");
+            assert!(lonely * 20 < drawn, "{span}°: {lonely} of {drawn} cells stand alone");
+        }
+    }
+
+    /// The date line is a seam in the projection, not in the world: a line
+    /// crossing it is drawn on both sides rather than straight across the map.
+    #[test]
+    fn nothing_is_drawn_across_the_date_line() {
+        let (cols, rows) = (200usize, 80usize);
+        let mut marks = vec![0u8; cols * rows];
+        // The Pacific, where Chukotka and Alaska sit either side of ±180°.
+        let view = (64.0, 180.0, 60.0, 24.0);
+        stamp_lines(&crate::basemap::lines().rivers, view, (cols, rows), &mut marks);
+        for row in 0..rows {
+            let filled = marks[row * cols..(row + 1) * cols].iter().filter(|m| **m != 0).count();
+            assert!(filled * 3 < cols, "row {row} is {filled}/{cols} wide — a wrap scar");
+        }
+    }
+
     /// What the point at rect fraction (fx, fy) is over, in (lat, lon).
     fn under(v: &MapView, fx: f64, fy: f64, aspect: f64) -> (f64, f64) {
         (v.clat + (0.5 - fy) * v.lat_span(aspect), wrap180(v.clon + (fx - 0.5) * v.lon_span))
@@ -565,7 +846,7 @@ mod tests {
         }
         assert!(
             (v.lon_span - MIN_USER_LON_SPAN).abs() < 1e-9,
-            "zoomed in past the mask: {}",
+            "zoomed in past the floor: {}",
             v.lon_span
         );
     }

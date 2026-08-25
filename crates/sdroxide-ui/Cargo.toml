@@ -5,6 +5,11 @@ edition.workspace = true
 
 [dependencies]
 sdroxide-types.workspace = true
+# Diagnostics only. The panadapter's view state is decided here and nowhere
+# else, so without a way to say what it did there is no way to tell a gesture
+# that never arrived from one that arrived and was overruled. Pure-facade and
+# wasm-safe; a build with no subscriber pays nothing.
+tracing.workspace = true
 # The APRS codec, for the one thing the panel needs it for: telling the
 # operator whether their digipeater path is a reasonable one. Pure parsing with
 # no I/O and no clock, so it builds for wasm32 alongside everything else here.

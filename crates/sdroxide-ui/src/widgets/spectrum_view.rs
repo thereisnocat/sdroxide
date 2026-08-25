@@ -1570,8 +1570,31 @@ pub fn show_ext(
         d.insert_temp(fling_id, fling);
         d.insert_temp(stop_click_id, stop_click);
     });
+    let view_log_id = ui.id().with("view-log");
 
+    // The panadapter's whole zoom/pan story in one line, and only when it
+    // moves. Three numbers because three different failures look identical on
+    // screen: a gesture that never reached the view (span unchanged frame after
+    // frame while the wheel turns), a view that moved and was clamped back
+    // (`span_after` < `span_before`), and a view that moved freely while the
+    // picture did not follow (span changes here, waterfall does not).
+    let span_before = view.span();
     view.clamp_to(dev_center, dev_span);
+    let (lo_now, hi_now, span_now) = (view.view_lo_hz, view.view_hi_hz, view.span());
+    if ui.data(|d| d.get_temp::<(f64, f64)>(view_log_id)) != Some((lo_now, hi_now)) {
+        ui.data_mut(|d| d.insert_temp(view_log_id, (lo_now, hi_now)));
+        tracing::debug!(
+            target: "sdroxide::panadapter",
+            dev_center,
+            dev_span,
+            view_lo = lo_now,
+            view_hi = hi_now,
+            span_before,
+            span_after = span_now,
+            clamped = span_now < span_before * 0.999,
+            "panadapter view moved",
+        );
+    }
 
     // --- drawing ----------------------------------------------------------
     // Recompute after this frame's pan/tune/edge updates.
@@ -2305,15 +2328,43 @@ pub(crate) fn draw_bw_measure(
 /// to disagree about where a zoom is anchored or how far it may go.
 fn zoom_about(view: &mut ViewState, x: f32, rect: &Rect, factor: f64, dev_span: f64) {
     let fpos = view.x_to_freq(x, rect);
-    let lo = fpos - (fpos - view.view_lo_hz) * factor;
-    let hi = fpos + (view.view_hi_hz - fpos) * factor;
+    let span = view.span();
+    if span <= 0.0 {
+        return;
+    }
     // Past this the FFT has no more detail to give and the view would go on
     // magnifying a single bin.
     let min_span = (dev_span / 1024.0).max(1_000.0);
-    if hi - lo >= min_span {
-        view.view_lo_hz = lo;
-        view.view_hi_hz = hi;
-    }
+    // ⛔ The floor applies to zooming *in* and to nothing else, and it is a
+    // clamp rather than a refusal.
+    //
+    // This read `if hi - lo >= min_span { … }` until 25 August 2026 — the new
+    // span tested against the floor whichever way the wheel had turned. A view
+    // already *below* the floor was therefore frozen solid: every notch out
+    // multiplied a too-small span by about 1.02 and landed short of the floor
+    // as well, so it was rejected with the same test that was meant to stop
+    // zooming in, and there was no gesture left that could climb out.
+    //
+    // Which is not a hypothetical: `min_span` is a fraction of the *front
+    // end's* span, so it moves when the front end does. A view left at 24 kHz
+    // by an Icom sending its 12 kHz IF, carried onto an RX-888 at 32.4 Msps,
+    // meets a floor of 31.6 kHz — above where it already sits — and the
+    // panadapter will not zoom at all, in either direction, for the rest of
+    // the session and every session after it, because the span is persisted.
+    let want = span * factor;
+    let new_span = if factor < 1.0 {
+        // Zooming in: never below the floor — and never below where the view
+        // already is, so a view that starts under the floor is held rather
+        // than shoved out to a width the operator did not ask for.
+        want.max(min_span.min(span))
+    } else {
+        // Zooming out: always allowed. `ViewState::clamp_to` bounds it at the
+        // captured window, which is the only limit that belongs on this side.
+        want
+    };
+    let k = new_span / span;
+    view.view_lo_hz = fpos - (fpos - view.view_lo_hz) * k;
+    view.view_hi_hz = fpos + (view.view_hi_hz - fpos) * k;
 }
 
 /// A frequency in Hz as `xx.xxxxx MHz`.
@@ -2571,6 +2622,79 @@ pub(crate) fn freq_gridlines(lo_hz: f64, hi_hz: f64) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zoom the view about its own centre, the way a wheel notch over the
+    /// middle of the panadapter does.
+    fn wheel(view: &mut ViewState, factor: f64, dev_span: f64) {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 400.0));
+        zoom_about(view, 500.0, &rect, factor, dev_span);
+    }
+
+    fn view_spanning(lo: f64, hi: f64) -> ViewState {
+        let mut v = ViewState::default();
+        v.view_lo_hz = lo;
+        v.view_hi_hz = hi;
+        v
+    }
+
+    /// The measured fault. A view left at 24 kHz by an Icom sending its 12 kHz
+    /// IF, carried onto an RX-888 at 32.4 Msps, sits below that front end's
+    /// 31.6 kHz zoom floor — and the old guard tested the *new* span against
+    /// the floor whichever way the wheel turned, so every notch out landed
+    /// short of it too and was refused. The panadapter would not zoom in either
+    /// direction, for good, because the span is persisted across sessions.
+    #[test]
+    fn a_view_below_the_floor_can_still_zoom_out() {
+        const DEV: f64 = 32_400_000.0;
+        assert!(24_000.0 < (DEV / 1024.0).max(1_000.0), "the fault needs a view under the floor");
+        let mut v = view_spanning(16_086_700.0, 16_110_700.0);
+        // One notch out, at the wheel's own ~2% per notch.
+        wheel(&mut v, 1.02, DEV);
+        assert!(v.span() > 24_000.0, "a notch out was refused: span stuck at {}", v.span());
+        // And it keeps climbing, right through the floor it started under.
+        for _ in 0..200 {
+            wheel(&mut v, 1.02, DEV);
+        }
+        assert!(v.span() > DEV / 1024.0, "the view never climbed past the floor");
+    }
+
+    #[test]
+    fn a_view_below_the_floor_is_held_rather_than_shrunk_or_shoved() {
+        const DEV: f64 = 32_400_000.0;
+        let mut v = view_spanning(16_086_700.0, 16_110_700.0);
+        wheel(&mut v, 0.98, DEV);
+        // Not shrunk further — but not yanked out to the floor either, which
+        // would be a zoom the operator did not ask for.
+        assert!((v.span() - 24_000.0).abs() < 1.0, "span moved to {}", v.span());
+    }
+
+    /// The floor still does its job on an ordinary view: zooming in stops at
+    /// it instead of magnifying a single bin, and stops *at* it rather than
+    /// refusing the notch that would cross it.
+    #[test]
+    fn zooming_in_clamps_at_the_floor() {
+        const DEV: f64 = 32_400_000.0;
+        let floor = (DEV / 1024.0).max(1_000.0);
+        let mut v = view_spanning(16_000_000.0, 17_000_000.0);
+        for _ in 0..2000 {
+            wheel(&mut v, 0.98, DEV);
+        }
+        assert!(v.span() >= floor - 1.0, "zoomed past the floor to {}", v.span());
+        assert!(v.span() < floor * 1.05, "stopped short of the floor at {}", v.span());
+    }
+
+    /// Zooming out is bounded by the captured window, not by this function —
+    /// `clamp_to` owns that side, and it must still be reachable.
+    #[test]
+    fn zooming_out_reaches_the_whole_window() {
+        const DEV: f64 = 32_400_000.0;
+        let mut v = view_spanning(16_000_000.0, 16_100_000.0);
+        for _ in 0..500 {
+            wheel(&mut v, 1.02, DEV);
+        }
+        v.clamp_to(DEV / 2.0, DEV);
+        assert!(v.span() >= DEV * 0.99, "never reached the full window: {}", v.span());
+    }
 
     /// The bug this replaced: the step was a fixed sixty seconds, and at the
     /// default scroll speed a minute is about 1700 pixels of waterfall — so on

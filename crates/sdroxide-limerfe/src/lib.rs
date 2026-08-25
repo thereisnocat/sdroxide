@@ -35,12 +35,14 @@ pub mod driver;
 pub mod error;
 pub mod frame;
 pub mod serial;
+pub mod trace;
 pub mod transport;
 
 pub use driver::{Ctrl, Follower, LimeRfeHandle, Presence, spawn};
 pub use error::{Error, Result};
 pub use frame::{RfeInfo, RfeState};
 pub use serial::SerialTransport;
+pub use trace::diagnostics;
 pub use transport::RfeTransport;
 
 use sdroxide_types::{LimeRfeConfig, RfeLink};

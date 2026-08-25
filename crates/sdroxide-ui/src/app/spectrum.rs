@@ -237,8 +237,21 @@ impl SdroxideApp {
         } else {
             (None, 1.0)
         };
-        let mut fft = self.view.fft_size.max(1024);
-        while (fft as f64) < self.view.fft_size as f64 * zoom.min(8.0) && fft < 32_768 {
+        // The operator's chip, capped at what this front end's *rate* can
+        // afford. A transform covers `fft_size / rate` seconds of signal, and
+        // that time is the panadapter's update period and its smear both — so
+        // the same 32768 that is free on a 2 Msps SDR (16 ms) is 1.4 seconds
+        // on the Icom LAN backend's 24 kHz IF, which is one new picture every
+        // 1.4 s, each of them an average of the whole of it. It buys nothing
+        // to pay for: a frame carries `DISPLAY_BINS` bins, so of 32768 across
+        // 24 kHz, sixteen are max-pooled into every one drawn.
+        //
+        // Only the *base* is capped. Zoom still multiplies it below, because
+        // resolution finer than the span is exactly what somebody zoomed in is
+        // asking for, and the seconds it costs are then a price they chose.
+        let base = base_fft_for_rate(self.view.fft_size, full_span);
+        let mut fft = base;
+        while (fft as f64) < base as f64 * zoom.min(8.0) && fft < 32_768 {
             fft *= 2;
         }
         SpectrumConfig {
@@ -633,6 +646,33 @@ impl SdroxideApp {
     }
 }
 
+/// The longest stretch of signal one device-wide transform may cover.
+///
+/// Not a resolution choice — a resolution *floor* implied by a rate. The
+/// waterfall scrolls on wall-clock, so a window longer than a row's worth of
+/// time is drawn as a run of identical rows however fast frames are published,
+/// and every event inside it is averaged flat. A tenth of a second keeps the
+/// device-wide lane above ten new pictures a second on any front end.
+const MAX_FFT_WINDOW_S: f64 = 0.1;
+
+/// The operator's FFT size, reduced to what `rate_hz` can deliver inside
+/// [`MAX_FFT_WINDOW_S`] — the largest power of two that fits, never below the
+/// 1024 floor the chip row starts at, and unchanged when the rate is unknown.
+///
+/// A wideband front end is untouched: 2 Msps affords 131072, well past the
+/// 32768 ceiling the chips offer. It bites only on the narrow lanes, which are
+/// the ones that cannot afford it — 2048 at 24 kHz, 4096 at 48 kHz.
+fn base_fft_for_rate(chip: u32, rate_hz: f64) -> u32 {
+    if !rate_hz.is_finite() || rate_hz <= 0.0 {
+        return chip.max(1024);
+    }
+    let mut afford = 1024u32;
+    while afford < chip && f64::from(afford * 2) / rate_hz <= MAX_FFT_WINDOW_S {
+        afford *= 2;
+    }
+    chip.min(afford).max(1024)
+}
+
 /// Whether a jump in the device window should re-fit the view to it.
 ///
 /// True only for an audio-mode front end whose window grew by a large factor
@@ -647,8 +687,9 @@ fn refit_on_window_growth(audio_mode: bool, prev_rate: f64, new_rate: f64, view_
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoFit, FIT_ARRIVED_DB, FIT_MIN_GAP_S, FIT_SETTLE_S, FIT_STEP_S, average_in, fit_due,
-        glide_step, levels_drifted, pick_levels, refit_on_window_growth, slack_viewport,
+        AutoFit, FIT_ARRIVED_DB, FIT_MIN_GAP_S, FIT_SETTLE_S, FIT_STEP_S, average_in,
+        base_fft_for_rate, fit_due, glide_step, levels_drifted, pick_levels,
+        refit_on_window_growth, slack_viewport,
     };
 
     /// The crash this replaced: an RX-888 scrolled to the top of its band, at a
@@ -707,6 +748,35 @@ mod tests {
         // And the cold-start transition (no previous rate) never fits here —
         // that is `spectrum_view`'s job on first draw.
         assert!(!refit_on_window_growth(true, 0.0, 200_000.0, 4_000.0));
+    }
+
+    /// The measured fault: an IC-705 over its LAN port on the 12 kHz IF runs
+    /// the engine at 24 kHz, where the 32768 chip covers 1.365 s of signal and
+    /// hands the waterfall 1.46 new pictures a second. Capped to 2048 it covers
+    /// 85 ms — and loses no drawable bin, because a frame carries 2048 of them.
+    #[test]
+    fn a_narrow_lane_cannot_afford_the_widest_chip() {
+        assert_eq!(base_fft_for_rate(32_768, 24_000.0), 2048);
+        assert!(2048.0 / 24_000.0 <= super::MAX_FFT_WINDOW_S);
+        // The CAT/Audio path, at twice the rate, affords twice the window.
+        assert_eq!(base_fft_for_rate(32_768, 48_000.0), 4096);
+    }
+
+    #[test]
+    fn a_wideband_front_end_keeps_what_the_operator_chose() {
+        // 2 Msps affords 131072, so every chip on the row passes through.
+        assert_eq!(base_fft_for_rate(32_768, 2_000_000.0), 32_768);
+        assert_eq!(base_fft_for_rate(4096, 2_000_000.0), 4096);
+        // And a rate we do not know yet changes nothing.
+        assert_eq!(base_fft_for_rate(32_768, 0.0), 32_768);
+    }
+
+    #[test]
+    fn the_floor_holds_however_slow_the_lane() {
+        // Below the chip row's own smallest size there is nothing to gain: the
+        // cap must not shrink the panadapter to a handful of bins.
+        assert_eq!(base_fft_for_rate(32_768, 1_000.0), 1024);
+        assert_eq!(base_fft_for_rate(1024, 24_000.0), 1024);
     }
 
     /// Map a dB value to the u8 code used by a frame spanning `[lo, hi]`.

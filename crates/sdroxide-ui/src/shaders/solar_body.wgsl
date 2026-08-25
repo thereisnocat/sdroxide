@@ -40,6 +40,8 @@ struct DrawData {
 @group(1) @binding(0) var<uniform> d: DrawData;
 @group(0) @binding(5) var border_tex: texture_2d<f32>;
 @group(0) @binding(6) var body_maps: texture_2d_array<f32>;
+@group(0) @binding(10) var river_tex: texture_2d<f32>;
+@group(0) @binding(11) var city_tex: texture_2d<f32>;
 
 // The FT8 map's own palette, so the globe reads as the same map (see
 // widgets/worldmap.rs, land `#1c4458`).
@@ -47,6 +49,8 @@ const LAND_DAY  = vec3<f32>(0.109804, 0.266667, 0.345098); // #1c4458
 const OCEAN_DAY = vec3<f32>(0.039216, 0.094118, 0.149020); // #0a1826
 const COAST     = vec3<f32>(0.113725, 0.611765, 0.745098); // #1d9cbe  theme::CYAN_DIM
 const ATMO      = vec3<f32>(0.000000, 0.815686, 0.956863); // #00d0f4  theme::CYAN
+const RIVER     = vec3<f32>(0.109804, 0.372549, 0.560784); // #1c5f8f  the flat map's river
+const CITY      = vec3<f32>(1.000000, 0.756863, 0.407843); // #ffc168  sodium, seen from orbit
 
 const PI = 3.14159265;
 
@@ -71,6 +75,22 @@ const COAST_PX = 0.6;
 /// and the borders keep their place below the coast in the hierarchy.
 const COAST_GLOW  = 0.16;
 const BORDER_GLOW = 0.085;
+
+/// The night side's city lights, from the built-up urban areas.
+///
+/// The one place where the globe stops being a line drawing and shows
+/// something photographic — and the reason it can afford to is that it is
+/// *true*: the layer is Natural Earth's urban-area polygons, so the Ruhr is a
+/// sprawl, the Nile is a thread and the Sahara is empty, exactly as the
+/// photographs from orbit show them. Bright enough to read the continents by
+/// on the dark half, nowhere near enough to compete with the terminator.
+const CITY_GLOW = 0.55;
+
+/// Rivers are a physical feature rather than an agreed line, so unlike the
+/// borders they are *not* self-lit at night: after dark a river is as dark as
+/// the ground it runs through, and the city lights beside it are what the eye
+/// follows instead.
+const RIVER_MIX = 0.55;
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     let lo = c / 12.92;
@@ -282,11 +302,25 @@ fn shade_earth(in: VsOut, n: vec3<f32>) -> vec3<f32> {
     let border = textureSample(border_tex, samp, in.uv).r;
     col = mix(col, srgb_to_linear(COAST) * (0.30 + 0.55 * day), border * 0.5 * (0.35 + 0.65 * day));
 
+    // Rivers, from the same Natural Earth data, drawn under the borders and in
+    // water's own colour: on a map with this much cyan on it, a line that is
+    // meant to read as water has to be the one blue thing on the ground.
+    let river = textureSample(river_tex, samp, in.uv).r;
+    col = mix(col, srgb_to_linear(RIVER) * (0.25 + 2.2 * day), river * RIVER_MIX * day);
+
     // Both line layers glow faintly once the Sun is off them. Emitted rather
     // than mixed, and ramped in on the same soft terminator the shading uses,
     // so it arrives the way city lights do instead of at a hard edge.
     let night = 1.0 - day;
     col += srgb_to_linear(COAST) * night * (coast * COAST_GLOW + border * BORDER_GLOW);
+
+    // ...and the cities light up, which is the one thing on this globe a
+    // photograph would agree with. Squared, because that is roughly what the
+    // eye does with a field of point sources seen from orbit: a dense core
+    // reads far brighter than twice a sparse edge, and the ramp keeps the
+    // suburbs from smearing every city into one blob.
+    let city = textureSample(city_tex, samp, in.uv).r;
+    col += srgb_to_linear(CITY) * night * city * city * CITY_GLOW;
 
     // Atmospheric limb. Brightest on the daylit edge, which is what gives the
     // globe its depth against a black background.

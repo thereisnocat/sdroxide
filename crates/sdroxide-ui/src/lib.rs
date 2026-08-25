@@ -10,6 +10,9 @@
 mod app;
 mod aprs_icons;
 mod aprs_map;
+/// The world the flat maps are drawn from — the globe's own land raster,
+/// sampled on the CPU, plus the border and river geometry and the city table.
+mod basemap;
 pub mod chrome;
 mod colormap;
 mod digi_map;

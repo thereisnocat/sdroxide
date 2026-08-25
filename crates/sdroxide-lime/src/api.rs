@@ -17,6 +17,7 @@ use sdroxide_types::LimeDevice;
 
 use crate::error::{Error, Result};
 use crate::ffi;
+use crate::trace::{self, Trace};
 
 struct ApiState {
     api: Option<Arc<ffi::Api>>,
@@ -102,21 +103,42 @@ pub struct Enumeration {
 /// Ask LimeSuite what is attached, or say why that is impossible — the
 /// distinction `--probe` needs between "no library" and "no devices".
 pub fn try_list() -> Result<Enumeration> {
+    // Its own trace, in its own slot: a scan that finds nothing is the report
+    // for "sdroxide does not see my board", and it must not overwrite the
+    // record of a session that did open one.
+    let t = Trace::new();
+    trace::remember_probe(&t);
     let mut s = state().lock().expect("lime api state poisoned");
-    let api = ensure_loaded(&mut s)?;
+    let api = match ensure_loaded(&mut s) {
+        Ok(a) => a,
+        Err(e) => {
+            t.call("dlopen", "LimeSuite", format!("FAILED: {e}"));
+            return Err(e);
+        }
+    };
+    t.set_identity(format!(
+        "LimeSuite {}{}",
+        api.version(),
+        if api.has_rfe() { "" } else { " (no LimeRFE support in this build)" }
+    ));
 
     // Two-call: a null pointer asks only for the count.
     let n = unsafe { (api.get_device_list)(std::ptr::null_mut()) };
     if n < 0 {
-        return Err(Error::api("LMS_GetDeviceList", api.err_text()));
+        let text = api.err_text();
+        t.call("LMS_GetDeviceList", "count", format!("FAILED: {text}"));
+        return Err(Error::api("LMS_GetDeviceList", text));
     }
     if n == 0 {
+        t.call("LMS_GetDeviceList", "count", "0 devices");
         return Ok(Enumeration { devices: Vec::new(), rejected: Vec::new() });
     }
     let mut buf = vec![[0 as c_char; ffi::INFO_STR_LEN]; n as usize];
     let n = unsafe { (api.get_device_list)(buf.as_mut_ptr()) };
     if n < 0 {
-        return Err(Error::api("LMS_GetDeviceList", api.err_text()));
+        let text = api.err_text();
+        t.call("LMS_GetDeviceList", "entries", format!("FAILED: {text}"));
+        return Err(Error::api("LMS_GetDeviceList", text));
     }
 
     let mut devices = Vec::new();
@@ -132,8 +154,10 @@ pub fn try_list() -> Result<Enumeration> {
         // that as a Lime board would hand back a receiver that hears nothing
         // and floods the log with transfer errors on the way.
         if LimeDevice::name_is_known(&dev.name) {
+            t.call("LMS_GetDeviceList", &info, "a Lime board");
             devices.push(dev);
         } else {
+            t.call("LMS_GetDeviceList", &info, "not a Lime board, ignored");
             rejected.push(info);
         }
     }

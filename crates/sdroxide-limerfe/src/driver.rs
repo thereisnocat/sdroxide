@@ -26,6 +26,7 @@ use sdroxide_types::{LimeRfeConfig, RfeLink, RfeMode};
 
 use crate::error::Result;
 use crate::frame::RfeState;
+use crate::trace::{self, Trace};
 use crate::transport::RfeTransport;
 
 /// The floor on how often anything is sent, whatever the transport says. The
@@ -247,6 +248,30 @@ pub enum Action {
     Mode(RfeMode),
 }
 
+/// One line for a report: what this transaction asked the board for.
+///
+/// Deliberately the same words the log uses. Somebody comparing a pasted
+/// report against a pasted log should not have to work out that they describe
+/// the same thing.
+fn describe_action(action: Action) -> String {
+    match action {
+        Action::Configure(st) => format!(
+            "{} in on {}, {} out on {}, relays {}{}{}",
+            st.channel_rx.label(),
+            st.port_rx.label(),
+            st.channel_tx.label(),
+            st.port_tx.label(),
+            st.mode.label(),
+            if st.notch { ", notch in" } else { "" },
+            match st.atten_steps {
+                0 => String::new(),
+                n => format!(", {} dB of attenuation", u16::from(n) * 2),
+            }
+        ),
+        Action::Mode(m) => format!("relays {}", m.label()),
+    }
+}
+
 /// Messages into the board's thread. Every one is last-value-wins.
 #[derive(Debug, Clone)]
 pub enum Ctrl {
@@ -322,16 +347,29 @@ pub fn spawn(mut transport: Box<dyn RfeTransport>, cfg: LimeRfeConfig) -> LimeRf
     let relay_settle = transport.round_trip() + TICK;
     let status = std::sync::Arc::new(std::sync::Mutex::new(None));
     let status_thread = std::sync::Arc::clone(&status);
+    // What this board was told, kept for a report. A front end that answers
+    // every command and passes no signal is diagnosed from exactly this, and
+    // on the serial link there is no other record of it anywhere.
+    let t = Trace::new();
+    t.set_link(&describe); // the transport's own description of the link
+    trace::remember(&t);
 
     let join = std::thread::Builder::new()
         .name("sdroxide-limerfe".into())
         .spawn(move || {
             let mut follower = Follower::new(cfg, transport.round_trip());
-            run(&mut *transport, &mut follower, &rx, &status_thread);
+            run(&mut *transport, &mut follower, &rx, &status_thread, &t);
             // Leave the board receiving rather than keyed, whatever happened
             // above — the same "shutdown is best-effort but unconditional"
             // rule the USB drivers apply to their radios.
-            let _ = transport.set_mode(RfeMode::Rx);
+            let stood_down = transport.set_mode(RfeMode::Rx);
+            t.note(
+                "shutdown: relays back to Receive",
+                match &stood_down {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("FAILED: {e}"),
+                },
+            );
         })
         .expect("spawn sdroxide-limerfe thread");
 
@@ -343,6 +381,7 @@ fn run(
     follower: &mut Follower,
     rx: &Receiver<Ctrl>,
     status: &std::sync::Mutex<Option<String>>,
+    trace: &Trace,
 ) {
     let tick = TICK;
     loop {
@@ -353,7 +392,10 @@ fn run(
                 Ok(Ctrl::Config(c)) => follower.set_config(*c),
                 Ok(Ctrl::RxFreq(hz)) => follower.set_rx_hz(hz),
                 Ok(Ctrl::TxFreq(hz)) => follower.set_tx_hz(hz),
-                Ok(Ctrl::Keyed(k)) => follower.set_keyed(k),
+                Ok(Ctrl::Keyed(k)) => {
+                    follower.set_keyed(k);
+                    trace.note(if k { "keyed" } else { "unkeyed" }, "");
+                }
                 Ok(Ctrl::Fan(on)) => {
                     if let Err(e) = transport.set_fan(on) {
                         tracing::warn!("LimeRFE fan: {e}");
@@ -398,9 +440,11 @@ fn run(
                         ),
                         Action::Mode(m) => tracing::info!("LimeRFE relays: {}", m.label()),
                     }
+                    trace.note(describe_action(action), "ok");
                 }
                 Err(e) => {
                     follower.on_error(Instant::now());
+                    trace.note(describe_action(action), format!("FAILED: {e}"));
                     let gone = follower.presence() == Presence::Absent;
                     if let Ok(mut s) = status.lock() {
                         *s = Some(if gone {
@@ -429,7 +473,10 @@ fn run(
                     Ctrl::Config(c) => follower.set_config(*c),
                     Ctrl::RxFreq(hz) => follower.set_rx_hz(hz),
                     Ctrl::TxFreq(hz) => follower.set_tx_hz(hz),
-                    Ctrl::Keyed(k) => follower.set_keyed(k),
+                    Ctrl::Keyed(k) => {
+                        follower.set_keyed(k);
+                        trace.note(if k { "keyed" } else { "unkeyed" }, "");
+                    }
                     Ctrl::Fan(on) => {
                         if let Err(e) = transport.set_fan(on) {
                             tracing::warn!("LimeRFE fan: {e}");

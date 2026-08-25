@@ -903,11 +903,18 @@ impl IqSource for LimeSource {
         {
             notes.push(n);
         }
-        // The cabling cost, stated once where it can be acted on.
-        if self.rfe.is_some()
-            && let Some(n) = self.cfg.rfe.switching_note()
-        {
-            notes.push(n);
+        // The cabling, stated once where it can be acted on: what an over
+        // costs on a shared connector, or which connector it leaves by on a
+        // split one.
+        if self.rfe.is_some() {
+            if let Some(n) = self.cfg.rfe.switching_note() {
+                notes.push(n);
+            }
+            if self.handle.can_tx()
+                && let Some(n) = self.cfg.rfe.connector_note()
+            {
+                notes.push(n);
+            }
         }
         // What the second chain is doing, when it is meant to be doing
         // something: an operator who turned diversity on and hears no

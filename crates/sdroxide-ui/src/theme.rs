@@ -773,6 +773,18 @@ pub struct MapPalette {
     pub sea: Color32,
     /// The dot matrix the continents are stippled in.
     pub land: Color32,
+    /// International borders and rivers, stippled into the same grid as the
+    /// land and so necessarily brighter than it: they are marks *on* the
+    /// ground, and a line the colour of the ground is not a line. The border
+    /// stays neutral and the river stays blue, because that is the one pair
+    /// the eye separates without a legend — and the two run together often
+    /// enough (a border drawn down a river) that they have to.
+    pub border: Color32,
+    pub river: Color32,
+    /// A populated place: the dot, and the name beside it. The name is dimmer
+    /// — it is there to be read once, not to compete with the stations.
+    pub city: Color32,
+    pub city_label: Color32,
     /// A decoded station with a known grid: a neutral dot, faded by age. Also
     /// the head of the transmit comet — the one mark that has to out-read
     /// every coloured one around it.
@@ -801,6 +813,10 @@ const fn map_from(p: &Palette) -> MapPalette {
     MapPalette {
         sea: p.input_bg,
         land: c(0x1c4458),
+        border: c(0x6d8b98),
+        river: c(0x2a7fbe),
+        city: c(0xc79a4e),
+        city_label: c(0x9a8560),
         station: Color32::WHITE,
         trail: c(0x00d0f4),
         comet: c(0x78f0ff),
@@ -819,6 +835,10 @@ const fn map_from(p: &Palette) -> MapPalette {
 const SCOPE_MAP_LIGHT: MapPalette = MapPalette {
     sea: c(0xdbe7f1),
     land: c(0x6b93a7),
+    border: c(0x2f4a57),
+    river: c(0x2f7fb8),
+    city: c(0x7a5210),
+    city_label: c(0x4a3a24),
     station: c(0x111a24), // the white dots inverted — anything paler vanishes
     trail: c(0x006d8f),
     comet: c(0x0b6ea8),
@@ -840,6 +860,10 @@ const SCOPE_MAP_LIGHT: MapPalette = MapPalette {
 const MAP_HIGH_CONTRAST: MapPalette = MapPalette {
     sea: c(0x000000),
     land: c(0x7a7a7a), // 4.9:1 on the sea — the coastline, not a suggestion
+    border: c(0xffffff),
+    river: c(0x4db8ff),
+    city: c(0xffcc00),
+    city_label: c(0xffcc00),
     station: c(0xffffff),
     trail: c(0x1aebff),
     comet: c(0x1aebff),

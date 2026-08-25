@@ -55,7 +55,6 @@ mod ui;
 mod voice;
 mod wefax;
 mod winlink;
-mod worldmask;
 mod wsjtx;
 mod wspr;
 
@@ -104,7 +103,6 @@ pub use entity::{
 };
 pub use geo::{
     bearing_deg, distance_km, great_circle_points, grid_bearing, grid_distance_km, grid_to_latlon,
-    is_land, land_cell, land_mask_dims,
 };
 pub use input::{
     Action, ActionInput, ActionKind, BindingTuning, ButtonMode, InputSettings, KeyBinding,

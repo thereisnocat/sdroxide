@@ -364,8 +364,20 @@ separately and shipped each as it landed):
    dropouts at the ÷64 decimation setting (`decimation_exp = 5`, the *lowest* of the six rates,
    still on the order of a couple of Msps at 16 bits — a nontrivial continuous TCP payload) —
    consistent with WiFi's own bandwidth headroom under real household loss patterns, not a protocol
-   or threading bug. This backend has only ever been asked to stream over LAN, not WiFi; not yet
-   tried over a wired connection to see whether the dropouts are WiFi-specific.
+   or threading bug.
+
+   **Confirmed wired-LAN clean through ÷8, breaking up at ÷4 and ÷2** the same day — settling the
+   WiFi question above (the WiFi dropouts really were WiFi's, not this crate's) and turning up a
+   real ceiling of its own: ÷4 and ÷2, the two highest-rate settings, both had "bad breakups" even
+   wired. Matches plain throughput arithmetic well enough to be the likely explanation rather than
+   a coincidence: at a 100 MHz ADC clock, ÷2 and ÷4 want roughly 1.6 Gbps and 800 Mbps of sustained
+   payload — at or above what 1GbE can carry — while ÷8's ~400 Mbps sits comfortably inside it,
+   matching exactly where clean stopped and breakup started. Unverified in the sense that this
+   crate does nothing to confirm the link speed or the radio's actual configured ADC clock, so
+   treat the specific numbers as illustrative, not measured — but the boundary landing precisely at
+   ÷8/÷4 is a strong signal it is a wire-speed ceiling, not a bug. A practical takeaway for now:
+   ÷8 and coarser (the four lower rates) are the range to expect solid results in over ordinary
+   1GbE; ÷2/÷4 likely need a faster link, not a driver fix.
 4. **Separate mode + `sdroxide_dsp::Diversity` wiring** — the part this plan exists to answer
    the question about. Prove it against real antennas the way the RSPduo work already did.
 5. **24-bit, decimation range, GPS discipline/correction readout** — each is a small, mostly

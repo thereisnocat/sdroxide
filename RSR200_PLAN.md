@@ -720,13 +720,21 @@ separately and shipped each as it landed):
    Confirmed fixed the same session: Ralph reports Serial mode audio "sounds normal now."
    `cargo build`/`cargo test -p sdroxide-rsr200` (38/38) and `cargo clippy` clean after the fix.
 
-   **A fourth item, tested the same day, not a bug**: "Solve for hardware diversity" on a real
-   local station (÷64, the narrowest available span) reported `"not representable in the radio's
-   0.001..8x range"` — the covariance solve found essentially zero correlation between the two
-   antennas for that signal, which the eigendecomposition math confirms is a real, meaningful
-   answer (see `covariance_eigen`'s degenerate-fallback case), not a software fault. Two genuinely
-   separate antennas, each with their own local noise, are not guaranteed to show a usable
-   correlation for every signal — that is an antenna-siting question, not one code can solve.
+   **A fourth item, tested the same day, believed not a bug — since called into question**:
+   "Solve for hardware diversity" on a real local station (÷64, the narrowest available span)
+   reported `"not representable in the radio's 0.001..8x range"` — the covariance solve found
+   essentially zero correlation between the two antennas for that signal, which the
+   eigendecomposition math confirms is a real, meaningful answer (see `covariance_eigen`'s
+   degenerate-fallback case), not a software fault. Two genuinely separate antennas, each with
+   their own local noise, are not guaranteed to show a usable correlation for every signal — that
+   is an antenna-siting question, not one code can solve. **Caveat, found afterward the same
+   day**: Ralph discovered one of the two antennas had been disconnected during this test. A dead
+   channel is *also* a real, correct way to produce near-zero measured correlation — so this
+   result, and the earlier whole-span Decorrelate/Adaptive real-antenna findings above (both from
+   testing on the same bench setup), may have been measuring "one antenna wasn't hearing
+   anything" rather than genuine two-antenna RF physics. Not retracted, but not confirmed either —
+   Ralph is retesting with both antennas actually connected; treat every "confirmed against real
+   antennas" claim in this document from 2026-08-25 as provisional until that retest lands.
    Because the solve failed, the Hardware diversity fields were never updated from their saved
    default (unity, 1.0/0°) when Ralph then switched into Hardware Diversity mode, which explains
    the "no signal change" report: switching into an unsolved, unity weight is a near no-op by

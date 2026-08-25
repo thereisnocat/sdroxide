@@ -3,10 +3,15 @@ name = "sdroxide-rsr200"
 version.workspace = true
 edition.workspace = true
 
-# Reuter RSR200(B) support. This crate starts with `protocol` — pure wire-format
-# math, no I/O, no sdroxide-types dependency (see that module's own doc) — per
-# RSR200_PLAN.md's suggested build order, step 1. Transport (`usb`/`lan`) and
-# the rest of the backend land in later steps.
+# Reuter RSR200(B) support. `protocol` and `device` are pure logic with no
+# I/O and no sdroxide-types dependency (see `protocol`'s own doc) -- the
+# only two pieces that needed neither. `lan`, `stream` and `handle` are the
+# real backend: a TCP transport, a worker thread, and the public API
+# src/rsr200_source.rs (outside this crate) calls.
 [dependencies]
+crossbeam-channel.workspace = true
 num-complex.workspace = true
+rtrb.workspace = true
+sdroxide-types.workspace = true
 thiserror.workspace = true
+tracing.workspace = true

@@ -630,7 +630,20 @@ use sdroxide_types::{
 /// A field appended to the radio configuration, which rides in both a command
 /// and an event, so a v89 peer would read the tail of either as garbage — the
 /// handshake's equality test is what stops it trying.
-pub const PROTO_VERSION: u16 = 90;
+///
+/// **91** — a Reuter RSR200(B) can be driven over its LAN interface
+/// (`RSR200_PLAN.md` step 3; issue #153's own hardware-diversity plan next
+/// to it). [`sdroxide_types::Backend`] gained `Rsr200`, appended last for
+/// the same reason every backend before it did; [`sdroxide_types::RadioConfig`]
+/// gained `rsr200: `[`sdroxide_types::Rsr200Config`]`, appended after
+/// `hydrasdr` for the same reason as every field above it. Only the LAN
+/// transport, single channel, 16-bit exist behind this so far.
+///
+/// The `Backend` append is what forces the bump (postcard numbers variants
+/// by declaration index, so a v90 peer handed `Rsr200` has no variant to
+/// decode it into); the `RadioConfig` field append is the same positional
+/// trap as every other config field before it.
+pub const PROTO_VERSION: u16 = 91;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1538,10 +1551,14 @@ mod tests {
                 },
                 ..sdroxide_types::SdrPlayConfig::default()
             },
-            // The last block in the struct, and the one most worth filling in:
-            // every field here differs from its neighbours' defaults, because a
-            // field-order slip only shows where two adjacent fields disagree.
-            // The nested LimeRFE block is the part that decides whether an
+            // Not the last block in the struct any more (soapy, hydrasdr and
+            // rsr200 all landed after it and, soapy and hydrasdr at least,
+            // were never given their own entries here — a gap, not a
+            // deliberate omission; rsr200 below doesn't repeat it) — but
+            // still worth filling in on its own terms: every field here
+            // differs from its neighbours' defaults, because a field-order
+            // slip only shows where two adjacent fields disagree. The
+            // nested LimeRFE block is the part that decides whether an
             // amplifier is switched into the transmit path, so it gets
             // non-default ports, a non-default channel and a non-default mode.
             lime: LimeConfig {
@@ -1590,6 +1607,17 @@ mod tests {
                     ps_rate: 0.8,
                     ps_frozen: false,
                 },
+            },
+            // The actual last block in the struct now — every field genuinely
+            // non-default, per the same reasoning as lime's own comment above.
+            rsr200: sdroxide_types::Rsr200Config {
+                host: "192.168.1.50".into(),
+                port: 55123,
+                adc_clock_hz: 100e6,
+                gps_discipline: false,
+                decimation_exp: 5,
+                attenuator1: 12,
+                attenuator2: 20,
             },
             ..RadioConfig::default()
         };

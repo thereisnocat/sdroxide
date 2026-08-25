@@ -2114,6 +2114,150 @@ pub(in crate::app) fn settings_icomnet_tab(
     );
 }
 
+/// Reuter RSR200(B) over LAN — the only transport `sdroxide-rsr200` streams
+/// yet (`RSR200_PLAN.md` step 3). No Discover button, same reasoning as
+/// [`settings_icomnet_tab`]: the radio does not announce itself, so the
+/// address is always typed in. No device list either — unlike the USB
+/// backends above, there is nothing on this machine's bus to enumerate.
+///
+/// Host, port, ADC clock, decimation and GPS discipline all move the sample
+/// rate or the connection itself, so — like `settings_sdrplay_tab`'s own
+/// device/rate/bandwidth fields — changing any of them sets `apply` rather
+/// than taking effect immediately. The two attenuators are the opposite: real
+/// front-end elements the running stream can move live, so they ride
+/// `Command::SetGain` the moment the slider moves, the same as every other
+/// backend's own gain controls.
+pub(in crate::app) fn settings_rsr200_tab(
+    ui: &mut egui::Ui,
+    radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    apply: &mut bool,
+    cmds: &mut Vec<Command>,
+) {
+    use sdroxide_types::Rsr200Config;
+    let Some(cfg) = radio_edit.as_mut() else {
+        ui.label("Waiting for the configuration of the machine the radio is attached to.");
+        return;
+    };
+
+    let before = (
+        cfg.rsr200.host.clone(),
+        cfg.rsr200.port,
+        cfg.rsr200.adc_clock_hz,
+        cfg.rsr200.decimation_exp,
+        cfg.rsr200.gps_discipline,
+    );
+
+    egui::Grid::new("rsr200-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Radio address");
+        crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut cfg.rsr200.host)
+                .desired_width(220.0)
+                .hint_text("host or IP, e.g. 192.168.1.50"),
+        );
+        ui.end_row();
+
+        ui.label("Port");
+        crate::chrome::field(ui, DragValue::new(&mut cfg.rsr200.port).range(1..=65535)).on_hover_text(format!(
+            "{} unless it has been changed on the radio.",
+            Rsr200Config::DEFAULT_PORT
+        ));
+        ui.end_row();
+
+        ui.label("ADC clock").on_hover_text(
+            "The RSR200's own sampling clock, ahead of decimation. A \
+             GPS-disciplined clock locks to a fixed rate for long-term \
+             frequency accuracy instead of free-running.",
+        );
+        let mut mhz = cfg.rsr200.adc_clock_hz / 1e6;
+        if crate::chrome::field(
+            ui,
+            DragValue::new(&mut mhz)
+                .range(Rsr200Config::ADC_CLOCK_MIN_HZ / 1e6..=Rsr200Config::ADC_CLOCK_MAX_HZ / 1e6)
+                .suffix(" MHz")
+                .speed(0.1),
+        )
+        .changed()
+        {
+            cfg.rsr200.adc_clock_hz = mhz * 1e6;
+        }
+        ui.end_row();
+
+        ui.label("Decimation")
+            .on_hover_text("Divides the ADC clock down to the rate sdroxide actually streams.");
+        ComboBox::from_id_salt("rsr200_decimation")
+            .selected_text(format!(
+                "÷{} ({:.3} Msps)",
+                Rsr200Config::decimation_rate(cfg.rsr200.decimation_exp),
+                cfg.rsr200.sample_rate_hz() / 1e6
+            ))
+            .show_styled(ui, |ui| {
+                for exp in Rsr200Config::DECIMATION_EXPS {
+                    let rate = Rsr200Config::decimation_rate(exp);
+                    let sps = cfg.rsr200.adc_clock_hz / f64::from(rate);
+                    if ui
+                        .selectable_label(cfg.rsr200.decimation_exp == exp, format!("÷{rate} ({:.3} Msps)", sps / 1e6))
+                        .clicked()
+                    {
+                        cfg.rsr200.decimation_exp = exp;
+                    }
+                }
+            });
+        ui.end_row();
+
+        ui.label("GPS-disciplined clock").on_hover_text(
+            "Locks the ADC clock to the RSR200's onboard GPS for long-term \
+             frequency accuracy. Needs a GPS antenna connected and a fix.",
+        );
+        ui.checkbox(&mut cfg.rsr200.gps_discipline, "");
+        ui.end_row();
+
+        ui.label("Attenuator 1");
+        {
+            let mut att = cfg.rsr200.attenuator1;
+            if crate::chrome::slider(ui, Slider::new(&mut att, 0..=Rsr200Config::ATTENUATOR_MAX_DB).suffix(" dB")).changed() {
+                cfg.rsr200.attenuator1 = att;
+                push_gain(cmds, Rsr200Config::ATT1_ELEMENT, -f64::from(att));
+            }
+        }
+        ui.end_row();
+
+        ui.label("Attenuator 2");
+        {
+            let mut att = cfg.rsr200.attenuator2;
+            if crate::chrome::slider(ui, Slider::new(&mut att, 0..=Rsr200Config::ATTENUATOR_MAX_DB).suffix(" dB")).changed() {
+                cfg.rsr200.attenuator2 = att;
+                push_gain(cmds, Rsr200Config::ATT2_ELEMENT, -f64::from(att));
+            }
+        }
+        ui.end_row();
+    });
+
+    if before
+        != (
+            cfg.rsr200.host.clone(),
+            cfg.rsr200.port,
+            cfg.rsr200.adc_clock_hz,
+            cfg.rsr200.decimation_exp,
+            cfg.rsr200.gps_discipline,
+        )
+    {
+        *apply = true;
+    }
+
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Reuter RSR200 support is new and has not been verified against real \
+             hardware: no RSR200 has been reachable to test sdroxide-rsr200 against. \
+             Single channel, 16-bit over LAN only — 24-bit, dual channel and USB are \
+             not wired up yet. Address, port, ADC clock, decimation and GPS \
+             discipline take effect on Apply; the attenuators apply as you move them.",
+        )
+        .weak(),
+    );
+}
+
 /// Kept as a function so the UI crate needs no dependency on the backend crate
 /// just to repeat one sentence.
 fn sdroxide_icomnet_hint() -> &'static str {

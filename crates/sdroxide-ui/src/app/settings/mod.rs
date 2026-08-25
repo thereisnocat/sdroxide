@@ -38,8 +38,8 @@ use self::radio::{
     settings_airspy_tab, settings_airspyhf_tab, settings_cat_tab, settings_elad_tab,
     settings_hackrf_tab, settings_hpsdr_tab, settings_hydrasdr_tab, settings_icomnet_tab,
     settings_lime_tab, settings_pluto_tab, settings_rtlsdr_tab, settings_rtltcp_tab,
-    settings_rx888_tab, settings_sdrplay_tab, settings_smartsdr_tab, settings_soapy_devices,
-    settings_soapy_tab, settings_spyserver_tab, settings_tci_tab,
+    settings_rsr200_tab, settings_rx888_tab, settings_sdrplay_tab, settings_smartsdr_tab,
+    settings_soapy_devices, settings_soapy_tab, settings_spyserver_tab, settings_tci_tab,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use self::remote::settings_remote_tab;
@@ -1861,6 +1861,9 @@ impl SdroxideApp {
                         &self.icomnet_test_result,
                         io.can_probe,
                     ),
+                    Backend::Rsr200 => {
+                        settings_rsr200_tab(ui, io.radio_edit, io.apply_iface, cmds);
+                    }
                     Backend::SmartSdr => settings_smartsdr_tab(
                         ui,
                         &self.smartsdr_devices,

@@ -16,6 +16,7 @@ mod local_controller;
 mod null_source;
 mod panadapter_source;
 mod pluto_source;
+mod rsr200_source;
 mod rtlsdr_source;
 mod rx888_source;
 mod sdrplay_source;
@@ -1376,6 +1377,7 @@ fn open_configured_source(
         Backend::AirspyHf => open_airspyhf_source(radio, cli.center_hz()),
         Backend::Airspy => open_airspy_source(radio, cli.center_hz()),
         Backend::HydraSdr => open_hydrasdr_source(radio, cli.center_hz()),
+        Backend::Rsr200 => open_rsr200_source(radio, cli.center_hz()),
         Backend::HackRf => open_hackrf_source(radio, cli.center_hz()),
         Backend::SdrPlay => open_sdrplay_source(radio, cli.center_hz()),
         Backend::Elad => open_elad_source(radio, cli.center_hz()),
@@ -1904,6 +1906,64 @@ fn hydrasdr_caps(src: &hydrasdr_source::HydraSdrSource) -> DeviceCaps {
             max_db: (HydraSdrConfig::GAIN_STEPS - 1) as f64,
             step_db: 1.0,
         }],
+        ..DeviceCaps::default()
+    }
+}
+
+/// Build the RSR200 source from radio.json. Fails outright with no host
+/// configured — there is no USB fallback to enumerate the way every other
+/// backend here has, since the radio is only reachable over the network.
+fn open_rsr200_source(
+    radio: &RadioConfig,
+    center_hz: f64,
+) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
+    let src =
+        rsr200_source::Rsr200Source::open(&radio.rsr200, center_hz).context("opening RSR200")?;
+    let caps = rsr200_caps(&src);
+    Ok((Box::new(src), caps))
+}
+
+/// Capabilities for a Reuter RSR200(B): wideband IQ, receive only, HF/VHF.
+///
+/// Single channel and a single achieved rate — `sdroxide-rsr200` streams no
+/// other shape yet (`RSR200_PLAN.md` steps 1–3), so there is nothing to
+/// offer a rate ladder over. The tuning range is the ADC clock's own
+/// Nyquist span (`0..adc_clock_hz/2`, per `sdroxide_rsr200::protocol::tune_for`),
+/// which moves with [`Rsr200Config::adc_clock_hz`] rather than being fixed
+/// the way a tuner chip's range would be — so it is read off the open
+/// source rather than hardcoded, the same reasoning `hydrasdr_caps` above
+/// applies to its own sample-rate list.
+///
+/// Two gain elements, the front-end attenuators — both real dB values, so
+/// (unlike HydraSDR's curve-and-switches split) neither needs a pseudo-
+/// element of its own.
+fn rsr200_caps(src: &rsr200_source::Rsr200Source) -> DeviceCaps {
+    use sdroxide_types::{Direction, GainElement, Rsr200Config};
+    let half = src.sample_rate() / 2.0;
+    DeviceCaps {
+        driver: "rsr200".into(),
+        label: src.describe(),
+        rx_channels: 1,
+        tx_channels: 0,
+        audio_mode: false,
+        freq_ranges_rx: vec![(0.0, half)],
+        sample_rates: vec![src.sample_rate()],
+        gains: vec![
+            GainElement {
+                name: Rsr200Config::ATT1_ELEMENT.into(),
+                direction: Direction::Rx,
+                min_db: -f64::from(Rsr200Config::ATTENUATOR_MAX_DB),
+                max_db: 0.0,
+                step_db: 1.0,
+            },
+            GainElement {
+                name: Rsr200Config::ATT2_ELEMENT.into(),
+                direction: Direction::Rx,
+                min_db: -f64::from(Rsr200Config::ATTENUATOR_MAX_DB),
+                max_db: 0.0,
+                step_db: 1.0,
+            },
+        ],
         ..DeviceCaps::default()
     }
 }

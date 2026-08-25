@@ -324,9 +324,36 @@ separately and shipped each as it landed):
    the three socket tests stable across repeated runs. Single channel, 16-bit is what's been
    exercised (no radio, and no USB transport, exists yet to try 24-bit or dual-channel against);
    the format-handling code itself is generic across both, per the plan's own crate-layout intent.
-3. **`Backend::Rsr200` registration**: config struct, `open_rsr200_source()`, settings tab —
-   even a minimal one, to get real spectrum on screen and close the loop on whether everything
-   above actually works against the real radio, not just against a protocol-level test harness.
+3. **Done. `Backend::Rsr200` registration** (branch `rsr200`) — `sdroxide-rsr200::handle`
+   (`Ctrl`/`Pending`/`Shared`/`push_iq`/`ring_for`/`Rsr200Handle`, the same shape as
+   `sdroxide-rtlsdr::handle`) and `sdroxide-rsr200::stream` (the worker thread: owns the
+   transport and the `Device`, drains one, feeds the other, pushes converted samples through an
+   `rtrb` ring — connect-and-configure-or-fail blocking synchronously inside `spawn()` so a wrong
+   address comes back as an ordinary open error, not a stream that silently never starts); then,
+   outside the crate, `src/rsr200_source.rs` (the `IqSource` impl, modelled on
+   `hydrasdr_source.rs`), `Rsr200Config`/`Backend::Rsr200`/`RadioConfig.rsr200` in
+   `sdroxide-types` (postcard-positional append, `PROTO_VERSION` 90 → 91), and
+   `settings_rsr200_tab` in `sdroxide-ui` (modelled on `settings_tci_tab`/`settings_icomnet_tab`:
+   no Discover button, no device list — the radio neither announces itself nor sits on this
+   machine's USB bus).
+   One deliberate design split, decided here rather than inherited from the C++ original (which
+   has no such distinction because it owns the ring's sizing dynamically): the two attenuators are
+   *live*, riding `Command::SetGain` straight to the running stream thread, because they're real
+   front-end elements the radio can move without touching the socket; host, port, ADC clock,
+   decimation and GPS discipline are all *reopen-triggers* instead — a `before != after` check in
+   `settings_rsr200_tab` sets `apply`, the same convention `sdrplay_source.rs` already uses for its
+   own device/rate/bandwidth fields — because any of the latter changes the sample rate, and
+   `sdroxide-rsr200` does not resize its `rtrb` ring on the fly. (`ADC_CLOCK_ELEMENT`/
+   `GPS_DISCIPLINE_ELEMENT`/`DECIMATION_ELEMENT` gain-element consts were drafted for the opposite,
+   all-live design before this split was settled, then removed as dead code once it wasn't.)
+   `cargo build -p sdroxide`: clean. `cargo test` across `sdroxide`, `sdroxide-ui`,
+   `sdroxide-rsr200`, `sdroxide-types`, `sdroxide-proto`: all green, `sdroxide-rsr200` itself now
+   38/38 (the 33 from steps 1–2 plus 5 new for `handle::Pending`/`push_iq`/`ring_for`). `cargo
+   clippy --all-targets` on the same five crates: no new warnings — the handful clippy reports are
+   all pre-existing, in unrelated files this work never touched. Single channel, 16-bit, LAN is the
+   whole of what streams: still genuinely untested against a real RSR200, since none has been
+   reachable to test any of this against — that gap is exactly what step 3 exists to close, and
+   `Rsr200Source::open_status()` says so plainly in the UI until it has been.
 4. **Separate mode + `sdroxide_dsp::Diversity` wiring** — the part this plan exists to answer
    the question about. Prove it against real antennas the way the RSPduo work already did.
 5. **24-bit, decimation range, GPS discipline/correction readout** — each is a small, mostly

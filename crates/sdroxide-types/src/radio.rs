@@ -140,10 +140,15 @@ pub enum Backend {
     /// shares the Airspy's USB id. Appended last, for the same reason as
     /// `SmartSdr` above.
     HydraSdr,
+    /// Reuter RSR200(B), a two-ADC HF/VHF direct-sampling receiver, GPS
+    /// disciplined, reached over its LAN interface (TCP). Only the LAN
+    /// transport, single channel, 16-bit exist yet — see `RSR200_PLAN.md`.
+    /// Appended last, for the same reason as `SmartSdr` above.
+    Rsr200,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 20] = [
+    pub const ALL: [Backend; 21] = [
         Backend::Auto,
         Backend::Soapy,
         Backend::Cat,
@@ -164,6 +169,7 @@ impl Backend {
         Backend::Elad,
         Backend::Lime,
         Backend::HydraSdr,
+        Backend::Rsr200,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -187,6 +193,7 @@ impl Backend {
             Backend::Elad => "ELAD FDM-DUO / FDM-S (USB)",
             Backend::Lime => "LimeSDR + LimeRFE (LimeSuite)",
             Backend::HydraSdr => "HydraSDR RFOne (USB)",
+            Backend::Rsr200 => "Reuter RSR200 (LAN)",
             Backend::None => "Not configured",
         }
     }
@@ -4219,6 +4226,85 @@ impl HydraSdrConfig {
     pub const FREQ_RANGE: (f64, f64) = (24.0e6, 1_800.0e6);
 }
 
+/// Reuter RSR200(B), reached over its LAN interface (TCP). Receive only,
+/// single channel, 16-bit — the only wire shape a transport exists for yet
+/// (`sdroxide_rsr200::lan`; see `RSR200_PLAN.md`). USB, 24-bit and the
+/// dual-channel Separate/Diversity modes are all real capabilities of the
+/// radio with no host-side wiring for them yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rsr200Config {
+    /// LAN host/IP. Empty means nothing configured yet, and opening fails
+    /// with a clear message rather than guessing an address.
+    pub host: String,
+    pub port: u16,
+    /// 70..200 MHz. What actually sets the Nyquist-zone grid tuning works
+    /// against — not a sample-rate control by itself, see
+    /// [`Self::sample_rate_hz`].
+    pub adc_clock_hz: f64,
+    /// Discipline the ADC clock from GPS when the radio has a lock. Off
+    /// leaves it free-running at whatever `adc_clock_hz` asked for.
+    pub gps_discipline: bool,
+    /// 0..=5; sample rate = `adc_clock_hz / 2^(decimation_exp+1)`.
+    pub decimation_exp: i32,
+    /// Front-end attenuators, 0..35 dB, one per ADC input — independent
+    /// settings, not a single shared one, because the two channels can be
+    /// on entirely different aerials.
+    pub attenuator1: i32,
+    pub attenuator2: i32,
+}
+
+impl Default for Rsr200Config {
+    fn default() -> Self {
+        Rsr200Config {
+            host: String::new(),
+            port: Self::DEFAULT_PORT,
+            adc_clock_hz: 125e6,
+            gps_discipline: true,
+            decimation_exp: 3,
+            attenuator1: 0,
+            attenuator2: 0,
+        }
+    }
+}
+
+impl Rsr200Config {
+    /// Matches `sdroxide_rsr200::protocol::LAN_TCP_PORT` — duplicated
+    /// rather than depended on, since this crate must not depend on any
+    /// native backend crate (see this file's own boundary note on
+    /// [`DiversityMode`]).
+    pub const DEFAULT_PORT: u16 = 55557;
+
+    pub const ADC_CLOCK_MIN_HZ: f64 = 70.0e6;
+    pub const ADC_CLOCK_MAX_HZ: f64 = 200.0e6;
+    pub const ATTENUATOR_MAX_DB: i32 = 35;
+    /// `decimation_exp`'s own range — rate `2` to `64`.
+    pub const DECIMATION_EXPS: [i32; 6] = [0, 1, 2, 3, 4, 5];
+
+    /// The two front-end attenuators are the only settings here that ride
+    /// live over `Command::SetGain` — real elements `sdroxide_rsr200`'s
+    /// running stream thread can move without touching the socket. Every
+    /// other field (`host`, `port`, `adc_clock_hz`, `decimation_exp`,
+    /// `gps_discipline`) moves the sample rate or the connection itself, so
+    /// `settings_rsr200_tab` treats a change to any of those as a
+    /// reopen-trigger instead — the same split `sdrplay_source.rs` draws
+    /// between its own live gain controls and its device/rate/bandwidth
+    /// fields.
+    pub const ATT1_ELEMENT: &'static str = "ATT1";
+    pub const ATT2_ELEMENT: &'static str = "ATT2";
+
+    /// `decimation_exp` → the divisor it selects (`2^(exp+1)`), matching
+    /// `sdroxide_rsr200::protocol::decimation_rate` without this crate
+    /// depending on that one.
+    pub fn decimation_rate(exp: i32) -> u32 {
+        1 << (exp.clamp(0, 5) + 1)
+    }
+
+    pub fn sample_rate_hz(&self) -> f64 {
+        self.adc_clock_hz / f64::from(Self::decimation_rate(self.decimation_exp))
+    }
+}
+
 /// AD9361 receive AGC mode. The names are the IIO `gain_control_mode` values,
 /// which is what actually goes on the wire.
 ///
@@ -5564,6 +5650,9 @@ pub struct RadioConfig {
     /// HydraSDR RFOne. Appended after `soapy`, for the same reason as every
     /// field above it.
     pub hydrasdr: HydraSdrConfig,
+    /// Reuter RSR200(B). Appended after `hydrasdr`, for the same reason as
+    /// every field above it.
+    pub rsr200: Rsr200Config,
 }
 
 #[cfg(test)]

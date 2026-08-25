@@ -90,6 +90,7 @@ sdroxide-airspyhf = { path = "crates/sdroxide-airspyhf" }
 sdroxide-airspy = { path = "crates/sdroxide-airspy" }
 sdroxide-hydrasdr = { path = "crates/sdroxide-hydrasdr" }
 sdroxide-hackrf = { path = "crates/sdroxide-hackrf" }
+sdroxide-rsr200 = { path = "crates/sdroxide-rsr200" }
 sdroxide-pluto = { path = "crates/sdroxide-pluto" }
 sdroxide-sdrplay = { path = "crates/sdroxide-sdrplay" }
 sdroxide-elad = { path = "crates/sdroxide-elad" }
@@ -150,6 +151,7 @@ sdroxide-airspyhf.workspace = true
 sdroxide-airspy.workspace = true
 sdroxide-hydrasdr.workspace = true
 sdroxide-hackrf.workspace = true
+sdroxide-rsr200.workspace = true
 sdroxide-pluto.workspace = true
 sdroxide-sdrplay.workspace = true
 sdroxide-elad.workspace = true

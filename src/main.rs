@@ -1919,7 +1919,7 @@ fn open_rsr200_source(
 ) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
     let src =
         rsr200_source::Rsr200Source::open(&radio.rsr200, center_hz).context("opening RSR200")?;
-    let caps = rsr200_caps(&src);
+    let caps = rsr200_caps(&src, &radio.rsr200);
     Ok((Box::new(src), caps))
 }
 
@@ -1927,26 +1927,42 @@ fn open_rsr200_source(
 ///
 /// Single channel and a single achieved rate — `sdroxide-rsr200` streams no
 /// other shape yet (`RSR200_PLAN.md` steps 1–3), so there is nothing to
-/// offer a rate ladder over. The tuning range is the ADC clock's own
-/// Nyquist span (`0..adc_clock_hz/2`, per `sdroxide_rsr200::protocol::tune_for`),
-/// which moves with [`Rsr200Config::adc_clock_hz`] rather than being fixed
-/// the way a tuner chip's range would be — so it is read off the open
-/// source rather than hardcoded, the same reasoning `hydrasdr_caps` above
-/// applies to its own sample-rate list.
+/// offer a rate ladder over.
+///
+/// **The tuning range is *not* the ADC clock's own Nyquist span.** A real
+/// bug, found on real hardware the day after step 8 shipped VHF switching:
+/// this used to report `0..adc_clock_hz/2` (the first Nyquist zone only),
+/// which is what a plain zero-IF/baseband-only source would offer — wrong
+/// for the RSR200, whose entire tuning design
+/// (`sdroxide_rsr200::protocol::tune_for`) is built to reach *far* higher by
+/// undersampling into higher Nyquist zones, exactly as the OM's own worked
+/// examples do (a 125 MHz ADC clock's 3rd zone reaches 155 MHz). Reporting
+/// the narrow Nyquist-half range meant the engine's own receive-range guard
+/// silently clamped/relabelled any tune request outside it — invisible for
+/// ordinary HF use (small span, narrow clamp, easy to miss), but glaring
+/// once VHF input was tried: tuning to 88.3 MHz (WBGO) displayed as roughly
+/// 800 kHz, because the guard clamped the request down into whatever tiny
+/// Nyquist-half the current decimation happened to produce, while
+/// `tune_for`'s own zone math still received and correctly placed the real
+/// station. Fixed: the reported range is now the radio's own documented
+/// −3 dB front-end limits (`RSR200_OM_V225.pdf` §4, "Specifications") for
+/// whichever input is selected — 1 kHz – 66 MHz on HF1/HF2,
+/// 66 – 150 MHz on VHF — which is what actually bounds what can be
+/// received, independent of decimation or ADC clock.
 ///
 /// Two gain elements, the front-end attenuators — both real dB values, so
 /// (unlike HydraSDR's curve-and-switches split) neither needs a pseudo-
 /// element of its own.
-fn rsr200_caps(src: &rsr200_source::Rsr200Source) -> DeviceCaps {
+fn rsr200_caps(src: &rsr200_source::Rsr200Source, cfg: &sdroxide_types::Rsr200Config) -> DeviceCaps {
     use sdroxide_types::{Direction, GainElement, Rsr200Config};
-    let half = src.sample_rate() / 2.0;
+    let rx_range = if cfg.use_vhf { (66_000_000.0, 150_000_000.0) } else { (1_000.0, 66_000_000.0) };
     DeviceCaps {
         driver: "rsr200".into(),
         label: src.describe(),
         rx_channels: 1,
         tx_channels: 0,
         audio_mode: false,
-        freq_ranges_rx: vec![(0.0, half)],
+        freq_ranges_rx: vec![rx_range],
         sample_rates: vec![src.sample_rate()],
         gains: vec![
             GainElement {

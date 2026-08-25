@@ -736,6 +736,39 @@ separately and shipped each as it landed):
    and does not have either — `format.channels` is already unconditionally 2 for `HardwareDiversity`
    via the same `is_dual()` fixed above, and channel A is already the one read as output.
 
+   **A fifth real bug, found the same day, once Ralph turned VHF on and tuned to the FM broadcast
+   band**: WBGO at 88.3 MHz displayed at roughly 800 kHz — real content, wildly mislabelled.
+   Root cause was `src/main.rs`'s `rsr200_caps()`, pre-dating step 8 entirely: it reported the
+   radio's tunable receive range as `0..adc_clock_hz/2` — the ADC's own first-Nyquist-zone half,
+   the shape a plain zero-IF source has. Wrong for this radio: `tune_for`'s whole tuning design
+   reaches far higher by undersampling into higher Nyquist zones (the OM's own worked example: a
+   125 MHz clock's 3rd zone reaches 155 MHz), which is the entire point of the VHF input this step
+   added. Reporting the narrow Nyquist-half range meant the engine's own receive-range guard
+   silently clamped every VHF tune down into whatever tiny half the current decimation produced —
+   invisible for ordinary HF use (a small, easily-missed clamp), glaring once a real VHF station
+   was tuned. **Fixed**: `rsr200_caps` now reports the radio's own documented −3 dB front-end
+   limits (`RSR200_OM_V225.pdf` §4, "Specifications") for whichever input is selected — 1 kHz –
+   66 MHz on HF1/HF2, 66 – 150 MHz on VHF — independent of ADC clock or decimation, which only
+   ever bounded the visible span's width, never which absolute frequencies are reachable.
+   Confirmed fixed live: Ralph reports getting "FM all over the place" briefly while learning the
+   new VHF range's edges, then "was able to finally navigate to the actual frequencies and get
+   them properly aligned."
+
+   **A real, related UX gap this exposed, not itself a bug**: HF's `[1 kHz, 66 MHz]` and VHF's
+   `[66, 150 MHz]` ranges are disjoint from each other's *usable interior* — the desktop frequency
+   dial (`crates/sdroxide-ui/src/widgets/freq_display.rs`'s `show()`) only supports per-digit
+   scroll/click, each commit validated and applied immediately, with no way to type a whole new
+   number at once. Jumping from deep in one band to deep in the other one digit at a time crosses
+   invalid territory at every intermediate step and gets rejected before the next digit can be
+   reached — every prior backend in this workspace has had one contiguous range, so this never
+   came up before. The compact/phone layout already has exactly this escape hatch
+   (`show_typed` — tap the readout, type a whole frequency, Enter commits) that the desktop dial
+   never got. Worked around live by toggling VHF off, scrolling up to the HF ceiling, applying,
+   then toggling VHF back on — a reopen keeps the dial where it was if the new front end can still
+   hear it, landing just inside VHF's own floor with no crossing needed. Adding the same typed
+   fallback to the desktop dial would close this properly; not done as part of step 8, flagged
+   here for whoever picks it up next.
+
 ## 8. Open questions
 
 - **Answered and built, see `DECORRELATION_PLAN.md`**: sdroxide's manual-null / decorrelation-style

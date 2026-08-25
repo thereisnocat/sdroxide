@@ -5374,6 +5374,7 @@ dependencies = [
  "libloading 0.8.9",
  "num-complex",
  "rtrb",
+ "sdroxide-dsp",
  "sdroxide-types",
  "thiserror 2.0.19",
  "tracing",

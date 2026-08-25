@@ -1,17 +1,25 @@
 //! Reuter RSR200(B) support. See `RSR200_PLAN.md` at the workspace root for the
 //! full plan this crate is built against.
 //!
-//! Steps 1 (`protocol`) through 3 (`stream`/`handle`, the public API
-//! `src/rsr200_source.rs` outside this crate calls, plus `Backend::Rsr200`'s
-//! registration in `sdroxide-types`/`sdroxide-ui`) of that plan's suggested
-//! build order are done and verified against a real RSR200 — LAN wired and
-//! over WiFi, USB on Linux/macOS (`ffi`/`usb`, done out of order ahead of
-//! steps 4–6 at Ralph's request; Windows still needs its own research spike,
-//! see `RSR200_PLAN.md` §6). See `RSR200_PLAN.md`'s own step 3 and step 7
-//! entries for what each run turned up, including a real shutdown segfault
-//! USB testing found and fixed. Not yet: 24-bit or dual channel (Separate
-//! mode + `sdroxide_dsp::Diversity` wiring, step 4) — single channel,
-//! 16-bit is the whole of what streams today, over either transport.
+//! Steps 1–4 and 7 of that plan's suggested build order are done: protocol
+//! (`protocol`), the transport-agnostic device layer (`device`), USB and
+//! LAN transports (`usb`/`ffi`, `lan`), `Backend::Rsr200`'s registration in
+//! `sdroxide-types`/`sdroxide-ui`, and Separate mode
+//! (`handle::Rsr200Handle::read_pair`, both ADCs interleaved through one
+//! ring — see that method's own doc for why no `Pairer` like
+//! `sdroxide-sdrplay`'s is needed here). Step 7 was done out of order,
+//! ahead of steps 4–6, at Ralph's request; Windows USB still needs its own
+//! research spike, see `RSR200_PLAN.md` §6.
+//!
+//! Verified against a real RSR200: LAN wired and over WiFi, USB on
+//! Linux/macOS single-channel and Separate mode both (real, non-silent
+//! data from both ADCs, `sdroxide_dsp::Diversity::process()` run against
+//! it without panicking — see `examples/usb_dual_probe.rs`). See
+//! `RSR200_PLAN.md`'s own step 3, 4 and 7 entries for what each run turned
+//! up, including a real shutdown segfault USB testing found and fixed. Not
+//! yet: 24-bit, or the radio's own *hardware* combiner (a third, distinct
+//! wire shape, step 6) — and Separate mode's own *result* has not been
+//! judged against two real aerials, only proven to run.
 
 pub mod device;
 pub mod error;

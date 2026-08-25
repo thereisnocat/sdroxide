@@ -2114,26 +2114,32 @@ pub(in crate::app) fn settings_icomnet_tab(
     );
 }
 
-/// Reuter RSR200(B) over LAN — the only transport `sdroxide-rsr200` streams
-/// yet (`RSR200_PLAN.md` step 3). No Discover button, same reasoning as
+/// Reuter RSR200(B) over LAN or USB — one radio, one config, a Connection
+/// choice rather than a separate tab per transport (`RSR200_PLAN.md` step
+/// 7). No Discover button for LAN, same reasoning as
 /// [`settings_icomnet_tab`]: the radio does not announce itself, so the
-/// address is always typed in. No device list either — unlike the USB
-/// backends above, there is nothing on this machine's bus to enumerate.
+/// address is always typed in. No device list for USB either — unlike the
+/// USB backends above with their Rescan buttons, there is no live
+/// enumeration wired up here yet, just a serial field; empty opens the
+/// first D3XX device found.
 ///
-/// Host, port, ADC clock, decimation and GPS discipline all move the sample
-/// rate or the connection itself, so — like `settings_sdrplay_tab`'s own
-/// device/rate/bandwidth fields — changing any of them sets `apply` rather
-/// than taking effect immediately. The two attenuators are the opposite: real
-/// front-end elements the running stream can move live, so they ride
-/// `Command::SetGain` the moment the slider moves, the same as every other
-/// backend's own gain controls.
+/// Host, port, ADC clock, decimation, GPS discipline and channel mode all
+/// move the sample rate, the wire shape, or the connection itself, so —
+/// like `settings_sdrplay_tab`'s own device/rate/bandwidth/dual-tuner
+/// fields — changing any of them sets `apply` rather than taking effect
+/// immediately. The two attenuators, and (in
+/// [`sdroxide_types::Rsr200ChannelMode::Separate`]) the software diversity
+/// filter's own controls, are the opposite: real front-end elements or a
+/// pure software swap the running stream can move live, so they ride
+/// `Command::SetGain` the moment a control changes, the same as every
+/// other backend's own gain controls — see `RSR200_PLAN.md` step 4.
 pub(in crate::app) fn settings_rsr200_tab(
     ui: &mut egui::Ui,
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
     apply: &mut bool,
     cmds: &mut Vec<Command>,
 ) {
-    use sdroxide_types::{Rsr200Config, Rsr200Transport};
+    use sdroxide_types::{Rsr200ChannelMode, Rsr200Config, Rsr200Transport};
     let Some(cfg) = radio_edit.as_mut() else {
         ui.label("Waiting for the configuration of the machine the radio is attached to.");
         return;
@@ -2147,6 +2153,7 @@ pub(in crate::app) fn settings_rsr200_tab(
         cfg.rsr200.gps_discipline,
         cfg.rsr200.transport,
         cfg.rsr200.usb_serial.clone(),
+        cfg.rsr200.channel_mode,
     );
 
     egui::Grid::new("rsr200-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -2254,6 +2261,24 @@ pub(in crate::app) fn settings_rsr200_tab(
         ui.checkbox(&mut cfg.rsr200.gps_discipline, "");
         ui.end_row();
 
+        ui.label("Channels").on_hover_text(
+            "Single: one ADC, plain receiver. Separate: both ADCs, unrelated on the \
+             wire — the radio does no combining of its own — and combined here in \
+             software, the same filter the SDRplay RSPduo's own second-tuner mode \
+             uses. Not the radio's own hardware combiner, which this backend does \
+             not offer yet.",
+        );
+        ComboBox::from_id_salt("rsr200_channel_mode")
+            .selected_text(cfg.rsr200.channel_mode.label())
+            .show_styled(ui, |ui| {
+                for m in Rsr200ChannelMode::ALL {
+                    if ui.selectable_label(cfg.rsr200.channel_mode == m, m.label()).clicked() {
+                        cfg.rsr200.channel_mode = m;
+                    }
+                }
+            });
+        ui.end_row();
+
         ui.label("Attenuator 1");
         {
             let mut att = cfg.rsr200.attenuator1;
@@ -2275,6 +2300,166 @@ pub(in crate::app) fn settings_rsr200_tab(
         ui.end_row();
     });
 
+    if cfg.rsr200.channel_mode == Rsr200ChannelMode::Separate {
+        use sdroxide_types::{DIVERSITY_MAX_TAPS, DiversityMode, DiversityTechnique, diversity_cost_note};
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(RichText::new("Second ADC").strong());
+        ui.label(
+            RichText::new(
+                "Both ADCs share one synthesiser and one sample clock, resynchronised on a \
+                 documented event (DP 4.6) rather than redrawn by chance on every start — so, \
+                 unlike an RSPduo, the relative phase between the two channels is repeatable, \
+                 not just stable within a single run. That is what lets them be combined: \
+                 subtracted to null a local noise source on the second ADC's own antenna, or \
+                 added to ride out a fade on two aerials hearing the same station.",
+            )
+            .weak(),
+        );
+
+        let sps = cfg.rsr200.sample_rate_hz();
+        let div = &mut cfg.rsr200.diversity;
+        egui::Grid::new("rsr200-div-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            ui.label("What to do with it");
+            ComboBox::from_id_salt("rsr200_div_mode").selected_text(div.mode.label()).show_styled(ui, |ui| {
+                for m in DiversityMode::ALL {
+                    if ui.selectable_label(div.mode == m, m.label()).clicked() {
+                        div.mode = m;
+                        push_gain(cmds, Rsr200Config::DIV_MODE_ELEMENT, f64::from(u8::from(m == DiversityMode::Combine)));
+                    }
+                }
+            });
+            ui.end_row();
+
+            ui.label("How to find it").on_hover_text(
+                "Three different ways to compute the weight above. The adaptive filter \
+                 converges over a second or two but can equalise a delay between the \
+                 channels; decorrelate is instant but one weight for the whole span; \
+                 decorrelate per bin is also instant and can null several interferers at \
+                 once, each in its own bin. Takes effect immediately and needs no \
+                 reconnect.",
+            );
+            ComboBox::from_id_salt("rsr200_div_technique").selected_text(div.technique.label()).show_styled(
+                ui,
+                |ui| {
+                    for t in DiversityTechnique::ALL {
+                        if ui.selectable_label(div.technique == t, t.label()).clicked() {
+                            div.technique = t;
+                            push_gain(
+                                cmds,
+                                Rsr200Config::DIV_TECHNIQUE_ELEMENT,
+                                match t {
+                                    DiversityTechnique::Adaptive => 0.0,
+                                    DiversityTechnique::Decorrelate => 1.0,
+                                    DiversityTechnique::WidebandDecorrelate => 2.0,
+                                },
+                            );
+                        }
+                    }
+                },
+            );
+            ui.end_row();
+
+            if div.technique == DiversityTechnique::Adaptive {
+                ui.label("Filter length");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(DragValue::new(&mut div.taps).speed(1.0).range(1..=DIVERSITY_MAX_TAPS).suffix(" taps"))
+                        .on_hover_text(
+                            "One tap is a gain and a phase — a null at one frequency that \
+                             gets worse either side of it, which is all an analogue phaser \
+                             can do. Each further tap buys one sample period of the path \
+                             difference between the two channels that the filter can \
+                             equalise, which is what turns that notch into a band quiet all \
+                             the way across.",
+                        )
+                        .changed()
+                    {
+                        push_gain(cmds, Rsr200Config::DIV_TAPS_ELEMENT, f64::from(div.taps));
+                    }
+                    ui.label(RichText::new(diversity_cost_note(div.taps, sps)).weak());
+                });
+                ui.end_row();
+
+                ui.label("Adaptation rate");
+                if crate::chrome::slider(ui, Slider::new(&mut div.rate, 0.0..=1.0).show_value(false))
+                    .on_hover_text(
+                        "Slow and steady at the left, converging inside a fraction of a \
+                         second and visibly hunting at the right. Start fast to find the \
+                         null, then hold it.",
+                    )
+                    .changed()
+                {
+                    push_gain(cmds, Rsr200Config::DIV_RATE_ELEMENT, f64::from(div.rate));
+                }
+                ui.end_row();
+            }
+
+            if div.technique == DiversityTechnique::WidebandDecorrelate {
+                ui.label("Gate").on_hover_text(
+                    "A bin more than this far below the span's own median bin power is left \
+                     alone rather than solved at all — without it, the noise floor's \
+                     thousands of near-silent bins each contribute an essentially arbitrary \
+                     momentary direction, and the null wanders instead of holding. Lower \
+                     catches more (and more marginal) interferers; higher is more \
+                     conservative. 20 dB is a starting point, not a measured constant.",
+                );
+                if crate::chrome::slider(ui, Slider::new(&mut div.gate_db, 0.0..=60.0).suffix(" dB")).changed() {
+                    push_gain(cmds, Rsr200Config::DIV_GATE_ELEMENT, f64::from(div.gate_db));
+                }
+                ui.end_row();
+            }
+
+            ui.label("Hold");
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut div.frozen, "Hold")
+                    .on_hover_text(if div.technique == DiversityTechnique::Adaptive {
+                        "Stop the filter moving. Reach for this the moment a null appears: \
+                         a filter left adapting will re-aim itself at whatever becomes \
+                         loudest, which on a quiet band is the station you are listening to."
+                    } else {
+                        "Stop re-solving and hold the current weight (every bin's, for \
+                         decorrelate per bin) where it is."
+                    })
+                    .changed()
+                {
+                    push_gain(cmds, Rsr200Config::DIV_FREEZE_ELEMENT, f64::from(u8::from(div.frozen)));
+                }
+                if ui
+                    .button("Restart")
+                    .on_hover_text(if div.technique == DiversityTechnique::Adaptive {
+                        "Zero the filter and find the null again."
+                    } else {
+                        "Clear the covariance estimate and solve again from scratch."
+                    })
+                    .clicked()
+                {
+                    push_gain(cmds, Rsr200Config::DIV_RESET_ELEMENT, 1.0);
+                }
+            });
+            ui.end_row();
+        });
+        ui.label(
+            RichText::new(
+                "None of the three techniques above can tell a wanted signal from an \
+                 unwanted one — each only knows what the two channels have in common. In \
+                 Cancel, the second ADC's aerial wants to hear the noise source and as \
+                 little of the band as possible, or it will dutifully cancel the station \
+                 too. In Combine, both want to hear the same station.",
+            )
+            .weak(),
+        );
+        ui.label(
+            RichText::new(
+                "Separate mode is new and has not yet been run against two real aerials — \
+                 only the software path itself has been exercised.",
+            )
+            .color(Color32::from_rgb(220, 170, 70)),
+        );
+    }
+
     if before
         != (
             cfg.rsr200.host.clone(),
@@ -2284,6 +2469,7 @@ pub(in crate::app) fn settings_rsr200_tab(
             cfg.rsr200.gps_discipline,
             cfg.rsr200.transport,
             cfg.rsr200.usb_serial.clone(),
+            cfg.rsr200.channel_mode,
         )
     {
         *apply = true;
@@ -2293,10 +2479,10 @@ pub(in crate::app) fn settings_rsr200_tab(
     ui.label(
         RichText::new(
             "Reuter RSR200 support is new: verified against real hardware over both LAN and \
-             USB (Linux/macOS — Windows needs its own driver research first). Single \
-             channel, 16-bit only — 24-bit and dual channel are not wired up yet. \
-             Connection, address/port or serial, ADC clock, decimation and GPS discipline \
-             take effect on Apply; the attenuators apply as you move them.",
+             USB (Linux/macOS — Windows needs its own driver research first). 16-bit only — \
+             24-bit is not wired up yet. Connection, address/port or serial, ADC clock, \
+             decimation, GPS discipline and channels take effect on Apply; the attenuators \
+             and (in Separate mode) the diversity controls apply as you move them.",
         )
         .weak(),
     );

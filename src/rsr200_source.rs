@@ -7,10 +7,21 @@
 //! Receive only: the trait's transmit methods already default to errors,
 //! which is the correct answer for this hardware (it has none).
 //!
-//! Single channel, 16-bit — the only wire shape `sdroxide-rsr200` streams
-//! yet (`RSR200_PLAN.md` steps 1–3, 7). 24-bit and the dual-channel
-//! Separate/Diversity modes are real capabilities of the radio with no
-//! host-side wiring for them here yet.
+//! In `Rsr200ChannelMode::Separate` this is also where the two ADCs meet:
+//! [`Rsr200Handle::read_pair`] hands back a sample-aligned pair — see that
+//! method's own doc for why, unlike the RSPduo's two independently-arriving
+//! tuner callbacks, there is nothing to reconcile here — and one of three
+//! `sdroxide_dsp` combiners, chosen by [`DiversityTechnique`], turns it into
+//! one stream: a noise source nulled, or two fading paths combined. The
+//! *same* component the SDRplay RSPduo's own second-tuner mode uses,
+//! reused rather than reimplemented — see `RSR200_PLAN.md` §3, and
+//! `sdrplay_source.rs`, which this file mirrors closely for exactly that
+//! reason.
+//!
+//! Single channel, 16-bit — the only wire shapes `sdroxide-rsr200` streams
+//! yet (`RSR200_PLAN.md` steps 1–4, 7). 24-bit and the radio's own
+//! *hardware* combiner (a third, distinct wire shape, step 6) are real
+//! capabilities of the radio with no host-side wiring for them here yet.
 //!
 //! Verified working against a real RSR200: real spectrum on screen, tuning
 //! and the attenuators all live. LAN (2026-08-24) over both WiFi and a
@@ -21,19 +32,33 @@
 //! at ÷2, the highest rate (its own, narrower throughput ceiling), and
 //! one real shutdown segfault found and fixed by that testing. See
 //! `RSR200_PLAN.md`'s own step 3 and step 7 entries for the full account of
-//! each.
+//! each. Separate mode (step 4) has not yet been run against two real
+//! aerials — see [`Rsr200Source::open_status`].
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::Context;
+use sdroxide_dsp::{Diversity, DiversityAlgorithm, WidebandDecorrelator};
 use sdroxide_radio::{Complex32, IqSource, Result};
 use sdroxide_rsr200::Rsr200Handle;
-use sdroxide_types::Rsr200Config;
+use sdroxide_types::{DiversityMode, DiversityTechnique, Rsr200Config, Rsr200Diversity};
 
 /// How long the radio may deliver nothing before the connection counts as
 /// dead. LAN, so more generous than a local USB device's three seconds —
 /// matching `sdroxide-rsr200::stream`'s own silence budget.
 const SILENCE_BEFORE_REOPEN: Duration = Duration::from_secs(5);
+
+/// [`DiversityTechnique::WidebandDecorrelate`]'s FFT size. Not exposed as a
+/// setting (yet), matching `sdrplay_source.rs`'s own constant and reasoning:
+/// gives a few hundred hertz of resolution across the RSR200's own rate
+/// range with well under a millisecond of added latency.
+const WB_FFT_SIZE: usize = 2048;
+
+/// [`DiversityTechnique::WidebandDecorrelate`]'s per-bin covariance
+/// smoothing time constant. Not exposed as a setting (yet); the gate
+/// threshold is the tunable that technique actually needs.
+const WB_AVG_TC_SECS: f32 = 0.5;
 
 pub struct Rsr200Source {
     handle: Rsr200Handle,
@@ -44,6 +69,33 @@ pub struct Rsr200Source {
     /// can answer without a round trip to the stream thread.
     attenuator1: i32,
     attenuator2: i32,
+    /// The second channel's settings as configured, so the panel's live
+    /// controls have somewhere to land.
+    div_cfg: Rsr200Diversity,
+    /// `Some` when `Rsr200ChannelMode::Separate` is running and
+    /// [`DiversityTechnique::Adaptive`] or [`DiversityTechnique::Decorrelate`]
+    /// is selected — the two techniques that share one component, differing
+    /// only in [`Diversity::algorithm`]. Mutually exclusive with
+    /// [`Self::wideband`]; [`Self::rebuild_combiner`] is what keeps it so.
+    diversity: Option<Diversity>,
+    /// `Some` when Separate mode is running and
+    /// [`DiversityTechnique::WidebandDecorrelate`] is selected.
+    wideband: Option<WidebandDecorrelator>,
+    /// This call's raw main-channel samples, when [`Self::wideband`] is
+    /// active. `buf` itself is reserved for draining [`Self::wb_out`] in
+    /// that case, since the decorrelator's overlap-add latency means what
+    /// comes out of one call is not what went into it.
+    wb_main_scratch: Vec<Complex32>,
+    /// [`WidebandDecorrelator::process`]'s own per-call output scratch,
+    /// reused rather than allocated fresh every call.
+    wb_produced: Vec<Complex32>,
+    /// Combined samples [`Self::wideband`] has produced but `read` has not
+    /// yet handed to its caller.
+    wb_out: VecDeque<Complex32>,
+    /// The second ADC's samples, as the filter wants them.
+    aux_scratch: Vec<f32>,
+    aux_buf: Vec<Complex32>,
+    dual: bool,
 }
 
 impl Rsr200Source {
@@ -51,15 +103,96 @@ impl Rsr200Source {
         let handle = Rsr200Handle::open(cfg, center_hz)
             .with_context(|| format!("opening the RSR200 at {}:{}", cfg.host, cfg.port))?;
         let label = handle.label.clone();
-        tracing::info!("RSR200 source ready: {label}, center {center_hz:.0} Hz");
-        Ok(Rsr200Source {
+        let dual = handle.dual();
+        tracing::info!(
+            "RSR200 source ready: {label}, center {center_hz:.0} Hz{}",
+            if dual { ", Separate mode" } else { "" }
+        );
+        let mut src = Rsr200Source {
             center: center_hz,
             rx_scratch: Vec::new(),
             label,
             attenuator1: cfg.attenuator1,
             attenuator2: cfg.attenuator2,
+            div_cfg: cfg.diversity.clone(),
+            diversity: None,
+            wideband: None,
+            wb_main_scratch: Vec::new(),
+            wb_produced: Vec::new(),
+            wb_out: VecDeque::new(),
+            aux_scratch: Vec::new(),
+            aux_buf: Vec::new(),
+            dual,
             handle,
-        })
+        };
+        if dual {
+            src.rebuild_combiner();
+            match cfg.diversity.technique {
+                DiversityTechnique::Adaptive => tracing::info!(
+                    "diversity is on: {} adaptive filter, {} taps",
+                    mode_word(cfg.diversity.mode),
+                    cfg.diversity.taps,
+                ),
+                DiversityTechnique::Decorrelate => tracing::info!(
+                    "diversity is on: {} (decorrelate, whole span)",
+                    mode_word(cfg.diversity.mode),
+                ),
+                DiversityTechnique::WidebandDecorrelate => tracing::info!(
+                    "diversity is on: {} (decorrelate per bin, {WB_FFT_SIZE}-point FFT, {:.0} dB gate)",
+                    mode_word(cfg.diversity.mode),
+                    cfg.diversity.gate_db,
+                ),
+            }
+        }
+        Ok(src)
+    }
+
+    /// (Re)build whichever combiner [`Self::div_cfg`]'s technique calls
+    /// for, discarding whatever was running before. Used both at
+    /// [`Self::open`] and whenever the technique itself changes live — a
+    /// pure software swap, so unlike `Rsr200ChannelMode::Separate` itself
+    /// it needs no reopen.
+    fn rebuild_combiner(&mut self) {
+        self.wb_out.clear();
+        match self.div_cfg.technique {
+            DiversityTechnique::Adaptive | DiversityTechnique::Decorrelate => {
+                let mut d =
+                    Diversity::new(div_mode(self.div_cfg.mode), usize::from(self.div_cfg.taps), self.div_cfg.rate);
+                if self.div_cfg.technique == DiversityTechnique::Decorrelate {
+                    d.set_algorithm(DiversityAlgorithm::Decorrelate);
+                }
+                d.set_frozen(self.div_cfg.frozen);
+                self.diversity = Some(d);
+                self.wideband = None;
+            }
+            DiversityTechnique::WidebandDecorrelate => {
+                let mut wb = WidebandDecorrelator::new(
+                    WB_FFT_SIZE,
+                    self.handle.sample_rate_hz,
+                    WB_AVG_TC_SECS,
+                    div_mode(self.div_cfg.mode),
+                );
+                wb.set_gate_db(self.div_cfg.gate_db);
+                wb.set_frozen(self.div_cfg.frozen);
+                self.wideband = Some(wb);
+                self.diversity = None;
+            }
+        }
+    }
+}
+
+/// The configuration's mode, as the DSP crate spells it.
+fn div_mode(mode: DiversityMode) -> sdroxide_dsp::DiversityMode {
+    match mode {
+        DiversityMode::Cancel => sdroxide_dsp::DiversityMode::Cancel,
+        DiversityMode::Combine => sdroxide_dsp::DiversityMode::Combine,
+    }
+}
+
+fn mode_word(mode: DiversityMode) -> &'static str {
+    match mode {
+        DiversityMode::Cancel => "cancelling",
+        DiversityMode::Combine => "combining",
     }
 }
 
@@ -90,20 +223,74 @@ impl IqSource for Rsr200Source {
         Ok(())
     }
 
+    /// One block from the receiver — and, in Separate mode, the second ADC
+    /// combined with the first.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         let need = buf.len() * 2;
         if self.rx_scratch.len() < need {
             self.rx_scratch.resize(need, 0.0);
         }
-        let n = self.handle.rx_read(&mut self.rx_scratch[..need]);
-        let pairs = n / 2;
+        if self.dual && self.aux_scratch.len() < need {
+            self.aux_scratch.resize(need, 0.0);
+        }
+        // Disjoint fields, so both landing buffers can be handed to the
+        // handle while the handle borrows itself.
+        let (main, aux) = (&mut self.rx_scratch[..need], &mut self.aux_scratch[..]);
+        let pairs = self.handle.read_pair(main, if self.dual { aux } else { &mut [] });
+
+        if pairs > 0 {
+            if self.wideband.is_some() {
+                // `buf` is reserved for draining `wb_out` below, which is
+                // not necessarily what this call fetched — the overlap-add
+                // has its own latency. Raw main samples land in scratch
+                // instead.
+                if self.wb_main_scratch.len() < pairs {
+                    self.wb_main_scratch.resize(pairs, Complex32::new(0.0, 0.0));
+                }
+                for p in 0..pairs {
+                    self.wb_main_scratch[p] = Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
+                }
+            } else {
+                for p in 0..pairs {
+                    buf[p] = Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
+                }
+            }
+
+            if self.dual {
+                if self.aux_buf.len() < pairs {
+                    self.aux_buf.resize(pairs, Complex32::new(0.0, 0.0));
+                }
+                for p in 0..pairs {
+                    self.aux_buf[p] = Complex32::new(self.aux_scratch[2 * p], self.aux_scratch[2 * p + 1]);
+                }
+                if let Some(d) = self.diversity.as_mut() {
+                    d.process(&mut buf[..pairs], &self.aux_buf[..pairs]);
+                } else if let Some(wb) = self.wideband.as_mut() {
+                    self.wb_produced.clear();
+                    wb.process(&self.wb_main_scratch[..pairs], &self.aux_buf[..pairs], &mut self.wb_produced);
+                    self.wb_out.extend(self.wb_produced.drain(..));
+                }
+            }
+        }
+
+        if self.wideband.is_some() {
+            let n = self.wb_out.len().min(buf.len());
+            for (i, v) in self.wb_out.drain(..n).enumerate() {
+                buf[i] = v;
+            }
+            if n == 0 {
+                // Nothing ready yet -- either the overlap-add is still
+                // filling its first block, or the radio has nothing this
+                // cycle.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            return Ok(n);
+        }
+
         if pairs == 0 {
             // Nothing yet — brief nap so the DSP loop doesn't spin hot.
             std::thread::sleep(Duration::from_millis(2));
             return Ok(0);
-        }
-        for (p, out) in buf.iter_mut().enumerate().take(pairs) {
-            *out = Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
         }
         Ok(pairs)
     }
@@ -112,9 +299,9 @@ impl IqSource for Rsr200Source {
         self.label.clone()
     }
 
-    /// The two front-end attenuators. Both real elements — unlike, say,
-    /// HydraSDR's curve-and-switches split, there is nothing here that
-    /// isn't a plain dB value the radio already expresses as one.
+    /// The two front-end attenuators, plus (in Separate mode) the software
+    /// diversity filter's own controls, riding `SetGain` for the usual
+    /// reason: no new `Command` variant for settings only this backend has.
     fn set_gain_element(&mut self, name: &str, db: f64) -> Result<()> {
         match name {
             Rsr200Config::ATT1_ELEMENT => {
@@ -124,6 +311,71 @@ impl IqSource for Rsr200Source {
             Rsr200Config::ATT2_ELEMENT => {
                 self.attenuator2 = (-db).round().clamp(0.0, f64::from(Rsr200Config::ATTENUATOR_MAX_DB)) as i32;
                 self.handle.set_attenuator2_db(self.attenuator2);
+            }
+            Rsr200Config::DIV_MODE_ELEMENT => {
+                self.div_cfg.mode = if db >= 0.5 { DiversityMode::Combine } else { DiversityMode::Cancel };
+                // Kept across the switch, both combiners: it is the same
+                // estimate either way, and throwing away a converged one
+                // would cost the operator the convergence they watched.
+                if let Some(d) = self.diversity.as_mut() {
+                    d.set_mode(div_mode(self.div_cfg.mode));
+                }
+                if let Some(wb) = self.wideband.as_mut() {
+                    wb.set_mode(div_mode(self.div_cfg.mode));
+                }
+            }
+            Rsr200Config::DIV_RATE_ELEMENT => {
+                // Adaptive only -- decorrelation, whole-span or per-bin, has
+                // nothing that converges for a rate to govern.
+                self.div_cfg.rate = db as f32;
+                if let Some(d) = self.diversity.as_mut() {
+                    d.set_rate(self.div_cfg.rate);
+                }
+            }
+            Rsr200Config::DIV_TAPS_ELEMENT => {
+                let taps = db.round().clamp(1.0, f64::from(sdroxide_types::DIVERSITY_MAX_TAPS)) as u8;
+                self.div_cfg.taps = taps;
+                if let Some(d) = self.diversity.as_mut() {
+                    d.set_taps(usize::from(taps));
+                }
+            }
+            Rsr200Config::DIV_FREEZE_ELEMENT => {
+                self.div_cfg.frozen = db >= 0.5;
+                if let Some(d) = self.diversity.as_mut() {
+                    d.set_frozen(self.div_cfg.frozen);
+                }
+                if let Some(wb) = self.wideband.as_mut() {
+                    wb.set_frozen(self.div_cfg.frozen);
+                }
+            }
+            Rsr200Config::DIV_RESET_ELEMENT => {
+                if db >= 0.5 {
+                    if let Some(d) = self.diversity.as_mut() {
+                        d.reset();
+                    }
+                    if let Some(wb) = self.wideband.as_mut() {
+                        wb.reset();
+                        self.wb_out.clear();
+                    }
+                }
+            }
+            Rsr200Config::DIV_TECHNIQUE_ELEMENT => {
+                self.div_cfg.technique = match db.round() as i64 {
+                    1 => DiversityTechnique::Decorrelate,
+                    2 => DiversityTechnique::WidebandDecorrelate,
+                    _ => DiversityTechnique::Adaptive,
+                };
+                // A pure software swap -- discards whatever the previous
+                // combiner had converged or solved, but needs no reopen.
+                if self.dual {
+                    self.rebuild_combiner();
+                }
+            }
+            Rsr200Config::DIV_GATE_ELEMENT => {
+                self.div_cfg.gate_db = db as f32;
+                if let Some(wb) = self.wideband.as_mut() {
+                    wb.set_gate_db(self.div_cfg.gate_db);
+                }
             }
             _ => {}
         }
@@ -155,15 +407,22 @@ impl IqSource for Rsr200Source {
     }
 
     fn open_status(&self) -> Option<String> {
-        Some(
+        let mut msg = String::from(
             "Reuter RSR200 support is new: verified against real hardware over both LAN \
              (wired and WiFi) and USB (Linux/macOS — Windows needs its own driver research \
-             first). Single channel, 16-bit only — 24-bit and dual channel are not wired up \
-             yet. LAN's ÷8 decimation and coarser is solid over ordinary gigabit Ethernet; \
-             ÷4/÷2 broke up even wired. USB held up cleanly through ÷4, with real loss only \
-             at ÷2 (the highest rate) — its own, narrower throughput ceiling. Either way, \
-             expect the link — not this driver — to be what limits the top end."
-                .to_string(),
-        )
+             first). 16-bit only — 24-bit is not wired up yet. LAN's ÷8 decimation and \
+             coarser is solid over ordinary gigabit Ethernet; ÷4/÷2 broke up even wired. \
+             USB held up cleanly through ÷4, with real loss only at ÷2 (the highest rate) \
+             — its own, narrower throughput ceiling. Either way, expect the link — not \
+             this driver — to be what limits the top end.",
+        );
+        if self.dual {
+            msg.push_str(
+                " Separate mode (both ADCs, combined in software) is new and has not yet \
+                 been run against two real aerials — only the software path itself has \
+                 been exercised.",
+            );
+        }
+        Some(msg)
     }
 }

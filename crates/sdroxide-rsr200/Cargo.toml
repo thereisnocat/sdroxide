@@ -16,3 +16,9 @@ rtrb.workspace = true
 sdroxide-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Only for examples/usb_dual_probe.rs's own Diversity::process() smoke
+# check -- sdroxide-dsp stays a source-glue (src/rsr200_source.rs) concern,
+# not this crate's own, per the doc comment above.
+[dev-dependencies]
+sdroxide-dsp.workspace = true

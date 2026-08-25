@@ -378,8 +378,51 @@ separately and shipped each as it landed):
    ÷8/÷4 is a strong signal it is a wire-speed ceiling, not a bug. A practical takeaway for now:
    ÷8 and coarser (the four lower rates) are the range to expect solid results in over ordinary
    1GbE; ÷2/÷4 likely need a faster link, not a driver fix.
-4. **Separate mode + `sdroxide_dsp::Diversity` wiring** — the part this plan exists to answer
-   the question about. Prove it against real antennas the way the RSPduo work already did.
+4. **Done, software path verified against real hardware; not yet judged against two real
+   antennas. Separate mode + `sdroxide_dsp::Diversity` wiring** (branch `rsr200`) — the part
+   this plan exists to answer the question about.
+
+   `stream.rs` sets `format.channels = 2` (still `OpMode::Independent` — "Separate" is the
+   wire shape, not a different op mode; the radio's own hardware combiner is
+   `OpMode::Diversity`, step 6, still not selected here) whenever
+   `Rsr200Config::channel_mode` is `Rsr200ChannelMode::Separate`, a new enum (`Single`/
+   `Separate` today; `RSR200_PLAN.md` deliberately leaves room to append a third variant for
+   step 6's hardware combiner later without disturbing either). `handle.rs` gained
+   `Rsr200Handle::read_pair`, a direct port of `SdrPlayHandle::read_pair` — one ring holding
+   `QUAD`-wide quadruples instead of pairs when dual, de-interleaved on read the same way. One
+   genuine simplification over the RSPduo case, not just a smaller port: `sdroxide-sdrplay`
+   needs its own `Pairer` (`pair.rs`) to reconcile two *independently-arriving* tuner
+   callbacks by hardware sample number; the RSR200's `Device::pump` already delivers both
+   channels from the very same parsed frame in one call, so they cannot come apart on the way
+   into the ring at all — nothing to reconcile, so nothing built to do it.
+
+   `src/rsr200_source.rs` owns the combiner exactly the way `sdrplay_source.rs` does — all
+   three `DiversityTechnique` variants (Adaptive, Decorrelate, WidebandDecorrelate; `sdroxide-
+   dsp` itself needed zero changes, genuine reuse as promised in §3), a `Rsr200Diversity`
+   config (`sdroxide-types`) field-for-field the same shape as `SdrPlayDiversity`'s own filter
+   settings minus its two SDRplay-specific second-tuner gain fields (this radio's second-ADC
+   gain is `attenuator2`, already its own top-level field). `settings_rsr200_tab` grew a
+   Channels selector (reopen-triggering, like the transport/decimation fields) and, when
+   Separate is selected, a full "Second ADC" controls section closely modelled on
+   `settings_sdrplay_tab`'s own "Second aerial" one. `PROTO_VERSION` 92 → 93.
+
+   **Verified against the real, physically-attached RSR200 the same day** (2026-08-24): a new
+   standalone example, `crates/sdroxide-rsr200/examples/usb_dual_probe.rs`, configures the
+   real `Device` for two channels, confirms `SampleBlock.dual` is actually set, collects
+   ~100k real sample pairs from *both* ADCs (non-silent, changing between runs — genuinely
+   live data, not zero-filled padding), and runs `Diversity::process()` against them without
+   panicking. Both channels read the same RMS on every run, which reads as expected rather
+   than suspicious — nothing indicates two genuinely different aerials were on the two inputs
+   during this test. One transient failure seen and recorded in the example's own doc rather
+   than chased further: the very first command write failed once, moments after a previous
+   example's own `Stop Stream` on the same radio — the same class of "the radio needs a
+   moment after Stop Stream" quirk DP 3.3 already documents for `FT_Create`, apparently also
+   reachable on a plain write; a retry succeeded cleanly, twice.
+
+   **What this run does *not* prove**: that the combining itself is musically useful. That
+   needs two real, distinct aerials on the two ADC inputs and a human listening for a null or
+   a filled-in fade — exactly the RSPduo work's own "confirmed on air" milestone, not yet
+   repeated here. `open_status()` and the settings tab both say so plainly until it has been.
 5. **24-bit, decimation range, GPS discipline/correction readout** — each is a small, mostly
    independent addition to `device.rs`/`protocol.rs` once the above is solid.
 6. **Hardware diversity (§3/§4's third mode)** — needs Separate mode's own solve-from-software

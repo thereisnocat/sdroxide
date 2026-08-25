@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use rtrb::Producer;
-use sdroxide_types::{Rsr200Config, Rsr200Transport};
+use sdroxide_types::{Rsr200ChannelMode, Rsr200Config, Rsr200Transport};
 
 use crate::device::{Config, Device, Transport, TransportKind};
 use crate::error::{Error, Result};
-use crate::handle::{Ctrl, Pending, Rsr200Handle, Shared, push_iq, ring_for};
+use crate::handle::{Ctrl, Pending, QUAD, Rsr200Handle, Shared, push_iq, ring_for};
 use crate::lan::LanTcpTransport;
 use crate::protocol::{BlockLayout, OpMode, StreamFormat};
 use crate::usb::UsbTransport;
@@ -117,7 +117,8 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded::<Ctrl>();
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<f64>>(1);
     let shared = Arc::new(Shared { alive: AtomicBool::new(true), last_rx_ms: AtomicU64::new(0) });
-    let (rx_prod, rx_cons) = ring_for(cfg.sample_rate_hz());
+    let dual = cfg.channel_mode == Rsr200ChannelMode::Separate;
+    let (rx_prod, rx_cons) = ring_for(cfg.sample_rate_hz(), if dual { QUAD } else { 2 });
 
     let cfg = cfg.clone();
     let where_from = match cfg.transport {
@@ -136,8 +137,12 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
 
     match ready_rx.recv() {
         Ok(Ok(rate_hz)) => {
-            let label = format!("Reuter RSR200 @ {where_from}, {:.3} Msps", rate_hz / 1e6);
-            Ok(Rsr200Handle::from_parts(rx_cons, ctrl_tx, shared, join, label, rate_hz))
+            let label = format!(
+                "Reuter RSR200 @ {where_from}, {:.3} Msps{}",
+                rate_hz / 1e6,
+                if dual { ", Separate mode" } else { "" }
+            );
+            Ok(Rsr200Handle::from_parts(rx_cons, ctrl_tx, shared, join, label, rate_hz, dual))
         }
         Ok(Err(e)) => {
             let _ = join.join();
@@ -177,15 +182,19 @@ fn run(
         },
     };
 
-    // Single channel, 16 bit -- the only wire shape either transport
-    // produces yet. `OpMode::Independent` on a one-channel format is ADC1
-    // alone, unmixed with ADC2 -- the plain single-receiver behaviour this
-    // backend wants for now.
+    // 16 bit -- the only sample width either transport produces yet. One
+    // channel or two depending on `channel_mode`; `OpMode::Independent`
+    // either way -- it is the wire shape itself ("two unrelated channels,"
+    // per its own doc) that RSR200_PLAN.md section 4 calls "Separate," not
+    // a different op mode. The radio's own hardware combiner is a distinct
+    // op mode (`OpMode::Diversity`, step 6, not yet built) that this
+    // backend never selects.
+    let dual = cfg.channel_mode == Rsr200ChannelMode::Separate;
     let mut dev_cfg = Config {
         adc_clock_hz: cfg.adc_clock_hz,
         gps_discipline: cfg.gps_discipline,
         decimation_exp: cfg.decimation_exp,
-        format: StreamFormat { channels: 1, bits: 16 },
+        format: StreamFormat { channels: if dual { 2 } else { 1 }, bits: 16 },
         op_mode: OpMode::Independent,
         tuned_hz: center_hz,
         attenuator1: cfg.attenuator1,
@@ -215,7 +224,7 @@ fn run(
 
     let mut pending = Pending::default();
     let mut out_a: Vec<f32> = Vec::new();
-    let mut out_b: Vec<f32> = Vec::new(); // unused (single channel); pump() still wants a slot
+    let mut out_b: Vec<f32> = Vec::new(); // only filled when `dual`; pump() always wants the slot
     let mut iq_scratch: Vec<f32> = Vec::new();
     let mut last_service = Instant::now();
 
@@ -265,7 +274,22 @@ fn run(
                 if let Some(sb) = outcome.samples {
                     let need = sb.frames * 2;
                     iq_scratch.clear();
-                    iq_scratch.extend_from_slice(&out_a[..need]);
+                    if sb.dual {
+                        // Interleave as quadruples (main I, main Q, aux I,
+                        // aux Q) -- `out_a`/`out_b` came from the very same
+                        // parsed frame (`Device::deliver`), so they are
+                        // already sample-aligned; nothing to reconcile, see
+                        // `handle.rs`'s own doc.
+                        iq_scratch.reserve(sb.frames * QUAD);
+                        for p in 0..sb.frames {
+                            iq_scratch.push(out_a[2 * p]);
+                            iq_scratch.push(out_a[2 * p + 1]);
+                            iq_scratch.push(out_b[2 * p]);
+                            iq_scratch.push(out_b[2 * p + 1]);
+                        }
+                    } else {
+                        iq_scratch.extend_from_slice(&out_a[..need]);
+                    }
                     if !push_iq(&mut rx, &iq_scratch) {
                         tracing::debug!("RSR200: RX ring full, {} sample(s) dropped", sb.frames);
                     }

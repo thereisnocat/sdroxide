@@ -6,10 +6,14 @@
 //! in over a `crossbeam_channel`, samples come back out through an `rtrb`
 //! ring of interleaved `f32`.
 //!
-//! Single channel only, matching [`crate::lan::LanTcpTransport`]'s own
-//! current scope — no `read_pair()` yet, unlike `SdrPlayHandle`'s. That is
-//! `RSR200_PLAN.md` step 4's own job (Separate mode + `sdroxide_dsp::Diversity`
-//! wiring), not this one's.
+//! [`Rsr200Handle::read_pair`] mirrors `SdrPlayHandle`'s own method of the
+//! same name (`RSR200_PLAN.md` step 4): with both ADCs running the ring
+//! holds quadruples (main I, main Q, aux I, aux Q) rather than pairs, same
+//! as an RSPduo's two tuners — and, unlike the RSPduo, needs no `Pairer`
+//! (`sdroxide-sdrplay::pair`) to get there: [`crate::device::Device::pump`]
+//! already delivers both channels from the very same parsed frame in one
+//! call, so they cannot come apart on the way into the ring the way two
+//! independently-arriving tuner callbacks could.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,14 +93,19 @@ pub(crate) fn push_iq(rx: &mut Producer<f32>, iq: &[f32]) -> bool {
     true
 }
 
+/// Floats per sample in the ring: I and Q, or (with both ADCs running) both
+/// channels' I and Q — matching `sdroxide-sdrplay`'s own `pair::QUAD`.
+pub(crate) const QUAD: usize = 4;
+
 /// Half a second of interleaved floats, rounded up to a power of two — same
-/// formula as every other native backend's ring here.
-pub(crate) fn ring_for(rate_hz: f64) -> (Producer<f32>, Consumer<f32>) {
-    let cap = ((rate_hz * 2.0 * 0.5) as usize).next_power_of_two().max(1 << 16);
+/// formula as every other native backend's ring here. `stride` is 2 for one
+/// ADC, [`QUAD`] for two.
+pub(crate) fn ring_for(rate_hz: f64, stride: usize) -> (Producer<f32>, Consumer<f32>) {
+    let cap = ((rate_hz * stride as f64 * 0.5) as usize).next_power_of_two().max(1 << 16);
     RingBuffer::<f32>::new(cap)
 }
 
-/// A connected RSR200, streaming over LAN.
+/// A connected RSR200, streaming over LAN or USB.
 pub struct Rsr200Handle {
     rx: Consumer<f32>,
     ctrl: Sender<Ctrl>,
@@ -109,15 +118,20 @@ pub struct Rsr200Handle {
     /// read back from the device rather than recomputed, so it can never
     /// disagree with what is actually on the wire.
     pub sample_rate_hz: f64,
+    /// Both ADCs are running (`Rsr200ChannelMode::Separate`) — the ring
+    /// holds [`QUAD`]-wide quadruples rather than pairs. Fixed for the life
+    /// of the handle: the wire shape is chosen at open time.
+    dual: bool,
 }
 
 impl Rsr200Handle {
-    /// Connect to the radio's LAN interface and start streaming. Blocks
-    /// until that has either succeeded or failed.
+    /// Connect to the radio and start streaming. Blocks until that has
+    /// either succeeded or failed.
     pub fn open(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> {
         crate::stream::spawn(cfg, center_hz)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         rx: Consumer<f32>,
         ctrl: Sender<Ctrl>,
@@ -125,8 +139,9 @@ impl Rsr200Handle {
         join: JoinHandle<()>,
         label: String,
         sample_rate_hz: f64,
+        dual: bool,
     ) -> Rsr200Handle {
-        Rsr200Handle { rx, ctrl, shared, opened_at: Instant::now(), join: Some(join), label, sample_rate_hz }
+        Rsr200Handle { rx, ctrl, shared, opened_at: Instant::now(), join: Some(join), label, sample_rate_hz, dual }
     }
 
     /// Whether the stream thread is still running.
@@ -143,8 +158,18 @@ impl Rsr200Handle {
         since_open.saturating_sub(last)
     }
 
+    /// Both ADCs are running and the ring holds quadruples — see
+    /// [`Self::read_pair`], which is what `rsr200_source.rs` calls either
+    /// way.
+    pub fn dual(&self) -> bool {
+        self.dual
+    }
+
     /// Drain interleaved I,Q floats into `out`. Always returns an even
     /// count. Zero means nothing is available yet.
+    ///
+    /// With both ADCs running the ring holds quadruples, not pairs — this
+    /// is the wrong door then; use [`Self::read_pair`].
     pub fn rx_read(&mut self, out: &mut [f32]) -> usize {
         let take = self.rx.slots().min(out.len()) & !1;
         let mut n = 0;
@@ -158,6 +183,38 @@ impl Rsr200Handle {
             }
         }
         n
+    }
+
+    /// Read both ADCs at once, as interleaved complex samples, and return
+    /// how many **complex samples** landed in each. With one ADC running
+    /// `aux` is left untouched and this is the ordinary read.
+    ///
+    /// The pair is sample-aligned by construction — see this module's own
+    /// doc for why, unlike an RSPduo's two independently-arriving tuner
+    /// callbacks, there is nothing to reconcile here.
+    pub fn read_pair(&mut self, main: &mut [f32], aux: &mut [f32]) -> usize {
+        if !self.dual {
+            return self.rx_read(main) / 2;
+        }
+        let want = (main.len() / 2).min(aux.len() / 2).min(self.rx.slots() / QUAD);
+        if want == 0 {
+            return 0;
+        }
+        let Ok(chunk) = self.rx.read_chunk(want * QUAD) else {
+            return 0;
+        };
+        let (head, tail) = chunk.as_slices();
+        for (idx, &v) in head.iter().chain(tail.iter()).enumerate() {
+            let (sample, lane) = (idx / QUAD, idx % QUAD);
+            match lane {
+                0 => main[2 * sample] = v,
+                1 => main[2 * sample + 1] = v,
+                2 => aux[2 * sample] = v,
+                _ => aux[2 * sample + 1] = v,
+            }
+        }
+        chunk.commit_all();
+        want
     }
 
     fn send(&self, c: Ctrl) {
@@ -231,10 +288,15 @@ mod tests {
     #[test]
     fn ring_capacity_is_even_and_at_least_half_a_second() {
         for rate in [130_560.0, 500_000.0, 2_000_000.0] {
-            let (p, _c) = ring_for(rate);
-            let cap = p.buffer().capacity();
-            assert_eq!(cap % 2, 0, "odd ring capacity at {rate}");
-            assert!(cap as f64 >= rate, "ring holds {cap} floats, less than 0.5 s of {rate} sps");
+            for stride in [2, QUAD] {
+                let (p, _c) = ring_for(rate, stride);
+                let cap = p.buffer().capacity();
+                assert_eq!(cap % stride, 0, "capacity not a whole number of samples at {rate}, stride {stride}");
+                assert!(
+                    cap as f64 >= rate * stride as f64 * 0.5,
+                    "ring holds {cap} floats, less than 0.5 s of {rate} sps at stride {stride}"
+                );
+            }
         }
     }
 

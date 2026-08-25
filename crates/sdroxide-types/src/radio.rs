@@ -4265,6 +4265,12 @@ pub struct Rsr200Config {
     /// (e.g. [`HydraSdrConfig::serial`]). Ignored when [`Self::transport`]
     /// is [`Rsr200Transport::Lan`].
     pub usb_serial: String,
+    /// Which of the RSR200's wire shapes is in use. Reopens the device — the
+    /// shape is fixed when the radio is configured, before streaming starts.
+    pub channel_mode: Rsr200ChannelMode,
+    /// The software diversity filter's own settings, live in
+    /// [`Rsr200ChannelMode::Separate`] — see that variant's own doc.
+    pub diversity: Rsr200Diversity,
 }
 
 impl Default for Rsr200Config {
@@ -4279,6 +4285,87 @@ impl Default for Rsr200Config {
             attenuator2: 0,
             transport: Rsr200Transport::Lan,
             usb_serial: String::new(),
+            channel_mode: Rsr200ChannelMode::Single,
+            diversity: Rsr200Diversity::default(),
+        }
+    }
+}
+
+/// The RSR200's own wire shape for how many ADCs are in use and what, if
+/// anything, combines them — `RSR200_PLAN.md` §4's "three distinct operating
+/// shapes." Only the first two exist here; the third (the radio's own
+/// *hardware* combiner, `OpMode::Diversity` on the wire, not to be confused
+/// with this software filter of the same name) is `RSR200_PLAN.md` step 6,
+/// not yet built — appending it later is exactly what this enum is shaped
+/// to do without disturbing either variant already here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Rsr200ChannelMode {
+    /// One ADC. Plain `IqSource` passthrough — nothing dual-channel-shaped
+    /// touches this path at all.
+    #[default]
+    Single,
+    /// Both ADCs, unrelated on the wire (DP's own "Separate" term — the
+    /// radio does no combining of its own), combined here in software by
+    /// [`Rsr200Diversity`] via `sdroxide_dsp::Diversity` — the same
+    /// component the SDRplay RSPduo's own second-tuner mode uses, reused
+    /// rather than reimplemented (`RSR200_PLAN.md` §3): "a second receiver,
+    /// coherent with the first because the two chains share one synthesiser
+    /// and one sample clock" describes the RSR200's own resync event (DP
+    /// 4.6) at least as precisely as it describes the RSPduo's.
+    Separate,
+}
+
+impl Rsr200ChannelMode {
+    pub const ALL: [Rsr200ChannelMode; 2] = [Rsr200ChannelMode::Single, Rsr200ChannelMode::Separate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Rsr200ChannelMode::Single => "Single channel",
+            Rsr200ChannelMode::Separate => "Separate (software diversity)",
+        }
+    }
+}
+
+/// The software diversity filter's own settings for [`Rsr200ChannelMode::Separate`].
+/// Field-for-field the same shape as [`SdrPlayDiversity`]'s own filter
+/// settings, minus that struct's two SDRplay-specific second-tuner gain
+/// fields (`lna_state`/`if_gr_db`) — the RSR200's second-ADC gain is
+/// [`Rsr200Config::attenuator2`], already its own top-level field, not
+/// something this struct needs to duplicate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rsr200Diversity {
+    /// Cancel or combine.
+    pub mode: DiversityMode,
+    /// How many taps the adaptive filter has, 1 to [`DIVERSITY_MAX_TAPS`].
+    /// [`DiversityTechnique::Adaptive`] only.
+    pub taps: u8,
+    /// How fast the filter adapts, 0 to 1. [`DiversityTechnique::Adaptive`]
+    /// only.
+    pub rate: f32,
+    /// Hold the filter — or, for [`DiversityTechnique::WidebandDecorrelate`],
+    /// every bin's weight — where it is.
+    pub frozen: bool,
+    /// Which of the three ways to find the combining weight. Live — takes
+    /// effect immediately, no reopen.
+    pub technique: DiversityTechnique,
+    /// [`DiversityTechnique::WidebandDecorrelate`]'s power gate: a bin more
+    /// than this far below the frame's median bin power is left untouched
+    /// rather than solved. 20 dB is what worked on real material in the
+    /// work this was ported from — a starting point to retune against this
+    /// chain's own noise floor, not a constant to trust unquestioned.
+    pub gate_db: f32,
+}
+
+impl Default for Rsr200Diversity {
+    fn default() -> Self {
+        Rsr200Diversity {
+            mode: DiversityMode::Cancel,
+            taps: 8,
+            rate: 0.7,
+            frozen: false,
+            technique: DiversityTechnique::Adaptive,
+            gate_db: 20.0,
         }
     }
 }
@@ -4320,17 +4407,33 @@ impl Rsr200Config {
     /// `decimation_exp`'s own range — rate `2` to `64`.
     pub const DECIMATION_EXPS: [i32; 6] = [0, 1, 2, 3, 4, 5];
 
-    /// The two front-end attenuators are the only settings here that ride
-    /// live over `Command::SetGain` — real elements `sdroxide_rsr200`'s
-    /// running stream thread can move without touching the socket. Every
-    /// other field (`host`, `port`, `adc_clock_hz`, `decimation_exp`,
-    /// `gps_discipline`) moves the sample rate or the connection itself, so
-    /// `settings_rsr200_tab` treats a change to any of those as a
-    /// reopen-trigger instead — the same split `sdrplay_source.rs` draws
-    /// between its own live gain controls and its device/rate/bandwidth
-    /// fields.
+    /// The two front-end attenuators, and (in
+    /// [`Rsr200ChannelMode::Separate`]) the software diversity filter's own
+    /// settings, are the only ones here that ride live over
+    /// `Command::SetGain` — real elements `sdroxide_rsr200`'s running stream
+    /// thread can move, or a pure software swap the source glue can make on
+    /// its own, without touching the socket. Every other field (`host`,
+    /// `port`, `adc_clock_hz`, `decimation_exp`, `gps_discipline`,
+    /// `transport`, `usb_serial`, `channel_mode`) moves the sample rate, the
+    /// wire shape, or the connection itself, so `settings_rsr200_tab` treats
+    /// a change to any of those as a reopen-trigger instead — the same
+    /// split `sdrplay_source.rs` draws between its own live gain controls
+    /// and its device/rate/bandwidth/dual-tuner fields.
     pub const ATT1_ELEMENT: &'static str = "ATT1";
     pub const ATT2_ELEMENT: &'static str = "ATT2";
+
+    /// The software diversity filter, through the same door — same names as
+    /// [`SdrPlayConfig`]'s own diversity elements, which is fine: each
+    /// backend's `SetGain` element names are only ever read by its own
+    /// `IqSource`, not shared across them.
+    pub const DIV_MODE_ELEMENT: &'static str = "DIVMODE";
+    pub const DIV_RATE_ELEMENT: &'static str = "DIVRATE";
+    pub const DIV_TAPS_ELEMENT: &'static str = "DIVTAPS";
+    pub const DIV_FREEZE_ELEMENT: &'static str = "DIVFREEZE";
+    /// Momentary: any value at or above 0.5 restarts the filter.
+    pub const DIV_RESET_ELEMENT: &'static str = "DIVRESET";
+    pub const DIV_TECHNIQUE_ELEMENT: &'static str = "DIVTECH";
+    pub const DIV_GATE_ELEMENT: &'static str = "DIVGATE";
 
     /// `decimation_exp` → the divisor it selects (`2^(exp+1)`), matching
     /// `sdroxide_rsr200::protocol::decimation_rate` without this crate

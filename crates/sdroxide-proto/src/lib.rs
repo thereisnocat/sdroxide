@@ -655,7 +655,18 @@ use sdroxide_types::{
 /// both appended at the tail for the same positional reason as every field
 /// above them — a v91 peer would read either as garbage past the end of
 /// `attenuator2`, not fail outright.
-pub const PROTO_VERSION: u16 = 92;
+///
+/// **93** — the RSR200 (v91/92) gains Separate mode: both ADCs, combined in
+/// software by `sdroxide_dsp::Diversity` exactly the way the SDRplay
+/// RSPduo's own second-tuner mode already does (`RSR200_PLAN.md` §3, step
+/// 4 — no changes to `sdroxide-dsp` needed, genuine reuse). `Rsr200Config`
+/// gained `channel_mode` ([`sdroxide_types::Rsr200ChannelMode`]: `Single` or
+/// `Separate`) and `diversity` ([`sdroxide_types::Rsr200Diversity`] —
+/// mode/taps/rate/frozen/technique/gate_db, the same shape as
+/// [`sdroxide_types::SdrPlayDiversity`]'s own filter settings minus its two
+/// SDRplay-specific second-tuner gain fields), both appended at the tail for
+/// the same positional reason as every field above them.
+pub const PROTO_VERSION: u16 = 93;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1632,6 +1643,15 @@ mod tests {
                 attenuator2: 20,
                 transport: sdroxide_types::Rsr200Transport::Usb,
                 usb_serial: "1234ABCD".into(),
+                channel_mode: sdroxide_types::Rsr200ChannelMode::Separate,
+                diversity: sdroxide_types::Rsr200Diversity {
+                    mode: sdroxide_types::DiversityMode::Combine,
+                    taps: 16,
+                    rate: 0.3,
+                    frozen: true,
+                    technique: sdroxide_types::DiversityTechnique::Decorrelate,
+                    gate_db: 35.0,
+                },
             },
             ..RadioConfig::default()
         };

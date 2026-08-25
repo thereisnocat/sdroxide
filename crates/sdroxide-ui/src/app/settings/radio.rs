@@ -2216,12 +2216,17 @@ pub(in crate::app) fn settings_rsr200_tab(
         }
         ui.end_row();
 
-        ui.label("Decimation").on_hover_text(
-            "Divides the ADC clock down to the rate sdroxide actually streams. In testing, \
-             ÷8 and coarser held up cleanly over ordinary gigabit Ethernet; ÷4 and ÷2 broke \
-             up even wired, most likely wire speed rather than a bug — expect those two to \
-             want a faster link.",
-        );
+        ui.label("Decimation").on_hover_text(if cfg.rsr200.transport == Rsr200Transport::Usb {
+            "Divides the ADC clock down to the rate sdroxide actually streams. In testing \
+             over USB, ÷4 and coarser held up cleanly; ÷2 (the highest rate) showed real \
+             loss — a USB throughput ceiling, not a bug — so expect that one setting alone \
+             to want a closer look before relying on it."
+        } else {
+            "Divides the ADC clock down to the rate sdroxide actually streams. In testing \
+             over LAN, ÷8 and coarser held up cleanly over ordinary gigabit Ethernet; ÷4 \
+             and ÷2 broke up even wired, most likely wire speed rather than a bug — expect \
+             those two to want a faster link."
+        });
         ComboBox::from_id_salt("rsr200_decimation")
             .selected_text(format!(
                 "÷{} ({:.3} Msps)",

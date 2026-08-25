@@ -16,9 +16,10 @@
 //! and the attenuators all live. LAN (2026-08-24) over both WiFi and a
 //! wired connection — clean through ÷8 decimation, ÷4/÷2 broke up even
 //! wired, reading as a wire-speed ceiling rather than a bug. USB
-//! (2026-08-24, same day) on Linux/macOS — essentially lossless through
-//! ÷8, real loss at ÷2 (its own, different throughput ceiling), and one
-//! real shutdown segfault found and fixed by that testing. See
+//! (2026-08-24, same day) on Linux/macOS — clean through ÷4 (confirmed
+//! against the real app, not just the standalone probe), real loss only
+//! at ÷2, the highest rate (its own, narrower throughput ceiling), and
+//! one real shutdown segfault found and fixed by that testing. See
 //! `RSR200_PLAN.md`'s own step 3 and step 7 entries for the full account of
 //! each.
 
@@ -159,9 +160,9 @@ impl IqSource for Rsr200Source {
              (wired and WiFi) and USB (Linux/macOS — Windows needs its own driver research \
              first). Single channel, 16-bit only — 24-bit and dual channel are not wired up \
              yet. LAN's ÷8 decimation and coarser is solid over ordinary gigabit Ethernet; \
-             ÷4/÷2 broke up even wired. USB is close to lossless through ÷8 too, with its \
-             own, different throughput ceiling near ÷2. Either way, expect the link — not \
-             this driver — to be what limits the top end."
+             ÷4/÷2 broke up even wired. USB held up cleanly through ÷4, with real loss only \
+             at ÷2 (the highest rate) — its own, narrower throughput ceiling. Either way, \
+             expect the link — not this driver — to be what limits the top end."
                 .to_string(),
         )
     }

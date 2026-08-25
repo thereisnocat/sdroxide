@@ -412,8 +412,14 @@ separately and shipped each as it landed):
    requested rate, 0–1 gap events per run (the occasional one matching the reference's own
    note about transients right at Start Stream). At ÷2 (the highest rate, ~50 Msps
    requested): real, measurable loss — ~41.3 Msps actually delivered with over 5000 gap
-   events in one run — a genuine USB-side throughput ceiling of its own, distinct from LAN's
-   gigabit ceiling but the same shape of finding: this transport's own useful range tops out
+   events in one run.
+
+   **Confirmed clean through ÷4 the same day, against the real app rather than just the
+   standalone probe**: Ralph reports "even 4x decimation had no breakups." So the USB
+   ceiling found above is narrower than it first looked — real loss only at ÷2, the single
+   highest rate, not the whole top half of the range the way LAN's own ÷4-and-÷2 ceiling
+   works. A genuine USB-side throughput ceiling of its own regardless, distinct from LAN's
+   gigabit one but the same shape of finding: this transport's own useful range tops out
    somewhere below its nominal maximum, not a bug so much as a fixed per-call overhead the
    reference's own `QUEUE_DEPTH`/`PACKETS_PER_READ` tuning already documented running into on
    Windows.

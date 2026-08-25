@@ -12,14 +12,15 @@
 //! research spike, see `RSR200_PLAN.md` §6.
 //!
 //! Verified against a real RSR200: LAN wired and over WiFi, USB on
-//! Linux/macOS single-channel and Separate mode both (real, non-silent
-//! data from both ADCs, `sdroxide_dsp::Diversity::process()` run against
-//! it without panicking — see `examples/usb_dual_probe.rs`). See
-//! `RSR200_PLAN.md`'s own step 3, 4 and 7 entries for what each run turned
-//! up, including a real shutdown segfault USB testing found and fixed. Not
-//! yet: 24-bit, or the radio's own *hardware* combiner (a third, distinct
-//! wire shape, step 6) — and Separate mode's own *result* has not been
-//! judged against two real aerials, only proven to run.
+//! Linux/macOS single-channel and Separate mode both. Separate mode has
+//! since been confirmed on real air, on two real antennas: whole-span
+//! decorrelate nulls well, as intended — but decorrelate-per-bin does not
+//! work on this radio as tested, wiping out the entire band rather than
+//! nulling specific interferers. Not yet root-caused. See `RSR200_PLAN.md`'s
+//! own step 3, 4 and 7 entries for what each run turned up, including a
+//! real shutdown segfault USB testing found and fixed. Not yet: 24-bit, or
+//! the radio's own *hardware* combiner (a third, distinct wire shape, step
+//! 6).
 
 pub mod device;
 pub mod error;

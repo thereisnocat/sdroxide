@@ -32,11 +32,20 @@
 //! at ÷2, the highest rate (its own, narrower throughput ceiling), and
 //! one real shutdown segfault found and fixed by that testing. See
 //! `RSR200_PLAN.md`'s own step 3 and step 7 entries for the full account of
-//! each. Separate mode (step 4) has not yet been run against two real
-//! aerials — see [`Rsr200Source::open_status`].
+//! each.
+//!
+//! Separate mode (step 4), confirmed on real air the same day, on two real
+//! antennas: [`DiversityTechnique::Decorrelate`] nulls well, as expected —
+//! this is the milestone `RSR200_PLAN.md` §4 was written to reach. But
+//! [`DiversityTechnique::WidebandDecorrelate`] does not work on this radio
+//! as tested: rather than nulling specific interferers, it wipes out the
+//! entire band — no carriers survive, only noise. Not yet root-caused; see
+//! [`Rsr200Source::open_status`] and `RSR200_PLAN.md`'s own step 4 entry.
+//! [`Self::log_depth`] now reports active-bin counts and null depth to the
+//! log for whoever investigates next.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use sdroxide_dsp::{Diversity, DiversityAlgorithm, WidebandDecorrelator};
@@ -59,6 +68,10 @@ const WB_FFT_SIZE: usize = 2048;
 /// smoothing time constant. Not exposed as a setting (yet); the gate
 /// threshold is the tunable that technique actually needs.
 const WB_AVG_TC_SECS: f32 = 0.5;
+
+/// How often the diversity filter's achieved null depth reaches the log —
+/// matching `sdrplay_source.rs`'s own interval and reasoning.
+const DEPTH_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct Rsr200Source {
     handle: Rsr200Handle,
@@ -96,6 +109,7 @@ pub struct Rsr200Source {
     aux_scratch: Vec<f32>,
     aux_buf: Vec<Complex32>,
     dual: bool,
+    last_depth_log: Instant,
 }
 
 impl Rsr200Source {
@@ -123,6 +137,7 @@ impl Rsr200Source {
             aux_scratch: Vec::new(),
             aux_buf: Vec::new(),
             dual,
+            last_depth_log: Instant::now(),
             handle,
         };
         if dual {
@@ -176,6 +191,45 @@ impl Rsr200Source {
                 wb.set_frozen(self.div_cfg.frozen);
                 self.wideband = Some(wb);
                 self.diversity = None;
+            }
+        }
+    }
+
+    /// Say how the combiner is doing, occasionally.
+    ///
+    /// The null depth is the one number that separates "the second ADC
+    /// hears the noise" from "the second ADC hears nothing the first one
+    /// does", and no amount of adjusting the filter fixes the second case.
+    /// For the per-bin technique, the active-bin count answers the same
+    /// question a different way: there is no single convergence to watch,
+    /// so "is this doing anything at all" needs its own number.
+    fn log_depth(&mut self) {
+        if self.last_depth_log.elapsed() < DEPTH_LOG_INTERVAL {
+            return;
+        }
+        self.last_depth_log = Instant::now();
+        if let Some(d) = self.diversity.as_ref() {
+            if let Some(db) = d.depth_db() {
+                tracing::info!(
+                    "diversity: {db:.1} dB of the main ADC's signal is being cancelled{}",
+                    if d.frozen() { ", filter held" } else { "" },
+                );
+            }
+        } else if let Some(wb) = self.wideband.as_ref() {
+            let (active, total) = (wb.active_bins(), wb.fft_size());
+            // depth_db() alone reads misleadingly shallow here: it is the
+            // whole span's own average, diluted by however many of `total`
+            // bins had nothing to remove -- peak_depth_db() is the number
+            // that actually answers "how deep is the null on whatever is
+            // actually being nulled." Both together tell the fuller story;
+            // neither alone does.
+            match (wb.depth_db(), wb.peak_depth_db()) {
+                (Some(avg), Some(peak)) => tracing::info!(
+                    "diversity: {peak:.1} dB peak null ({avg:.1} dB span average), {active}/{total} \
+                     bins active{}",
+                    if wb.frozen() { ", held" } else { "" },
+                ),
+                _ => tracing::info!("diversity: combining, {active}/{total} bins active"),
             }
         }
     }
@@ -270,6 +324,7 @@ impl IqSource for Rsr200Source {
                     wb.process(&self.wb_main_scratch[..pairs], &self.aux_buf[..pairs], &mut self.wb_produced);
                     self.wb_out.extend(self.wb_produced.drain(..));
                 }
+                self.log_depth();
             }
         }
 
@@ -417,11 +472,23 @@ impl IqSource for Rsr200Source {
              this driver — to be what limits the top end.",
         );
         if self.dual {
-            msg.push_str(
-                " Separate mode (both ADCs, combined in software) is new and has not yet \
-                 been run against two real aerials — only the software path itself has \
-                 been exercised.",
-            );
+            match self.div_cfg.technique {
+                DiversityTechnique::WidebandDecorrelate => msg.push_str(
+                    " Separate mode's decorrelate-per-bin technique does not work on this \
+                     radio as tested: confirmed on real air to wipe out the entire band \
+                     rather than null specific interferers — no carriers survive, only \
+                     noise. Not yet root-caused. Whole-span decorrelate nulls well; \
+                     consider that instead until this is understood.",
+                ),
+                DiversityTechnique::Decorrelate => msg.push_str(
+                    " Separate mode's whole-span decorrelate is confirmed on real air, \
+                     nulling well on the current frequency.",
+                ),
+                DiversityTechnique::Adaptive => msg.push_str(
+                    " Separate mode's adaptive filter has not yet been judged against two \
+                     real antennas — only whole-span decorrelate has.",
+                ),
+            }
         }
         Some(msg)
     }

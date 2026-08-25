@@ -2452,11 +2452,23 @@ pub(in crate::app) fn settings_rsr200_tab(
             .weak(),
         );
         ui.label(
-            RichText::new(
-                "Separate mode is new and has not yet been run against two real aerials — \
-                 only the software path itself has been exercised.",
-            )
-            .color(Color32::from_rgb(220, 170, 70)),
+            RichText::new(match div.technique {
+                DiversityTechnique::WidebandDecorrelate =>
+                    "Decorrelate per bin is confirmed NOT to work on this radio: on real air \
+                     it wipes out the entire band rather than nulling specific interferers — \
+                     no carriers survive, only noise. Not yet root-caused. Whole-span \
+                     decorrelate nulls well; use that instead until this is understood.",
+                DiversityTechnique::Decorrelate =>
+                    "Confirmed on real air: nulls well on the current frequency.",
+                DiversityTechnique::Adaptive =>
+                    "Not yet judged against two real antennas — only whole-span decorrelate \
+                     has been.",
+            })
+            .color(if div.technique == DiversityTechnique::WidebandDecorrelate {
+                Color32::from_rgb(230, 90, 80)
+            } else {
+                Color32::from_rgb(220, 170, 70)
+            }),
         );
     }
 

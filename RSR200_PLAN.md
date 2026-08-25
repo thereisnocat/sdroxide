@@ -419,10 +419,28 @@ separately and shipped each as it landed):
    moment after Stop Stream" quirk DP 3.3 already documents for `FT_Create`, apparently also
    reachable on a plain write; a retry succeeded cleanly, twice.
 
-   **What this run does *not* prove**: that the combining itself is musically useful. That
-   needs two real, distinct aerials on the two ADC inputs and a human listening for a null or
-   a filled-in fade — exactly the RSPduo work's own "confirmed on air" milestone, not yet
-   repeated here. `open_status()` and the settings tab both say so plainly until it has been.
+   **Confirmed on air the same day, on two real antennas** — the RSPduo work's own "confirmed
+   on air" milestone, reached: `DiversityTechnique::Decorrelate` (whole-span, one weight)
+   "works as expected, nulling well on the current frequency." But
+   `DiversityTechnique::WidebandDecorrelate` (per-bin) does **not** work on this radio as
+   tested — Ralph's own words: "basically wipes out the entire band, nothing but noise, no
+   carriers, nothing." Not the same failure the RSPduo work found and fixed in
+   `WidebandDecorrelator` (instability across windows, fixed by the per-bin power gate,
+   `DECORRELATION_PLAN.md`) — this is a full-band wipeout, not a wandering null, and the
+   default 20 dB gate is already in effect. Not yet root-caused. One plausible reading, worth
+   testing rather than trusted outright: `usb_dual_probe.rs`'s own two-channel test found the
+   two ADCs reading identical RMS on every run (§7's own step 4 entry) — if the two aerials as
+   connected are more similar/coupled than the RSPduo's own two independent tuners typically
+   are, a per-bin solve could find "these two channels agree" in nearly every bin and null all
+   of it, while the whole-span solve only locks onto the single dominant coherent
+   relationship (likely the interferer) and leaves weaker, differently-phased signals
+   elsewhere in the band comparatively alone. Untested against this specific hypothesis.
+   `Rsr200Source::log_depth` (mirroring `sdrplay_source.rs`'s own, previously omitted here) now
+   reports active-bin count and peak/average null depth to the log every ten seconds, so a next
+   investigation has real numbers to read rather than needing to add logging first.
+   `open_status()` and the settings tab both report per-technique status now: Decorrelate
+   confirmed good, WidebandDecorrelate flagged in red as confirmed broken, Adaptive still
+   unjudged on real antennas.
 5. **24-bit, decimation range, GPS discipline/correction readout** — each is a small, mostly
    independent addition to `device.rs`/`protocol.rs` once the above is solid.
 6. **Hardware diversity (§3/§4's third mode)** — needs Separate mode's own solve-from-software

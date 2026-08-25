@@ -754,20 +754,20 @@ separately and shipped each as it landed):
    new VHF range's edges, then "was able to finally navigate to the actual frequencies and get
    them properly aligned."
 
-   **A real, related UX gap this exposed, not itself a bug**: HF's `[1 kHz, 66 MHz]` and VHF's
-   `[66, 150 MHz]` ranges are disjoint from each other's *usable interior* — the desktop frequency
-   dial (`crates/sdroxide-ui/src/widgets/freq_display.rs`'s `show()`) only supports per-digit
-   scroll/click, each commit validated and applied immediately, with no way to type a whole new
-   number at once. Jumping from deep in one band to deep in the other one digit at a time crosses
-   invalid territory at every intermediate step and gets rejected before the next digit can be
-   reached — every prior backend in this workspace has had one contiguous range, so this never
-   came up before. The compact/phone layout already has exactly this escape hatch
-   (`show_typed` — tap the readout, type a whole frequency, Enter commits) that the desktop dial
-   never got. Worked around live by toggling VHF off, scrolling up to the HF ceiling, applying,
-   then toggling VHF back on — a reopen keeps the dial where it was if the new front end can still
-   hear it, landing just inside VHF's own floor with no crossing needed. Adding the same typed
-   fallback to the desktop dial would close this properly; not done as part of step 8, flagged
-   here for whoever picks it up next.
+   **A real, related UX gap this exposed, found and fixed the same day**: HF's `[1 kHz, 66 MHz]`
+   and VHF's `[66, 150 MHz]` ranges are disjoint from each other's *usable interior* — the desktop
+   frequency dial (`crates/sdroxide-ui/src/widgets/freq_display.rs`'s `show()`) only supported
+   per-digit scroll/click, each commit validated and applied immediately, with no way to type a
+   whole new number at once. Jumping from deep in one band to deep in the other one digit at a
+   time crossed invalid territory at every intermediate step and got rejected before the next
+   digit could be reached — every prior backend in this workspace has had one contiguous range, so
+   this never came up before. Worked around live at the time by toggling VHF off, scrolling up to
+   the HF ceiling, applying, then toggling VHF back on. **Fixed properly**: `show()` now reuses the
+   same type-in editor the compact/phone layout's `show_typed` already had (`edit_field`, one
+   shared implementation, not a second one) — double-click any digit to open it, prefilled with the
+   current frequency in MHz and pre-selected so typing replaces it, Enter commits, Escape or a
+   click elsewhere cancels. Checked ahead of the existing single-click bump so a double-click never
+   also nudges the digit by one step on its way in.
 
 ## 8. Open questions
 

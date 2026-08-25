@@ -5371,6 +5371,7 @@ name = "sdroxide-rsr200"
 version = "1.5.1"
 dependencies = [
  "crossbeam-channel",
+ "libloading 0.8.9",
  "num-complex",
  "rtrb",
  "sdroxide-types",

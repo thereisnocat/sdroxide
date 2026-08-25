@@ -11,6 +11,14 @@ pub enum Error {
     #[error("{0}")]
     Net(String),
 
+    /// A USB (D3XX) open, enumerate, or pipe failure — same reasoning as
+    /// [`Self::Net`]: the actionable sentence, not a raw `FT_STATUS` number.
+    /// A missing driver, a device that never enumerated, and a queued read
+    /// that failed mid-stream all want different next steps from an
+    /// operator.
+    #[error("{0}")]
+    Usb(String),
+
     /// [`crate::device::Device::service`]'s retry budget ran out — the radio
     /// never acknowledged a command after
     /// [`crate::device::Device::MAX_ATTEMPTS`] sends.

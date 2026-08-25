@@ -4235,7 +4235,8 @@ impl HydraSdrConfig {
 #[serde(default)]
 pub struct Rsr200Config {
     /// LAN host/IP. Empty means nothing configured yet, and opening fails
-    /// with a clear message rather than guessing an address.
+    /// with a clear message rather than guessing an address. Ignored when
+    /// [`Self::transport`] is [`Rsr200Transport::Usb`].
     pub host: String,
     pub port: u16,
     /// 70..200 MHz. What actually sets the Nyquist-zone grid tuning works
@@ -4252,6 +4253,18 @@ pub struct Rsr200Config {
     /// on entirely different aerials.
     pub attenuator1: i32,
     pub attenuator2: i32,
+    /// How the radio is reached — the same command protocol either way (DP
+    /// 4), differing only in framing, so this is one config with a choice
+    /// rather than a second `Backend`, matching `sdroxide-rtlsdr`'s own
+    /// USB-and-`tcp/`-in-one-crate precedent and the SDR++ sibling
+    /// implementation's own "Transport combo" UI shape (`RSR200_PLAN.md`
+    /// §1/§6).
+    pub transport: Rsr200Transport,
+    /// USB (D3XX) serial to open, matched exactly. Empty means the first
+    /// D3XX device found — the same convention every USB backend here uses
+    /// (e.g. [`HydraSdrConfig::serial`]). Ignored when [`Self::transport`]
+    /// is [`Rsr200Transport::Lan`].
+    pub usb_serial: String,
 }
 
 impl Default for Rsr200Config {
@@ -4264,6 +4277,32 @@ impl Default for Rsr200Config {
             decimation_exp: 3,
             attenuator1: 0,
             attenuator2: 0,
+            transport: Rsr200Transport::Lan,
+            usb_serial: String::new(),
+        }
+    }
+}
+
+/// How a [`Rsr200Config`] reaches the radio. See the field's own doc for why
+/// this is one config with a choice rather than a second `Backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Rsr200Transport {
+    #[default]
+    Lan,
+    /// FTDI D3XX over the FT601Q SuperSpeed-FIFO bridge — needs the vendor
+    /// driver installed (`libftd3xx`/`FTD3XXWU`), found by dlopen at
+    /// runtime like the SDRplay API; not yet implemented on Windows, see
+    /// `RSR200_PLAN.md` §6.
+    Usb,
+}
+
+impl Rsr200Transport {
+    pub const ALL: [Rsr200Transport; 2] = [Rsr200Transport::Lan, Rsr200Transport::Usb];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Rsr200Transport::Lan => "LAN",
+            Rsr200Transport::Usb => "USB",
         }
     }
 }

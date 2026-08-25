@@ -2133,7 +2133,7 @@ pub(in crate::app) fn settings_rsr200_tab(
     apply: &mut bool,
     cmds: &mut Vec<Command>,
 ) {
-    use sdroxide_types::Rsr200Config;
+    use sdroxide_types::{Rsr200Config, Rsr200Transport};
     let Some(cfg) = radio_edit.as_mut() else {
         ui.label("Waiting for the configuration of the machine the radio is attached to.");
         return;
@@ -2145,24 +2145,57 @@ pub(in crate::app) fn settings_rsr200_tab(
         cfg.rsr200.adc_clock_hz,
         cfg.rsr200.decimation_exp,
         cfg.rsr200.gps_discipline,
+        cfg.rsr200.transport,
+        cfg.rsr200.usb_serial.clone(),
     );
 
     egui::Grid::new("rsr200-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        ui.label("Radio address");
-        crate::chrome::field(
-            ui,
-            egui::TextEdit::singleline(&mut cfg.rsr200.host)
-                .desired_width(220.0)
-                .hint_text("host or IP, e.g. 192.168.1.50"),
+        ui.label("Connection").on_hover_text(
+            "The RSR200's LAN port and its USB interface speak the same command set — this \
+             is one radio either way, not two. USB needs FTDI's D3XX driver installed \
+             (libftd3xx / FTD3XXWU from ftdichip.com) and is not implemented on Windows yet.",
         );
+        ComboBox::from_id_salt("rsr200_transport")
+            .selected_text(cfg.rsr200.transport.label())
+            .show_styled(ui, |ui| {
+                for t in Rsr200Transport::ALL {
+                    if ui.selectable_label(cfg.rsr200.transport == t, t.label()).clicked() {
+                        cfg.rsr200.transport = t;
+                    }
+                }
+            });
         ui.end_row();
 
-        ui.label("Port");
-        crate::chrome::field(ui, DragValue::new(&mut cfg.rsr200.port).range(1..=65535)).on_hover_text(format!(
-            "{} unless it has been changed on the radio.",
-            Rsr200Config::DEFAULT_PORT
-        ));
-        ui.end_row();
+        if cfg.rsr200.transport == Rsr200Transport::Lan {
+            ui.label("Radio address");
+            crate::chrome::field(
+                ui,
+                egui::TextEdit::singleline(&mut cfg.rsr200.host)
+                    .desired_width(220.0)
+                    .hint_text("host or IP, e.g. 192.168.1.50"),
+            );
+            ui.end_row();
+
+            ui.label("Port");
+            crate::chrome::field(ui, DragValue::new(&mut cfg.rsr200.port).range(1..=65535)).on_hover_text(format!(
+                "{} unless it has been changed on the radio.",
+                Rsr200Config::DEFAULT_PORT
+            ));
+            ui.end_row();
+        } else {
+            ui.label("USB serial").on_hover_text(
+                "Matched exactly against the connected D3XX device's serial number. Leave \
+                 empty to open the first one found — only worth setting when more than one \
+                 is attached.",
+            );
+            crate::chrome::field(
+                ui,
+                egui::TextEdit::singleline(&mut cfg.rsr200.usb_serial)
+                    .desired_width(220.0)
+                    .hint_text("empty = first found"),
+            );
+            ui.end_row();
+        }
 
         ui.label("ADC clock").on_hover_text(
             "The RSR200's own sampling clock, ahead of decimation. A \
@@ -2244,6 +2277,8 @@ pub(in crate::app) fn settings_rsr200_tab(
             cfg.rsr200.adc_clock_hz,
             cfg.rsr200.decimation_exp,
             cfg.rsr200.gps_discipline,
+            cfg.rsr200.transport,
+            cfg.rsr200.usb_serial.clone(),
         )
     {
         *apply = true;
@@ -2252,11 +2287,11 @@ pub(in crate::app) fn settings_rsr200_tab(
     ui.add_space(4.0);
     ui.label(
         RichText::new(
-            "Reuter RSR200 support is new and has not been verified against real \
-             hardware: no RSR200 has been reachable to test sdroxide-rsr200 against. \
-             Single channel, 16-bit over LAN only — 24-bit, dual channel and USB are \
-             not wired up yet. Address, port, ADC clock, decimation and GPS \
-             discipline take effect on Apply; the attenuators apply as you move them.",
+            "Reuter RSR200 support is new: verified against real hardware over both LAN and \
+             USB (Linux/macOS — Windows needs its own driver research first). Single \
+             channel, 16-bit only — 24-bit and dual channel are not wired up yet. \
+             Connection, address/port or serial, ADC clock, decimation and GPS discipline \
+             take effect on Apply; the attenuators apply as you move them.",
         )
         .weak(),
     );

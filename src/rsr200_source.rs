@@ -1,20 +1,26 @@
-//! An [`IqSource`] for a Reuter RSR200(B) driven over LAN by the native
-//! driver in `sdroxide-rsr200` — no vendor SDK, no ExtIO.
+//! An [`IqSource`] for a Reuter RSR200(B) driven by the native driver in
+//! `sdroxide-rsr200`, over either its LAN interface or (Linux/macOS) its
+//! USB one — the choice lives in [`Rsr200Config::transport`], not in this
+//! file: both ride the same [`Rsr200Handle`], because nothing about it was
+//! ever specific to one transport.
 //!
 //! Receive only: the trait's transmit methods already default to errors,
 //! which is the correct answer for this hardware (it has none).
 //!
-//! Single channel, 16-bit, LAN — the only wire shape `sdroxide-rsr200`
-//! streams yet (`RSR200_PLAN.md` steps 1–3). USB, 24-bit and the
-//! dual-channel Separate/Diversity modes are real capabilities of the radio
-//! with no host-side wiring for them here yet.
+//! Single channel, 16-bit — the only wire shape `sdroxide-rsr200` streams
+//! yet (`RSR200_PLAN.md` steps 1–3, 7). 24-bit and the dual-channel
+//! Separate/Diversity modes are real capabilities of the radio with no
+//! host-side wiring for them here yet.
 //!
-//! Verified working against a real RSR200 (2026-08-24): real spectrum on
-//! screen, tuning and the attenuators all live, both over WiFi and over a
-//! wired LAN. Wired was clean through ÷8 decimation; ÷4 and ÷2 broke up even
-//! wired, matching plain 1GbE throughput arithmetic closely enough to read
-//! as a wire-speed ceiling rather than a bug here. See `RSR200_PLAN.md`'s
-//! own step 3 entry for the full account.
+//! Verified working against a real RSR200: real spectrum on screen, tuning
+//! and the attenuators all live. LAN (2026-08-24) over both WiFi and a
+//! wired connection — clean through ÷8 decimation, ÷4/÷2 broke up even
+//! wired, reading as a wire-speed ceiling rather than a bug. USB
+//! (2026-08-24, same day) on Linux/macOS — essentially lossless through
+//! ÷8, real loss at ÷2 (its own, different throughput ceiling), and one
+//! real shutdown segfault found and fixed by that testing. See
+//! `RSR200_PLAN.md`'s own step 3 and step 7 entries for the full account of
+//! each.
 
 use std::time::Duration;
 
@@ -149,11 +155,13 @@ impl IqSource for Rsr200Source {
 
     fn open_status(&self) -> Option<String> {
         Some(
-            "Reuter RSR200 support is new: verified against real hardware, wired and over \
-             WiFi. Single channel, 16-bit only — 24-bit, dual channel and USB are not wired \
-             up yet. ÷8 decimation and coarser is solid over ordinary gigabit Ethernet; ÷4 \
-             and ÷2 broke up even wired in testing, likely wire speed rather than a bug — \
-             expect a faster link to matter more than anything here."
+            "Reuter RSR200 support is new: verified against real hardware over both LAN \
+             (wired and WiFi) and USB (Linux/macOS — Windows needs its own driver research \
+             first). Single channel, 16-bit only — 24-bit and dual channel are not wired up \
+             yet. LAN's ÷8 decimation and coarser is solid over ordinary gigabit Ethernet; \
+             ÷4/÷2 broke up even wired. USB is close to lossless through ÷8 too, with its \
+             own, different throughput ceiling near ÷2. Either way, expect the link — not \
+             this driver — to be what limits the top end."
                 .to_string(),
         )
     }

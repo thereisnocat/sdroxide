@@ -384,8 +384,51 @@ separately and shipped each as it landed):
    independent addition to `device.rs`/`protocol.rs` once the above is solid.
 6. **Hardware diversity (§3/§4's third mode)** — needs Separate mode's own solve-from-software
    step to be meaningful, so it belongs after step 4, not before it.
-7. **USB transport** — its own phase, per §6, including the Windows research spike before
-   deciding the implementation approach.
+7. **Done on Linux/macOS, Windows still open. USB transport** (branch `rsr200`) — done out of
+   order, ahead of steps 4–6, at Ralph's request. `sdroxide-rsr200::ffi` (hand-written D3XX
+   bindings, loaded with `dlopen` at runtime via `libloading` — same pattern as
+   `sdroxide-sdrplay`'s own `ffi.rs`, so this crate still builds and ships everywhere and
+   merely finds USB missing where the driver is not installed) and `sdroxide-rsr200::usb`
+   (`UsbTransport: Transport`, a direct port of the already-hardware-verified
+   `transport_usb.h`/`.cpp` from the SDR++ sibling implementation — same `QUEUE_DEPTH`/
+   `PACKETS_PER_READ` constants, empirically arrived at there, not re-derived here). One
+   config, not a second `Backend`: `Rsr200Config` gained `transport` (`Rsr200Transport::Lan`/
+   `Usb`) and `usb_serial`, and `settings_rsr200_tab` grew a Connection selector — matching
+   `sdroxide-rtlsdr`'s own USB-and-`tcp/`-in-one-crate precedent and the SDR++ reference's own
+   "Transport combo" UI shape (§1), not the `RtlSdr`/`RtlTcp`-style split-Backend convention,
+   since USB and LAN really are the same radio with the same command protocol here. Windows is
+   deliberately unimplemented — `Api::load()` fails there with a clear message pointing at this
+   section — rather than guess at the differently-shaped Windows D3XX SDK (`FT_ReadPipeEx` as
+   the *overlapped* call there, an inversion from Linux/macOS) without the research spike §6
+   itself called for. `PROTO_VERSION` 91 → 92.
+
+   **Verified against the real, physically-attached RSR200 the same day** (2026-08-24), not
+   just built: a standalone example (`crates/sdroxide-rsr200/examples/usb_live_probe.rs`, a
+   direct port of the reference's own `test_usb_live.cpp`, kept in the repo for future
+   hardware bring-up the same way that file was) enumerates the D3XX device, opens it,
+   configures and starts the stream through the real `Device`, and pumps samples for a fixed
+   window — run directly against the connected radio rather than only reasoned about. At ÷8
+   decimation (6.25 Msps): 31M+ frames delivered per 5-second run, essentially the exact
+   requested rate, 0–1 gap events per run (the occasional one matching the reference's own
+   note about transients right at Start Stream). At ÷2 (the highest rate, ~50 Msps
+   requested): real, measurable loss — ~41.3 Msps actually delivered with over 5000 gap
+   events in one run — a genuine USB-side throughput ceiling of its own, distinct from LAN's
+   gigabit ceiling but the same shape of finding: this transport's own useful range tops out
+   somewhere below its nominal maximum, not a bug so much as a fixed per-call overhead the
+   reference's own `QUEUE_DEPTH`/`PACKETS_PER_READ` tuning already documented running into on
+   Windows.
+
+   **A real bug found and fixed by that same testing, not by inspection**: the first run
+   streamed cleanly for the full window and then **segfaulted during shutdown**. The C++
+   reference's own `close()` — `FT_AbortPipe`, then `FT_ReleaseOverlapped` on every queued
+   buffer immediately, no drain in between — is exactly what `UsbTransport::close` had ported
+   1:1. On this driver, `FT_AbortPipe` returns before every queued read has actually finished
+   cancelling despite its synchronous-looking signature, so releasing immediately could race a
+   read still genuinely in flight. Fixed by calling `FT_GetOverlappedResult` (waiting) on each
+   buffer between the abort and the release, so the driver has actually finished with it
+   first; confirmed fixed across two clean, crash-free runs afterward. Not documented anywhere
+   in the D3XX headers — found only because this was run against real hardware rather than
+   left as "ported faithfully, should be fine."
 8. **Auto-ATT, Serial mode, VHF/preamp switching** — lowest priority; each is real but
    self-contained, and none of them blocks anything else on this list.
 

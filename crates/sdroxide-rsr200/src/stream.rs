@@ -9,13 +9,85 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use rtrb::Producer;
-use sdroxide_types::Rsr200Config;
+use sdroxide_types::{Rsr200Config, Rsr200Transport};
 
-use crate::device::{Config, Device, Transport};
+use crate::device::{Config, Device, Transport, TransportKind};
 use crate::error::{Error, Result};
 use crate::handle::{Ctrl, Pending, Rsr200Handle, Shared, push_iq, ring_for};
 use crate::lan::LanTcpTransport;
-use crate::protocol::{OpMode, StreamFormat};
+use crate::protocol::{BlockLayout, OpMode, StreamFormat};
+use crate::usb::UsbTransport;
+
+/// Whichever transport this session opened, behind one [`Transport`] impl
+/// that just delegates — an enum rather than `Box<dyn Transport>` because
+/// [`RunTransport::close`] needs each variant's own inherent teardown (LAN's
+/// own `stop()` unblocks a read from another thread before `close()`; USB's
+/// [`UsbTransport::close`] is self-contained), which is not part of the
+/// [`Transport`] trait itself.
+enum RunTransport {
+    Lan(LanTcpTransport),
+    Usb(UsbTransport),
+}
+
+impl RunTransport {
+    fn close(&mut self) {
+        match self {
+            RunTransport::Lan(t) => {
+                t.stop();
+                t.close();
+            }
+            RunTransport::Usb(t) => t.close(),
+        }
+    }
+}
+
+impl Transport for RunTransport {
+    fn kind(&self) -> TransportKind {
+        match self {
+            RunTransport::Lan(t) => t.kind(),
+            RunTransport::Usb(t) => t.kind(),
+        }
+    }
+
+    fn send_command(&mut self, data: &[u8]) -> bool {
+        match self {
+            RunTransport::Lan(t) => t.send_command(data),
+            RunTransport::Usb(t) => t.send_command(data),
+        }
+    }
+
+    fn next_frame(&mut self, out: &mut Vec<u8>) -> bool {
+        match self {
+            RunTransport::Lan(t) => t.next_frame(out),
+            RunTransport::Usb(t) => t.next_frame(out),
+        }
+    }
+
+    /// USB ignores block layout entirely — it reads whole 4096-byte packets
+    /// from a fixed endpoint, nothing to frame — matching
+    /// [`Transport::set_layout`]'s own default no-op.
+    fn set_layout(&mut self, layout: BlockLayout) {
+        if let RunTransport::Lan(t) = self {
+            t.set_layout(layout);
+        }
+    }
+
+    /// Only LAN has a standalone-packet concept at all — see
+    /// [`Transport::read_packet`]'s own doc for why USB never calls this.
+    fn read_packet(&mut self, out: &mut Vec<u8>, expected_bytes: usize) -> bool {
+        match self {
+            RunTransport::Lan(t) => t.read_packet(out, expected_bytes),
+            RunTransport::Usb(_) => false,
+        }
+    }
+
+    fn last_error(&self) -> Option<&str> {
+        match self {
+            RunTransport::Lan(t) => t.last_error(),
+            RunTransport::Usb(t) => t.last_error(),
+        }
+    }
+}
 
 /// How long a single LAN read may block before the loop goes back to serve
 /// control and the acknowledgement timer. Bounds how long a retune or a
@@ -38,7 +110,7 @@ const SILENCE_BEFORE_DROP: Duration = Duration::from_secs(5);
 /// wrong address or a radio that is not listening comes back as an ordinary
 /// error rather than as a stream that never starts.
 pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> {
-    if cfg.host.is_empty() {
+    if cfg.transport == Rsr200Transport::Lan && cfg.host.is_empty() {
         return Err(Error::Net("no RSR200 host configured".to_string()));
     }
 
@@ -48,8 +120,11 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
     let (rx_prod, rx_cons) = ring_for(cfg.sample_rate_hz());
 
     let cfg = cfg.clone();
-    let host = cfg.host.clone();
-    let port = cfg.port;
+    let where_from = match cfg.transport {
+        Rsr200Transport::Lan => format!("{}:{}", cfg.host, cfg.port),
+        Rsr200Transport::Usb if cfg.usb_serial.is_empty() => "USB".to_string(),
+        Rsr200Transport::Usb => format!("USB {}", cfg.usb_serial),
+    };
     let thread_shared = Arc::clone(&shared);
     let join = std::thread::Builder::new()
         .name("sdroxide-rsr200".into())
@@ -61,7 +136,7 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
 
     match ready_rx.recv() {
         Ok(Ok(rate_hz)) => {
-            let label = format!("Reuter RSR200 @ {host}:{port}, {:.3} Msps", rate_hz / 1e6);
+            let label = format!("Reuter RSR200 @ {where_from}, {:.3} Msps", rate_hz / 1e6);
             Ok(Rsr200Handle::from_parts(rx_cons, ctrl_tx, shared, join, label, rate_hz))
         }
         Ok(Err(e)) => {
@@ -83,18 +158,29 @@ fn run(
     shared: Arc<Shared>,
     ready_tx: Sender<Result<f64>>,
 ) {
-    let mut transport = LanTcpTransport::new();
-    if !transport.connect(&cfg.host, cfg.port, READ_TIMEOUT) {
-        let msg = transport.last_error().unwrap_or("connect failed").to_string();
-        let _ = ready_tx.send(Err(Error::Net(msg)));
-        return;
-    }
+    let mut transport = match cfg.transport {
+        Rsr200Transport::Lan => {
+            let mut t = LanTcpTransport::new();
+            if !t.connect(&cfg.host, cfg.port, READ_TIMEOUT) {
+                let msg = t.last_error().unwrap_or("connect failed").to_string();
+                let _ = ready_tx.send(Err(Error::Net(msg)));
+                return;
+            }
+            RunTransport::Lan(t)
+        }
+        Rsr200Transport::Usb => match UsbTransport::open(&cfg.usb_serial) {
+            Ok(t) => RunTransport::Usb(t),
+            Err(e) => {
+                let _ = ready_tx.send(Err(Error::Usb(e)));
+                return;
+            }
+        },
+    };
 
-    // Single channel, 16 bit -- the only wire shape a transport exists for
-    // yet. `OpMode::Independent` on a one-channel format is ADC1 alone,
-    // unmixed with ADC2 -- the plain single-receiver behaviour this backend
-    // wants for now, not yet verified against real hardware (no RSR200 has
-    // been reachable to test any of sdroxide-rsr200 against).
+    // Single channel, 16 bit -- the only wire shape either transport
+    // produces yet. `OpMode::Independent` on a one-channel format is ADC1
+    // alone, unmixed with ADC2 -- the plain single-receiver behaviour this
+    // backend wants for now.
     let mut dev_cfg = Config {
         adc_clock_hz: cfg.adc_clock_hz,
         gps_discipline: cfg.gps_discipline,
@@ -207,7 +293,6 @@ fn run(
     }
 
     let _ = device.stop_stream(&mut transport, now_ms(started));
-    transport.stop();
     transport.close();
 }
 

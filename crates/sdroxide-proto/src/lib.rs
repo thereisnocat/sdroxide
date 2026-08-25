@@ -643,7 +643,19 @@ use sdroxide_types::{
 /// by declaration index, so a v90 peer handed `Rsr200` has no variant to
 /// decode it into); the `RadioConfig` field append is the same positional
 /// trap as every other config field before it.
-pub const PROTO_VERSION: u16 = 91;
+///
+/// **92** — the RSR200 (v91) gains its second transport: USB over FTDI's
+/// D3XX driver, alongside the original LAN one (`RSR200_PLAN.md` step 7).
+/// One config for both, not a second `Backend` — the same physical radio,
+/// the same command protocol either way, differing only in framing, so a
+/// transport choice belongs inside [`sdroxide_types::Rsr200Config`] rather
+/// than duplicating the whole registration the way `RtlSdr`/`RtlTcp` do for
+/// a genuinely different remote server. `Rsr200Config` gained `transport`
+/// ([`sdroxide_types::Rsr200Transport`]: `Lan` or `Usb`) and `usb_serial`,
+/// both appended at the tail for the same positional reason as every field
+/// above them — a v91 peer would read either as garbage past the end of
+/// `attenuator2`, not fail outright.
+pub const PROTO_VERSION: u16 = 92;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1618,6 +1630,8 @@ mod tests {
                 decimation_exp: 5,
                 attenuator1: 12,
                 attenuator2: 20,
+                transport: sdroxide_types::Rsr200Transport::Usb,
+                usb_serial: "1234ABCD".into(),
             },
             ..RadioConfig::default()
         };

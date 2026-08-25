@@ -2157,6 +2157,18 @@ pub(in crate::app) fn settings_rsr200_tab(
         cfg.rsr200.bits24,
         cfg.rsr200.hw_div_magnitude,
         cfg.rsr200.hw_div_phase_deg,
+        // Nested: std's tuple trait impls stop at 12 elements, and step 8's
+        // own fields alone are eight more.
+        (
+            cfg.rsr200.use_vhf,
+            cfg.rsr200.vhf_preamp,
+            cfg.rsr200.swap_channels,
+            cfg.rsr200.upper_sideband,
+            cfg.rsr200.auto_att_threshold,
+            cfg.rsr200.auto_att_hold_time_sec,
+            cfg.rsr200.auto_att_gain_ch1,
+            cfg.rsr200.auto_att_gain_ch2,
+        ),
     );
 
     egui::Grid::new("rsr200-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -2270,7 +2282,9 @@ pub(in crate::app) fn settings_rsr200_tab(
              software, the same filter the SDRplay RSPduo's own second-tuner mode \
              uses. Hardware diversity: both ADCs still cross the wire, but the radio \
              itself sums them, weighted by the magnitude/phase set below — nothing \
-             left for software to combine.",
+             left for software to combine. Serial: one ADC's worth of wire traffic, \
+             but both ADCs sample time-interleaved at double the rate, folding a \
+             wider Nyquist zone out of the same ADC clock.",
         );
         ComboBox::from_id_salt("rsr200_channel_mode")
             .selected_text(cfg.rsr200.channel_mode.label())
@@ -2281,6 +2295,37 @@ pub(in crate::app) fn settings_rsr200_tab(
                     }
                 }
             });
+        ui.end_row();
+
+        if cfg.rsr200.channel_mode == Rsr200ChannelMode::Serial {
+            ui.label("Upper sideband").on_hover_text(
+                "Which half of the folded Nyquist zone the time-interleaved samples come \
+                 from. Should match the parity of the zone the current frequency tunes \
+                 into — picking the wrong one costs about 30 dB on the wanted signal \
+                 instead of the interferer, which is obvious and a one-click fix while \
+                 tuning, not something worth losing the manual choice over.",
+            );
+            ui.checkbox(&mut cfg.rsr200.upper_sideband, "");
+            ui.end_row();
+        }
+
+        ui.label("Antenna input").on_hover_text(
+            "ADC1 normally reads HF1; check this to read the VHF input instead. \
+             Remote power/preamp switches on the same connector's remote supply and \
+             RS-232 control line, for an active antenna or preamp that needs it.",
+        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut cfg.rsr200.use_vhf, "VHF input");
+            ui.checkbox(&mut cfg.rsr200.vhf_preamp, "Remote power/preamp");
+        });
+        ui.end_row();
+
+        ui.label("Swap channels").on_hover_text(
+            "Which physical ADC lands on which wire channel. In Single mode this picks \
+             ADC1 or ADC2 outright; in the two-ADC modes it swaps which one carries \
+             channel 1.",
+        );
+        ui.checkbox(&mut cfg.rsr200.swap_channels, "");
         ui.end_row();
 
         ui.label("Sample width").on_hover_text(
@@ -2325,10 +2370,15 @@ pub(in crate::app) fn settings_rsr200_tab(
             ui.end_row();
         }
 
+        // DP §4.7: while the automatic attenuator is on, its own +16dB step
+        // needs headroom above whatever is already manually set, so the
+        // manual range effectively shrinks from 0..35 to 0..19.
+        let att_max = if cfg.rsr200.auto_att_threshold > 0 { 19 } else { Rsr200Config::ATTENUATOR_MAX_DB };
+
         ui.label("Attenuator 1");
         {
-            let mut att = cfg.rsr200.attenuator1;
-            if crate::chrome::slider(ui, Slider::new(&mut att, 0..=Rsr200Config::ATTENUATOR_MAX_DB).suffix(" dB")).changed() {
+            let mut att = cfg.rsr200.attenuator1.min(att_max);
+            if crate::chrome::slider(ui, Slider::new(&mut att, 0..=att_max).suffix(" dB")).changed() {
                 cfg.rsr200.attenuator1 = att;
                 push_gain(cmds, Rsr200Config::ATT1_ELEMENT, -f64::from(att));
             }
@@ -2337,13 +2387,62 @@ pub(in crate::app) fn settings_rsr200_tab(
 
         ui.label("Attenuator 2");
         {
-            let mut att = cfg.rsr200.attenuator2;
-            if crate::chrome::slider(ui, Slider::new(&mut att, 0..=Rsr200Config::ATTENUATOR_MAX_DB).suffix(" dB")).changed() {
+            let mut att = cfg.rsr200.attenuator2.min(att_max);
+            if crate::chrome::slider(ui, Slider::new(&mut att, 0..=att_max).suffix(" dB")).changed() {
                 cfg.rsr200.attenuator2 = att;
                 push_gain(cmds, Rsr200Config::ATT2_ELEMENT, -f64::from(att));
             }
         }
         ui.end_row();
+
+        ui.label("Automatic attenuator").on_hover_text(
+            "Watches the signal level and adds a further 16 dB above whatever the manual \
+             attenuators already set, the moment it crosses this threshold — a fast, \
+             automatic guard against overload on top of manual gain-setting, not a \
+             replacement for it. Off leaves the attenuators exactly as set above.",
+        );
+        ComboBox::from_id_salt("rsr200_auto_att")
+            .selected_text(match cfg.rsr200.auto_att_threshold {
+                0 => "Off".to_string(),
+                t => format!("-{} dB", 6 * t),
+            })
+            .show_styled(ui, |ui| {
+                for t in 0..=5 {
+                    let label = if t == 0 { "Off".to_string() } else { format!("-{} dB", 6 * t) };
+                    if ui.selectable_label(cfg.rsr200.auto_att_threshold == t, label).clicked() {
+                        cfg.rsr200.auto_att_threshold = t;
+                    }
+                }
+            });
+        ui.end_row();
+
+        if cfg.rsr200.auto_att_threshold > 0 {
+            ui.label("Hold time").on_hover_text(
+                "How long the automatic +16dB step holds once the signal drops back below \
+                 the threshold, before releasing.",
+            );
+            crate::chrome::field(
+                ui,
+                DragValue::new(&mut cfg.rsr200.auto_att_hold_time_sec).range(0.0..=10.0).suffix(" s").speed(0.05),
+            );
+            ui.end_row();
+
+            ui.label("Calibration gain").on_hover_text(
+                "Per-channel compensation for the automatic step's own nominal 16 dB \
+                 (6.3096×) — device tolerances mean the real attenuation is rarely exactly \
+                 nominal; retune these against a known signal if levels jump when the \
+                 automatic step engages or releases.",
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    DragValue::new(&mut cfg.rsr200.auto_att_gain_ch1).range(1.0..=16.0).speed(0.001).prefix("ch1 "),
+                );
+                ui.add(
+                    DragValue::new(&mut cfg.rsr200.auto_att_gain_ch2).range(1.0..=16.0).speed(0.001).prefix("ch2 "),
+                );
+            });
+            ui.end_row();
+        }
     });
 
     if cfg.rsr200.channel_mode == Rsr200ChannelMode::Separate {
@@ -2548,6 +2647,16 @@ pub(in crate::app) fn settings_rsr200_tab(
             cfg.rsr200.bits24,
             cfg.rsr200.hw_div_magnitude,
             cfg.rsr200.hw_div_phase_deg,
+            (
+                cfg.rsr200.use_vhf,
+                cfg.rsr200.vhf_preamp,
+                cfg.rsr200.swap_channels,
+                cfg.rsr200.upper_sideband,
+                cfg.rsr200.auto_att_threshold,
+                cfg.rsr200.auto_att_hold_time_sec,
+                cfg.rsr200.auto_att_gain_ch1,
+                cfg.rsr200.auto_att_gain_ch2,
+            ),
         )
     {
         *apply = true;
@@ -2559,14 +2668,26 @@ pub(in crate::app) fn settings_rsr200_tab(
             "Reuter RSR200 support is new: verified against real hardware over both LAN and \
              USB (Linux/macOS — Windows needs its own driver research first). Connection, \
              address/port or serial, ADC clock, decimation, GPS discipline, channels, \
-             sample width and the hardware diversity weight take effect on Apply; the \
-             attenuators and (in Separate mode) the diversity controls apply as you move \
-             them. Hardware diversity's own mode switch and weight command are confirmed \
-             against real hardware; whether the *combining* itself is correct still needs \
-             two real aerials and a human listening. Temperature and the GPS-corrected \
-             clock offset aren't shown here yet — no live readout exists in this dialog for \
-             any radio — but they, and a solved hardware-diversity weight, all reach the \
-             log instead.",
+             sample width, antenna input/preamp, swap channels, upper sideband, the \
+             automatic attenuator and the hardware diversity weight take effect on Apply; \
+             the attenuators and (in Separate mode) the diversity controls apply as you \
+             move them. Two real bugs, invisible until checked against the radio's own \
+             protocol documentation, were found and fixed while adding Serial mode: mode \
+             Independent was being sent in a documented-invalid single-channel combination, \
+             and ADC2 was never actually being switched onto the HF2 connector in Separate \
+             and Hardware-diversity mode — every earlier 'confirmed on air' diversity result \
+             up to that fix was very likely two ADCs both listening to the HF1 antenna, not \
+             two independent aerials. With that fixed and two real antennas genuinely in \
+             the loop, whole-span Decorrelate and Adaptive both need Hold/Freeze once they \
+             look right — left running continuously against real (not artificially \
+             identical) two-antenna data, both are expected to wander, matching what this \
+             same technique already showed on the RSPduo. WidebandDecorrelate's real-antenna \
+             band-wipe on the RSR200 is still not root-caused. Serial mode, the automatic \
+             attenuator, VHF input switching and swap-channels are protocol-verified but not \
+             yet exercised against real hardware. Temperature and the GPS-corrected clock \
+             offset aren't shown here yet — no live readout exists in this dialog for any \
+             radio — but they, and a solved hardware-diversity weight, all reach the log \
+             instead.",
         )
         .weak(),
     );

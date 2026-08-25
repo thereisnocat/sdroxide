@@ -683,7 +683,30 @@ use sdroxide_types::{
 /// it into. `Rsr200Config` gained `hw_div_magnitude`/`hw_div_phase_deg`
 /// (`f64`), appended at the tail for the same positional reason as every
 /// field above them.
-pub const PROTO_VERSION: u16 = 95;
+///
+/// **96** — the RSR200 (v91–95) gains its last plan step: Serial mode,
+/// automatic attenuator control, VHF/preamp antenna-input switching, and
+/// swap-channels (`RSR200_PLAN.md` step 8, the last of the plan's eight
+/// steps). [`sdroxide_types::Rsr200ChannelMode`] gained `Serial`, appended
+/// last for the same reason every enum append before it was. `Rsr200Config`
+/// gained eight fields — `use_vhf`, `vhf_preamp`, `swap_channels`,
+/// `upper_sideband` (all `bool`), `auto_att_threshold` (`i32`),
+/// `auto_att_hold_time_sec` (`f64`), `auto_att_gain_ch1`/`auto_att_gain_ch2`
+/// (`f32`) — appended at the tail for the same positional reason as every
+/// field above them. This step also fixed two real bugs found by reading the
+/// radio's own protocol documentation rather than assuming: `stream.rs` was
+/// sending `OpMode::Independent` for `Single` channel mode, a
+/// documented-invalid combination (it requires the dual-channel wire
+/// format); and `SW_ADC2_TO_HF2` was never being set for `Separate`/
+/// `HardwareDiversity` mode, so ADC2 stayed on the radio's power-on default
+/// of listening to the same HF1 connector as ADC1 rather than the genuinely
+/// separate HF2 antenna those modes are for. Neither bug touches the wire
+/// format this proto crate carries — both are pure device-command
+/// corrections inside `sdroxide-rsr200` — but they materially change what
+/// "confirmed on air" meant for every earlier diversity test, which is why
+/// they're recorded here alongside the version that actually shipped the
+/// fix.
+pub const PROTO_VERSION: u16 = 96;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1660,7 +1683,7 @@ mod tests {
                 attenuator2: 20,
                 transport: sdroxide_types::Rsr200Transport::Usb,
                 usb_serial: "1234ABCD".into(),
-                channel_mode: sdroxide_types::Rsr200ChannelMode::Separate,
+                channel_mode: sdroxide_types::Rsr200ChannelMode::Serial,
                 diversity: sdroxide_types::Rsr200Diversity {
                     mode: sdroxide_types::DiversityMode::Combine,
                     taps: 16,
@@ -1672,6 +1695,14 @@ mod tests {
                 bits24: true,
                 hw_div_magnitude: 2.5,
                 hw_div_phase_deg: 45.0,
+                use_vhf: true,
+                vhf_preamp: true,
+                swap_channels: true,
+                upper_sideband: true,
+                auto_att_threshold: 3,
+                auto_att_hold_time_sec: 1.5,
+                auto_att_gain_ch1: 8.0,
+                auto_att_gain_ch2: 9.5,
             },
             ..RadioConfig::default()
         };

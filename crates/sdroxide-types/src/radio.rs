@@ -4291,6 +4291,43 @@ pub struct Rsr200Config {
     pub hw_div_magnitude: f64,
     /// The same weight's phase, in degrees.
     pub hw_div_phase_deg: f64,
+    /// Which physical input feeds ADC1: HF1 (`false`) or VHF (`true`). Reopens
+    /// the device.
+    pub use_vhf: bool,
+    /// Remote power and RS-232 control for an active antenna on the ADC1
+    /// side (HF1/VHF, whichever [`Self::use_vhf`] selects) — DP §3.3's
+    /// "remote power supply HF1/VHF" and "Control" switch bits together, one
+    /// checkbox. Reopens the device.
+    pub vhf_preamp: bool,
+    /// Swap which physical ADC lands on which wire channel — DP §3.3's port
+    /// mode "Channel selection" bit. In [`Rsr200ChannelMode::Single`] this
+    /// picks ADC1 or ADC2 outright; in the two-ADC modes it swaps which of
+    /// the two carries channel 1. Reopens the device.
+    pub swap_channels: bool,
+    /// [`Rsr200ChannelMode::Serial`] only: which Nyquist-zone sideband the
+    /// time-interleaved samples fold from — should match the parity of the
+    /// zone `tune_for` computes for the current frequency (odd → `false`,
+    /// even → `true`), but left manual: picking the wrong one costs ~30 dB
+    /// on the wanted signal instead of the interferer, a mistake that is
+    /// obvious and one click to fix while tuning, not worth taking the
+    /// choice away for. Reopens the device.
+    pub upper_sideband: bool,
+    /// 0 = off, 1..=5 = -6dB..-30dB in fixed 6dB steps — the radio's own
+    /// automatic gain-reduction step, independent of and layered on top of
+    /// the manual attenuators. "Enabled" is `auto_att_threshold > 0`; there
+    /// is no separate on/off field, so the two can never disagree. Reopens
+    /// the device (DP §4.7: the manual attenuator range effectively shrinks
+    /// to 0..19 while this is on, since the automatic +16dB step needs
+    /// headroom above whatever is already set).
+    pub auto_att_threshold: i32,
+    /// How long the automatic +16dB step holds after the signal drops back
+    /// below [`Self::auto_att_threshold`], in seconds. Reopens the device.
+    pub auto_att_hold_time_sec: f64,
+    /// Per-channel calibration multiplier for the automatic attenuator's own
+    /// gain compensation — nominal 6.3096× (DP's own worked value, the
+    /// attenuator's nominal 16dB). Reopens the device.
+    pub auto_att_gain_ch1: f32,
+    pub auto_att_gain_ch2: f32,
 }
 
 impl Default for Rsr200Config {
@@ -4310,6 +4347,14 @@ impl Default for Rsr200Config {
             bits24: false,
             hw_div_magnitude: 1.0,
             hw_div_phase_deg: 0.0,
+            use_vhf: false,
+            vhf_preamp: false,
+            swap_channels: false,
+            upper_sideband: false,
+            auto_att_threshold: 0,
+            auto_att_hold_time_sec: 0.2,
+            auto_att_gain_ch1: 6.3096,
+            auto_att_gain_ch2: 6.3096,
         }
     }
 }
@@ -4348,17 +4393,29 @@ pub enum Rsr200ChannelMode {
     /// combining by the time a sample arrives, so there is nothing left
     /// for a software filter to do (`RSR200_PLAN.md` §3).
     HardwareDiversity,
+    /// One ADC, but time-interleaved sampling across both ADCs doubles the
+    /// effective rate and folds a wider Nyquist zone — DP's own "ADC1 + ADC2
+    /// serial" DSP mode. Needs ADC2's own clock inverted (`SW_ADC2_CLK_INVERTED`
+    /// on the switch register), a hard DP requirement ("CLK ADC2 must be
+    /// inverted!"), not an option — `stream.rs` sets that bit whenever this
+    /// variant is selected, unconditionally.
+    Serial,
 }
 
 impl Rsr200ChannelMode {
-    pub const ALL: [Rsr200ChannelMode; 3] =
-        [Rsr200ChannelMode::Single, Rsr200ChannelMode::Separate, Rsr200ChannelMode::HardwareDiversity];
+    pub const ALL: [Rsr200ChannelMode; 4] = [
+        Rsr200ChannelMode::Single,
+        Rsr200ChannelMode::Separate,
+        Rsr200ChannelMode::HardwareDiversity,
+        Rsr200ChannelMode::Serial,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Rsr200ChannelMode::Single => "Single channel",
             Rsr200ChannelMode::Separate => "Separate (software diversity)",
             Rsr200ChannelMode::HardwareDiversity => "Hardware diversity (radio combines)",
+            Rsr200ChannelMode::Serial => "Serial (time-interleaved, wider Nyquist zone)",
         }
     }
 }

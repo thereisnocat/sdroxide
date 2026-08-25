@@ -441,6 +441,30 @@ separately and shipped each as it landed):
    `open_status()` and the settings tab both report per-technique status now: Decorrelate
    confirmed good, WidebandDecorrelate flagged in red as confirmed broken, Adaptive still
    unjudged on real antennas.
+
+   **Correction, step 8 (2026-08-25) — read this before trusting anything above.** The identical
+   RMS reading and the "confirmed on air, nulling well" Decorrelate result were both artifacts of
+   the same bug, not evidence of anything real. Reading the OM's own DP directly for step 8 found
+   that `stream.rs` had never set the `SW_ADC2_TO_HF2` switch-register bit in *any* dual-channel
+   mode, in any step up to and including this one — the radio's own documented power-on default is
+   "HF1 to ADC1 *and* ADC2," so ADC2 had been internally paralleled onto the same HF1 connector as
+   ADC1 the entire time, never routed to the physically separate HF2 aerial. That alone explains
+   the identical-RMS finding outright — the "more similar/coupled aerials" hypothesis floated above
+   was never tested and was not the answer — and it means the "confirmed on air" result was really
+   Decorrelate solving the degenerate two-near-identical-inputs case, not genuine two-antenna
+   diversity. Fixed in step 8 (§7 below, `PROTO_VERSION` 96): `SW_ADC2_TO_HF2` is now set whenever
+   `dual` is true. Retested the same day against two real, physically distinct antennas (confirmed
+   with Ralph directly — HF1 and HF2 each carry a different aerial): with genuine diversity now in
+   the signal path, whole-span Decorrelate left running continuously (not held/frozen) produces
+   audible distortion and a "dancing" spectrum trace rather than a clean null, and Adaptive left
+   running continuously also now wipes out the band. Both match, rather than contradict, prior
+   findings already on record elsewhere in this codebase: `DECORRELATION_PLAN.md`'s own real-air
+   RSPduo testing found a single global weight "not very useful for the most part" against genuine
+   interference, and `Diversity`'s own module doc has always said the adaptive filter needs to be
+   frozen once converged or it "will re-aim itself at whatever is loudest." Ralph had not tried
+   Hold/Freeze during this retest — that is the next real-hardware step, not yet done. What is
+   *not* yet retested at all: WidebandDecorrelate's already-noted full-band wipeout, with the
+   routing fix now in place.
 5. **Done. 24-bit, decimation range, GPS discipline/correction readout** (branch `rsr200`) —
    turned out to be smaller than the three items in its own title suggested, once actually
    checked against what steps 1–4 had already done.
@@ -560,6 +584,16 @@ separately and shipped each as it landed):
    or combines something real. That needs two real aerials and a human listening — the same
    "confirmed on air" milestone Separate mode already reached for its own software path.
    `open_status()` and the settings tab both say so plainly until it has been.
+
+   **Correction, step 8 (2026-08-25)**: the same `SW_ADC2_TO_HF2` bug corrected in step 4's own
+   annotation above applies here too — `HardwareDiversity` is also a `dual` mode, so every run of
+   `usb_hwdiv_probe.rs` and every real-hardware test of this mode up to step 8 had ADC2 listening
+   to the same HF1 antenna as ADC1, not the genuinely separate HF2 aerial the radio's own hardware
+   combiner is meant to combine. The runs above still prove what they claimed — the mode switch
+   and weight command are accepted and streaming stays clean — but "whether the *combining* itself
+   is correct" (this entry's own closing line) has still not been tested with a real, physically
+   independent second aerial in the loop, and now that the routing bug is fixed, it still needs to
+   be.
 7. **Done on Linux/macOS, Windows still open. USB transport** (branch `rsr200`) — done out of
    order, ahead of steps 4–6, at Ralph's request. `sdroxide-rsr200::ffi` (hand-written D3XX
    bindings, loaded with `dlopen` at runtime via `libloading` — same pattern as
@@ -611,8 +645,58 @@ separately and shipped each as it landed):
    first; confirmed fixed across two clean, crash-free runs afterward. Not documented anywhere
    in the D3XX headers — found only because this was run against real hardware rather than
    left as "ported faithfully, should be fine."
-8. **Auto-ATT, Serial mode, VHF/preamp switching** — lowest priority; each is real but
-   self-contained, and none of them blocks anything else on this list.
+8. **Done. Auto-ATT, Serial mode, VHF/preamp switching, swap-channels** (branch `rsr200`) — the
+   last of the plan's eight steps, done exactly as scoped: each was self-contained, and almost all
+   the underlying protocol work (`Config`'s Auto-ATT fields, `cmd_set_auto_attenuator`, the
+   switch-register bit constants, `port_mode_byte`/`dsp_mode_byte`) was already built and tested
+   since step 1 — this step was field exposure and wiring, not new protocol logic.
+
+   `Rsr200ChannelMode` gained a fourth variant, `Serial` (time-interleaved single-stream mode,
+   `OpMode::Serial`, `format.channels = 1` like `Single` since both ADCs fold into one stream
+   rather than two — not the dual-channel shape `Separate`/`HardwareDiversity` use). `Rsr200Config`
+   gained eight fields: `use_vhf`/`vhf_preamp` (antenna input switching), `swap_channels`,
+   `upper_sideband` (Serial-only), and the four Auto-ATT fields (`auto_att_threshold` 0–5,
+   `auto_att_hold_time_sec`, `auto_att_gain_ch1`/`auto_att_gain_ch2`). All eight are
+   reopen-triggering only, per the SDR++ sibling implementation's own "static setting only
+   editable while stopped" precedent — none of them got live `SetGain`-style plumbing.
+   `settings_rsr200_tab` grew an antenna-input row (VHF input / remote power+preamp checkboxes,
+   matching the DP-documented `SW_ADC1_TO_VHF | SW_REMOTE_PWR_CH1 | SW_REMOTE_CTRL_CH1` sequence —
+   *not* the `SW_VHF_PREAMP` bit, which the SDR++ reference's own real USB packet capture already
+   found to be the wrong one, per `sdrpp-antenna-phasing`), a swap-channels checkbox, a
+   Serial-only upper-sideband checkbox, and an Automatic Attenuator section (threshold combo box,
+   plus hold-time/calibration-gain fields shown only when enabled). The attenuator sliders now cap
+   at 19 dB rather than the usual 31 when Auto-ATT is active, matching DP §Auto-ATT's own note
+   that the attenuator's top range is reserved for the automatic function once engaged.
+   `PROTO_VERSION` 95 → 96.
+
+   **Two real, previously-unnoticed correctness bugs found and fixed while reading the DP directly
+   for Serial mode's own op-mode/switch-register requirements** — not found by testing, found by
+   checking the manufacturer's own documentation rather than assuming the existing code was right:
+
+   - The DP's "1 byte DSP mode" table states outright that mode 0 (`OpMode::Independent`, "two
+     unrelated channels") "requires port mode bit 4 [dual-channel] to be 1" — a documented-invalid
+     combination. `stream.rs` had been sending exactly that invalid combination for `Single`
+     channel mode since step 4: `format.channels = 1` with `op_mode = Independent`.
+     `Config::default()`'s own `op_mode` was already `ParallelAdd` (matching the radio's own
+     documented power-on default) from the start — the bug was `stream.rs` overriding that correct
+     default with an invalid one for `Single` specifically. Fixed: `Single` now sends
+     `OpMode::ParallelAdd`, matching the default it should never have overridden.
+   - `SW_ADC2_TO_HF2` — the switch-register bit that actually routes ADC2's analog front end to
+     the physical HF2 connector, rather than leaving it internally paralleled onto HF1 (the radio's
+     documented power-on default) — had never been set anywhere in `stream.rs`, in any dual-channel
+     mode, since step 4. Fixed: now set whenever `dual` is true. **This materially recontextualizes
+     every earlier "confirmed on air" result for Separate mode and Hardware Diversity** — see the
+     correction notes added to steps 4 and 6 above, which should be read alongside those entries
+     rather than treated as a footnote here.
+
+   Both fixes verified by `cargo test -p sdroxide-rsr200` (38/38 still pass) and `cargo build`/
+   `cargo clippy` across every crate this step touched (`sdroxide-types`, `sdroxide-rsr200`,
+   `sdroxide-ui`, `sdroxide`, `sdroxide-proto`) — no new warnings introduced. **Not yet done**: no
+   standalone real-hardware probe example exists yet for Serial mode, Auto-ATT, VHF/preamp
+   switching, or swap-channels, matching the `usb_status_probe.rs`/`usb_hwdiv_probe.rs`/
+   `usb_dual_probe.rs` precedent every step from 5 onward set — this step shipped on protocol-level
+   confidence (the underlying commands were already hardware-verified at step 1) and code review
+   against the DP, not a fresh real-hardware run of its own new surface area.
 
 ## 8. Open questions
 
@@ -632,3 +716,16 @@ separately and shipped each as it landed):
 - Whether the Windows `FTD3XXWU`/WinUSB question in §6 is worth spiking *before* LAN is proven,
   in case it changes how much of the USB phase is genuinely new work versus reachable through
   `nusb` the way every sibling crate manages.
+- `SW_REMOTE_PWR_CH2`/`SW_REMOTE_CTRL_CH2` (channel 2's own remote antenna power/control, for an
+  RLA4/RFA2/RAP-style active antenna on HF2) are defined in `protocol.rs` and untouched by step 8
+  — that step's own title said "VHF/preamp switching," which the DP and this codebase have both
+  treated as ADC1/channel-1-focused throughout, but the DP documents the same capability
+  symmetrically for channel 2. Not decided whether that's in scope for a future step or genuinely
+  unused by this radio's real-world antenna configurations.
+- Now that step 8's `SW_ADC2_TO_HF2` fix has two genuinely independent antennas actually in the
+  signal path for the first time (see the correction notes on steps 4 and 6), whole-span
+  Decorrelate and Adaptive both need real-hardware retesting *with* Hold/Freeze engaged before
+  either can be called working or not-working against real interference — untested as of step 8's
+  own completion. WidebandDecorrelate's pre-existing full-band-wipeout bug (step 4) also still
+  needs retesting with the routing fix in place; nothing suggests the fix touches that bug either
+  way, but it hasn't been checked.

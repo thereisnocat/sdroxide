@@ -18,14 +18,13 @@
 //! `sdrplay_source.rs`, which this file mirrors closely for exactly that
 //! reason.
 //!
-//! Single channel, Separate (two ADCs, combined here in software), or
-//! hardware diversity (two ADCs, combined by the radio itself before a
-//! sample reaches the host — channel A carries the result, channel B is
-//! read off the wire but unused) — [`Rsr200Config::channel_mode`] picks
-//! which, and [`Rsr200Config::bits24`] the sample width, independently
-//! (`RSR200_PLAN.md` steps 1–7 — only step 8's own lowest-priority extras,
-//! Auto-ATT/Serial mode/VHF preamp switching, remain unbuilt). Hardware
-//! diversity's own weight is solved once in software
+//! Single channel, Serial (both ADCs time-interleaved into one stream),
+//! Separate (two ADCs, combined here in software), or hardware diversity
+//! (two ADCs, combined by the radio itself before a sample reaches the host
+//! — channel A carries the result, channel B is read off the wire but
+//! unused) — [`Rsr200Config::channel_mode`] picks which, and
+//! [`Rsr200Config::bits24`] the sample width, independently (`RSR200_PLAN.md`
+//! steps 1–8, all done). Hardware diversity's own weight is solved once in software
 //! (whole-span decorrelate, while running in Separate mode — see
 //! [`Rsr200Source::log_hardware_diversity_solve`]) and applied by
 //! reopening into `Rsr200ChannelMode::HardwareDiversity`, not adjusted
@@ -45,30 +44,50 @@
 //! `RSR200_PLAN.md`'s own step 3 and step 7 entries for the full account of
 //! each.
 //!
-//! Separate mode (step 4), confirmed on real air the same day, on two real
-//! antennas: [`DiversityTechnique::Decorrelate`] nulls well, as expected —
-//! this is the milestone `RSR200_PLAN.md` §4 was written to reach. But
-//! [`DiversityTechnique::WidebandDecorrelate`] does not work on this radio
-//! as tested: rather than nulling specific interferers, it wipes out the
-//! entire band — no carriers survive, only noise. Not yet root-caused; see
+//! Separate mode (step 4) and hardware diversity (step 6) were both
+//! believed confirmed on real air, on two real antennas, the day they were
+//! built. **Step 8 found that belief was wrong**: reading the DP directly
+//! for Serial mode's own switch-register requirements turned up that
+//! `SW_ADC2_TO_HF2` — the bit that actually routes ADC2 to the physical HF2
+//! connector — had never been set in either dual-channel mode, so every
+//! "confirmed on air" run through step 7 had both ADCs listening to the
+//! same HF1 antenna, not two genuinely independent aerials. Fixed in step 8;
+//! see `RSR200_PLAN.md`'s own step 4/6 entries and their step-8 correction
+//! notes for the full account. Retested the same day against two real,
+//! physically separate antennas: [`DiversityTechnique::Decorrelate`], left
+//! running continuously rather than frozen once converged, now shows
+//! audible distortion and a wandering null rather than the clean result the
+//! pre-fix (same-antenna) test found — not a regression, the first
+//! non-degenerate test this technique has had on this radio, and it needs a
+//! follow-up with Hold/Freeze engaged before it can be judged either way.
+//! [`DiversityTechnique::WidebandDecorrelate`] still does not work on this
+//! radio as tested: rather than nulling specific interferers, it wipes out
+//! the entire band — no carriers survive, only noise. Not yet root-caused,
+//! and not yet retested against the routing fix either; see
 //! [`Rsr200Source::open_status`] and `RSR200_PLAN.md`'s own step 4 entry.
-//! [`Self::log_depth`] now reports active-bin counts and null depth to the
-//! log for whoever investigates next.
+//! [`Self::log_depth`] reports active-bin counts and null depth to the log
+//! for whoever investigates next.
 //!
 //! Hardware diversity (step 6) follows the SDR++ sibling implementation's
 //! own already-tested design exactly, including a real bug that
 //! implementation found and fixed live (channel 2's weight has to be
 //! explicitly set to unity in Separate mode too, or it silently inherits a
 //! stale weight from a previous hardware-diversity session and reads as an
-//! exact, clean zero) — and, the same day this was built, was confirmed
-//! against the real RSR200: `OpMode::Diversity` and the channel-2 weight
-//! command both accepted at unity and at a real non-unity weight
-//! (magnitude 0.5, phase 45°), real samples streaming cleanly afterward
-//! either way. What that run does *not* prove is that the *combining*
-//! itself is correct — which channel actually carries the result, whether
-//! a solved weight actually nulls or combines something real — that needs
-//! two real aerials and a human listening, `RSR200_PLAN.md`'s own next
-//! open question for this step.
+//! exact, clean zero) — and was confirmed against the real RSR200:
+//! `OpMode::Diversity` and the channel-2 weight command both accepted at
+//! unity and at a real non-unity weight (magnitude 0.5, phase 45°), real
+//! samples streaming cleanly afterward either way. What that run does *not*
+//! prove, and still has not proven even after step 8's routing fix, is that
+//! the *combining* itself is correct — which channel actually carries the
+//! result, whether a solved weight actually nulls or combines something
+//! real — that needs its own retest with two genuinely independent aerials
+//! now that they are, for the first time, actually in the signal path.
+//!
+//! Step 8 itself (Auto-ATT, Serial mode, VHF/preamp switching,
+//! swap-channels) shipped on protocol-level confidence — the underlying
+//! commands were already hardware-verified at step 1 — and on the DP read
+//! directly rather than a fresh real-hardware probe of its own; none exists
+//! yet for this step's own new surface area.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -173,6 +192,7 @@ impl Rsr200Source {
                 Rsr200ChannelMode::Single => "",
                 Rsr200ChannelMode::Separate => ", Separate mode",
                 Rsr200ChannelMode::HardwareDiversity => ", hardware diversity",
+                Rsr200ChannelMode::Serial => ", Serial mode",
             }
         );
         let mut src = Rsr200Source {

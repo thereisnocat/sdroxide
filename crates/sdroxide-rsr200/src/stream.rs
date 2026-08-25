@@ -146,6 +146,7 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
                 Rsr200ChannelMode::Single => "",
                 Rsr200ChannelMode::Separate => ", Separate mode",
                 Rsr200ChannelMode::HardwareDiversity => ", hardware diversity",
+                Rsr200ChannelMode::Serial => ", Serial mode",
             };
             let label = format!("Reuter RSR200 @ {where_from}, {:.3} Msps{mode_note}", rate_hz / 1e6);
             Ok(Rsr200Handle::from_parts(rx_cons, ctrl_tx, shared, join, label, rate_hz, dual))
@@ -188,27 +189,69 @@ fn run(
         },
     };
 
-    // 16 or 24 bit per `bits24`, one channel or two depending on
-    // `channel_mode`. `format.channels` is 2 for *both* `Separate` and
-    // `HardwareDiversity` -- a real trap in the SDR++ sibling
+    // 16 or 24 bit per `bits24`. `format.channels` is 2 for both `Separate`
+    // and `HardwareDiversity` -- a real trap in the SDR++ sibling
     // implementation's own live testing: the first attempt assumed a
     // hardware-combined result meant a 1-channel wire format, which
     // produced a live, audible channel-deinterleaving comb of spurs
-    // instead. Only `op_mode` tells the radio which of the two it's in --
-    // `Independent` ("two unrelated channels," per its own doc, what
-    // RSR200_PLAN.md section 4 calls "Separate") or `Diversity` (the
-    // radio's own hardware combiner, step 6).
-    let dual = cfg.channel_mode != Rsr200ChannelMode::Single;
+    // instead -- and 1 for `Single` and `Serial` alike, since Serial folds
+    // both ADCs' time-interleaved samples into one stream, not two.
+    //
+    // `op_mode` is what actually tells the radio which shape it's in, and
+    // is not simply "`Independent` unless HardwareDiversity" -- a real bug
+    // this step found and fixed, not present from the start: DP's own DSP
+    // mode table states outright that mode 0 (`Independent`, "two unrelated
+    // channels") "requires port mode bit 4 [dual-channel] to be 1" --
+    // sending it with `format.channels == 1`, which is what `Single` mode
+    // did here from step 4 through step 7, is a documented-invalid
+    // combination. `Config::default()`'s own `op_mode` was `ParallelAdd`
+    // from the start (matching the radio's own documented power-on default,
+    // "Operating mode: Parallel (ADC1 + ADC2)") -- this step's fix is
+    // simply to stop overriding that default with something invalid for
+    // `Single` specifically.
+    let dual = matches!(cfg.channel_mode, Rsr200ChannelMode::Separate | Rsr200ChannelMode::HardwareDiversity);
+    let op_mode = match cfg.channel_mode {
+        Rsr200ChannelMode::Single => OpMode::ParallelAdd,
+        Rsr200ChannelMode::Separate => OpMode::Independent,
+        Rsr200ChannelMode::HardwareDiversity => OpMode::Diversity,
+        Rsr200ChannelMode::Serial => OpMode::Serial,
+    };
+
+    // The switch register. DP §4's own documented power-on default is
+    // "Inputs: HF1 to ADC1 *and* ADC2" -- both ADCs internally paralleled
+    // onto the same HF1 connector until told otherwise. Another real bug
+    // this step found and fixed: nothing here ever set `SW_ADC2_TO_HF2`
+    // before, so every `Separate`/`HardwareDiversity` session run so far
+    // had ADC2 listening to whatever HF1 hears, not to a genuinely separate
+    // second aerial on HF2 -- matching the SDR++ sibling implementation's
+    // own `dualChannel ? SW_ADC2_TO_HF2 : 0`. `SW_ADC2_CLK_INVERTED` is a
+    // hard DP requirement for Serial mode ("CLK ADC2 must be inverted!"),
+    // not an option, so it is unconditional here rather than a setting.
+    let switch_register = (if cfg.use_vhf { crate::protocol::SW_ADC1_TO_VHF } else { 0 })
+        | (if cfg.vhf_preamp {
+            crate::protocol::SW_REMOTE_PWR_CH1 | crate::protocol::SW_REMOTE_CTRL_CH1
+        } else {
+            0
+        })
+        | (if dual { crate::protocol::SW_ADC2_TO_HF2 } else { 0 })
+        | (if cfg.channel_mode == Rsr200ChannelMode::Serial { crate::protocol::SW_ADC2_CLK_INVERTED } else { 0 });
+
     let mut dev_cfg = Config {
         adc_clock_hz: cfg.adc_clock_hz,
         gps_discipline: cfg.gps_discipline,
         decimation_exp: cfg.decimation_exp,
         format: StreamFormat { channels: if dual { 2 } else { 1 }, bits: if cfg.bits24 { 24 } else { 16 } },
-        op_mode: if cfg.channel_mode == Rsr200ChannelMode::HardwareDiversity { OpMode::Diversity } else { OpMode::Independent },
+        op_mode,
+        swap_channels: cfg.swap_channels,
+        upper_sideband: cfg.upper_sideband,
         tuned_hz: center_hz,
+        switch_register: u16::from(switch_register),
         attenuator1: cfg.attenuator1,
         attenuator2: cfg.attenuator2,
-        ..Config::default()
+        auto_att_threshold: cfg.auto_att_threshold,
+        auto_att_hold_time_sec: cfg.auto_att_hold_time_sec,
+        auto_att_gain_ch1: cfg.auto_att_gain_ch1,
+        auto_att_gain_ch2: cfg.auto_att_gain_ch2,
     };
 
     let mut device = Device::new();

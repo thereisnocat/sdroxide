@@ -7,9 +7,14 @@
 //! Single channel, 16-bit, LAN — the only wire shape `sdroxide-rsr200`
 //! streams yet (`RSR200_PLAN.md` steps 1–3). USB, 24-bit and the
 //! dual-channel Separate/Diversity modes are real capabilities of the radio
-//! with no host-side wiring for them here yet, and none of this has been
-//! run against real hardware — no RSR200 has been reachable to test it
-//! against.
+//! with no host-side wiring for them here yet.
+//!
+//! Verified working against a real RSR200 (2026-08-24), so far only over
+//! WiFi: real spectrum on screen, tuning and the attenuators all live. One
+//! caveat from that first run, recorded in `RSR200_PLAN.md`'s own step 3
+//! entry rather than repeated here: brief dropouts at the lowest decimation
+//! setting, consistent with WiFi's own bandwidth headroom rather than
+//! anything wrong in this crate — not yet tried over a wired LAN.
 
 use std::time::Duration;
 
@@ -144,9 +149,10 @@ impl IqSource for Rsr200Source {
 
     fn open_status(&self) -> Option<String> {
         Some(
-            "Reuter RSR200 support is new and has not been verified against real hardware: \
-             no RSR200 has been reachable to test sdroxide-rsr200 against. Single channel, \
-             16-bit over LAN only — 24-bit, dual channel and USB are not wired up yet."
+            "Reuter RSR200 support is new: verified against real hardware over WiFi, not yet \
+             over a wired LAN. Single channel, 16-bit only — 24-bit, dual channel and USB are \
+             not wired up yet. Brief dropouts at low decimation are a known WiFi bandwidth \
+             limitation, not a bug — a wired connection is expected to do better."
                 .to_string(),
         )
     }

@@ -351,9 +351,21 @@ separately and shipped each as it landed):
    38/38 (the 33 from steps 1–2 plus 5 new for `handle::Pending`/`push_iq`/`ring_for`). `cargo
    clippy --all-targets` on the same five crates: no new warnings — the handful clippy reports are
    all pre-existing, in unrelated files this work never touched. Single channel, 16-bit, LAN is the
-   whole of what streams: still genuinely untested against a real RSR200, since none has been
-   reachable to test any of this against — that gap is exactly what step 3 exists to close, and
-   `Rsr200Source::open_status()` says so plainly in the UI until it has been.
+   whole of what streams.
+
+   **Verified against a real RSR200** (2026-08-24, over WiFi rather than wired LAN): registering
+   `Backend::Rsr200` in `RadioConfig`, the settings-tab dispatch and `open_configured_source` was
+   not enough on its own — it never reached `settings/mod.rs`'s own hand-maintained `iface_opts`
+   list, a *second*, separate enumeration that actually populates the Interface dropdown
+   (`Backend::ALL` is not it). Built, opened a settings tab, accepted a host/port — but was not
+   selectable until that list got the same one-line addition. Fixed, rebuilt, confirmed selectable
+   and working: real spectrum on screen, closing the loop step 3 set out to close. One real,
+   expected caveat surfaced by an actual radio rather than the protocol-level test harness: brief
+   dropouts at the ÷64 decimation setting (`decimation_exp = 5`, the *lowest* of the six rates,
+   still on the order of a couple of Msps at 16 bits — a nontrivial continuous TCP payload) —
+   consistent with WiFi's own bandwidth headroom under real household loss patterns, not a protocol
+   or threading bug. This backend has only ever been asked to stream over LAN, not WiFi; not yet
+   tried over a wired connection to see whether the dropouts are WiFi-specific.
 4. **Separate mode + `sdroxide_dsp::Diversity` wiring** — the part this plan exists to answer
    the question about. Prove it against real antennas the way the RSPduo work already did.
 5. **24-bit, decimation range, GPS discipline/correction readout** — each is a small, mostly

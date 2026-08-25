@@ -1,8 +1,15 @@
 //! PowerSDR-style frequency readout: each digit tunes with the scroll wheel,
 //! click upper/lower half to increment/decrement, or right-click to zero that
-//! digit and everything to its right. Compact layouts use [`show_typed`]
-//! instead: the same dial, but a tap on it opens a type-in field rather than
-//! nudging whichever place value was under the finger.
+//! digit and everything to its right. Double-clicking a digit opens the same
+//! type-in editor [`show_typed`] uses for compact layouts — the escape hatch
+//! a per-digit nudge cannot offer once a source's valid ranges are not one
+//! contiguous span (the RSR200's disjoint HF/VHF ranges are what exposed the
+//! gap): jumping from deep in one band to deep in another crosses invalid
+//! territory at every intermediate digit otherwise, and each rejected digit
+//! change reverts before the next one can be reached. Compact layouts use
+//! [`show_typed`] for the *resting* state too: the same dial, but any tap on
+//! it opens the editor rather than nudging whichever place value was under
+//! the finger — there is no room to hit one digit precisely on a phone.
 
 use eframe::egui::{self, Color32, Label, RichText, Sense, Ui};
 use sdroxide_types::WheelSettings;
@@ -44,9 +51,18 @@ pub fn show(
     size: f32,
     ink: Option<Color32>,
 ) -> Option<f64> {
+    // Mid-edit: the editor from a previous frame's double-click. Same shared
+    // state and field as `show_typed`'s own, so there is one implementation
+    // of "type a frequency" rather than two that could drift apart.
+    let edit_id = id.with("edit");
+    if let Some(text) = ui.data(|d| d.get_temp::<String>(edit_id)) {
+        return edit_field(ui, id, edit_id, text, size);
+    }
+
     let lit = ink.unwrap_or_else(digit_ink);
     let mut freq = hz.round().max(0.0) as i64;
     let orig = freq;
+    let mut open_editor = false;
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
@@ -69,7 +85,8 @@ pub fn show(
                     )
                     .sense(Sense::click()),
                 )
-                .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                .on_hover_text("Scroll or click to tune this digit — double-click to type a frequency");
 
             if resp.hovered() {
                 ui.painter().hline(resp.rect.x_range(), resp.rect.bottom() - 1.0, (2.0, lit));
@@ -85,13 +102,20 @@ pub fn show(
                 freq = (freq + step * detents as i64).max(0);
             }
 
-            if resp.clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    if pos.y < resp.rect.center().y {
-                        freq += step;
-                    } else {
-                        freq = (freq - step).max(0);
-                    }
+            // Double-click opens the type-in editor instead of nudging this
+            // digit — checked ahead of the single-click bump below so a
+            // double-click never also moves the dial by one step on its way
+            // in (egui counts both clicks of a double-click as ordinary
+            // `clicked()` events too).
+            if resp.double_clicked() {
+                open_editor = true;
+            } else if resp.clicked()
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                if pos.y < resp.rect.center().y {
+                    freq += step;
+                } else {
+                    freq = (freq - step).max(0);
                 }
             }
 
@@ -105,6 +129,16 @@ pub fn show(
         }
         ui.add(Label::new(RichText::new(" Hz").size(size * 0.3).color(crate::theme::gray(140))));
     });
+
+    if open_editor {
+        ui.data_mut(|d| {
+            d.insert_temp(edit_id, format_mhz(hz));
+            // Marks the editor's first frame, when it takes focus and selects
+            // the prefill so typing replaces it — see `edit_field`.
+            d.insert_temp(id.with("fresh"), true);
+        });
+        return None;
+    }
 
     (freq != orig).then_some(freq as f64)
 }

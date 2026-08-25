@@ -121,7 +121,8 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
         last_rx_ms: AtomicU64::new(0),
         status: std::sync::Mutex::new(crate::protocol::Status::default()),
     });
-    let dual = cfg.channel_mode == Rsr200ChannelMode::Separate;
+    let dual = cfg.channel_mode != Rsr200ChannelMode::Single;
+    let channel_mode = cfg.channel_mode;
     let (rx_prod, rx_cons) = ring_for(cfg.sample_rate_hz(), if dual { QUAD } else { 2 });
 
     let cfg = cfg.clone();
@@ -141,11 +142,12 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
 
     match ready_rx.recv() {
         Ok(Ok(rate_hz)) => {
-            let label = format!(
-                "Reuter RSR200 @ {where_from}, {:.3} Msps{}",
-                rate_hz / 1e6,
-                if dual { ", Separate mode" } else { "" }
-            );
+            let mode_note = match channel_mode {
+                Rsr200ChannelMode::Single => "",
+                Rsr200ChannelMode::Separate => ", Separate mode",
+                Rsr200ChannelMode::HardwareDiversity => ", hardware diversity",
+            };
+            let label = format!("Reuter RSR200 @ {where_from}, {:.3} Msps{mode_note}", rate_hz / 1e6);
             Ok(Rsr200Handle::from_parts(rx_cons, ctrl_tx, shared, join, label, rate_hz, dual))
         }
         Ok(Err(e)) => {
@@ -187,19 +189,22 @@ fn run(
     };
 
     // 16 or 24 bit per `bits24`, one channel or two depending on
-    // `channel_mode`; `OpMode::Independent` either way -- it is the wire
-    // shape itself ("two unrelated channels," per its own doc) that
-    // RSR200_PLAN.md section 4 calls "Separate," not a different op mode.
-    // The radio's own hardware combiner is a distinct op mode
-    // (`OpMode::Diversity`, step 6, not yet built) that this backend never
-    // selects.
-    let dual = cfg.channel_mode == Rsr200ChannelMode::Separate;
+    // `channel_mode`. `format.channels` is 2 for *both* `Separate` and
+    // `HardwareDiversity` -- a real trap in the SDR++ sibling
+    // implementation's own live testing: the first attempt assumed a
+    // hardware-combined result meant a 1-channel wire format, which
+    // produced a live, audible channel-deinterleaving comb of spurs
+    // instead. Only `op_mode` tells the radio which of the two it's in --
+    // `Independent` ("two unrelated channels," per its own doc, what
+    // RSR200_PLAN.md section 4 calls "Separate") or `Diversity` (the
+    // radio's own hardware combiner, step 6).
+    let dual = cfg.channel_mode != Rsr200ChannelMode::Single;
     let mut dev_cfg = Config {
         adc_clock_hz: cfg.adc_clock_hz,
         gps_discipline: cfg.gps_discipline,
         decimation_exp: cfg.decimation_exp,
         format: StreamFormat { channels: if dual { 2 } else { 1 }, bits: if cfg.bits24 { 24 } else { 16 } },
-        op_mode: OpMode::Independent,
+        op_mode: if cfg.channel_mode == Rsr200ChannelMode::HardwareDiversity { OpMode::Diversity } else { OpMode::Independent },
         tuned_hz: center_hz,
         attenuator1: cfg.attenuator1,
         attenuator2: cfg.attenuator2,
@@ -213,6 +218,31 @@ fn run(
         let _ = ready_tx.send(Err(Error::Net(format!("configuring the radio failed: {e}"))));
         return;
     }
+
+    // OM section 6.2: channel 2's diversity magnitude/phase weight (command
+    // 0xB0, selector 9) sits in the signal path even in Separate mode -- the
+    // vendor software sets it to unity when switching to Separate, and the
+    // DP documents the adjustable value as defaulting to zero on power-up.
+    // Without this, a Separate-mode session that follows a hardware-diversity
+    // one on the same radio would inherit that session's own non-unity
+    // weight, and channel 2 would read as a clean, exact zero -- real ADC2
+    // data multiplied by a zero weight looks identical to no data at all.
+    // Confirmed against real hardware in the SDR++ sibling implementation's
+    // own live testing, which is where this fix is drawn from. Sent after
+    // `apply_config` (which already told the radio which op mode to use)
+    // and before `start_stream`, matching that same implementation's order.
+    if dual {
+        let (mag, deg) = if cfg.channel_mode == Rsr200ChannelMode::HardwareDiversity {
+            (cfg.hw_div_magnitude, cfg.hw_div_phase_deg)
+        } else {
+            (1.0, 0.0)
+        };
+        if let Err(e) = device.set_hardware_diversity(&mut transport, mag, deg, now_ms(started)) {
+            let _ = ready_tx.send(Err(Error::Net(format!("setting the channel 2 weight failed: {e}"))));
+            return;
+        }
+    }
+
     if let Err(e) = device.start_stream(&mut transport, now_ms(started)) {
         let _ = ready_tx.send(Err(Error::Net(format!("starting the stream failed: {e}"))));
         return;

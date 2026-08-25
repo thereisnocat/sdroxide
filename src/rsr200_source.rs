@@ -18,11 +18,21 @@
 //! `sdrplay_source.rs`, which this file mirrors closely for exactly that
 //! reason.
 //!
-//! Single or dual channel, 16- or 24-bit — [`Rsr200Config`]'s own
-//! `channel_mode`/`bits24` fields choose the wire shape (`RSR200_PLAN.md`
-//! steps 1–5, 7). The radio's own *hardware* combiner (a third, distinct
-//! wire shape, step 6) is a real capability of the radio with no
-//! host-side wiring for it here yet.
+//! Single channel, Separate (two ADCs, combined here in software), or
+//! hardware diversity (two ADCs, combined by the radio itself before a
+//! sample reaches the host — channel A carries the result, channel B is
+//! read off the wire but unused) — [`Rsr200Config::channel_mode`] picks
+//! which, and [`Rsr200Config::bits24`] the sample width, independently
+//! (`RSR200_PLAN.md` steps 1–7 — only step 8's own lowest-priority extras,
+//! Auto-ATT/Serial mode/VHF preamp switching, remain unbuilt). Hardware
+//! diversity's own weight is solved once in software
+//! (whole-span decorrelate, while running in Separate mode — see
+//! [`Rsr200Source::log_hardware_diversity_solve`]) and applied by
+//! reopening into `Rsr200ChannelMode::HardwareDiversity`, not adjusted
+//! live — the round trip through the command channel is too slow for a
+//! control loop, confirmed in the SDR++ sibling implementation this whole
+//! flow (including a real channel-2-needs-an-explicit-unity-weight bug
+//! that implementation found and fixed) is drawn from.
 //!
 //! Verified working against a real RSR200: real spectrum on screen, tuning
 //! and the attenuators all live. LAN (2026-08-24) over both WiFi and a
@@ -44,6 +54,21 @@
 //! [`Rsr200Source::open_status`] and `RSR200_PLAN.md`'s own step 4 entry.
 //! [`Self::log_depth`] now reports active-bin counts and null depth to the
 //! log for whoever investigates next.
+//!
+//! Hardware diversity (step 6) follows the SDR++ sibling implementation's
+//! own already-tested design exactly, including a real bug that
+//! implementation found and fixed live (channel 2's weight has to be
+//! explicitly set to unity in Separate mode too, or it silently inherits a
+//! stale weight from a previous hardware-diversity session and reads as an
+//! exact, clean zero) — and, the same day this was built, was confirmed
+//! against the real RSR200: `OpMode::Diversity` and the channel-2 weight
+//! command both accepted at unity and at a real non-unity weight
+//! (magnitude 0.5, phase 45°), real samples streaming cleanly afterward
+//! either way. What that run does *not* prove is that the *combining*
+//! itself is correct — which channel actually carries the result, whether
+//! a solved weight actually nulls or combines something real — that needs
+//! two real aerials and a human listening, `RSR200_PLAN.md`'s own next
+//! open question for this step.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -52,7 +77,7 @@ use anyhow::Context;
 use sdroxide_dsp::{Diversity, DiversityAlgorithm, WidebandDecorrelator};
 use sdroxide_radio::{Complex32, IqSource, Result};
 use sdroxide_rsr200::Rsr200Handle;
-use sdroxide_types::{DiversityMode, DiversityTechnique, Rsr200Config, Rsr200Diversity};
+use sdroxide_types::{DiversityMode, DiversityTechnique, Rsr200ChannelMode, Rsr200Config, Rsr200Diversity};
 
 /// How long the radio may deliver nothing before the connection counts as
 /// dead. LAN, so more generous than a local USB device's three seconds —
@@ -115,7 +140,16 @@ pub struct Rsr200Source {
     /// The second ADC's samples, as the filter wants them.
     aux_scratch: Vec<f32>,
     aux_buf: Vec<Complex32>,
+    /// Wire is 2-channel — true for both `Rsr200ChannelMode::Separate` and
+    /// `Rsr200ChannelMode::HardwareDiversity`.
     dual: bool,
+    /// `Rsr200ChannelMode::HardwareDiversity`: the radio has already
+    /// combined the channels by the time a sample arrives (channel A
+    /// carries the result), so [`Self::diversity`]/[`Self::wideband`] stay
+    /// `None` and `read()`'s existing "no combiner running" path — already
+    /// correct for a single ADC — is exactly the right behaviour here too,
+    /// with no changes of its own needed.
+    hw_diversity: bool,
     /// Whether the radio was told to discipline its ADC clock from GPS —
     /// [`sdroxide_rsr200::protocol::freq_correction_hz`]'s resolution
     /// depends on it (0.5 Hz/LSB disciplining, 0.1 Hz/LSB only measuring).
@@ -132,9 +166,14 @@ impl Rsr200Source {
             .with_context(|| format!("opening the RSR200 at {}:{}", cfg.host, cfg.port))?;
         let label = handle.label.clone();
         let dual = handle.dual();
+        let hw_diversity = cfg.channel_mode == Rsr200ChannelMode::HardwareDiversity;
         tracing::info!(
             "RSR200 source ready: {label}, center {center_hz:.0} Hz{}",
-            if dual { ", Separate mode" } else { "" }
+            match cfg.channel_mode {
+                Rsr200ChannelMode::Single => "",
+                Rsr200ChannelMode::Separate => ", Separate mode",
+                Rsr200ChannelMode::HardwareDiversity => ", hardware diversity",
+            }
         );
         let mut src = Rsr200Source {
             center: center_hz,
@@ -151,12 +190,13 @@ impl Rsr200Source {
             aux_scratch: Vec::new(),
             aux_buf: Vec::new(),
             dual,
+            hw_diversity,
             gps_discipline: cfg.gps_discipline,
             last_depth_log: Instant::now(),
             last_status_log: Instant::now(),
             handle,
         };
-        if dual {
+        if dual && !hw_diversity {
             src.rebuild_combiner();
             match cfg.diversity.technique {
                 DiversityTechnique::Adaptive => tracing::info!(
@@ -174,6 +214,12 @@ impl Rsr200Source {
                     cfg.diversity.gate_db,
                 ),
             }
+        } else if hw_diversity {
+            tracing::info!(
+                "hardware diversity active: magnitude {:.3}, phase {:+.1} deg",
+                cfg.hw_div_magnitude,
+                cfg.hw_div_phase_deg
+            );
         }
         Ok(src)
     }
@@ -279,6 +325,59 @@ impl Rsr200Source {
         } else {
             tracing::info!("RSR200: {}°C, {correction}", s.temperature_c);
         }
+    }
+
+    /// Solve the current whole-span decorrelation weight for the radio's
+    /// own hardware combiner and log it — `RSR200_PLAN.md` §4's "solve,
+    /// then apply" flow. Only meaningful in `Rsr200ChannelMode::Separate`
+    /// with `DiversityTechnique::Decorrelate` selected: that is the one
+    /// combination whose running [`Diversity`] already has a fresh, whole-
+    /// span-scalar `decorrelated_weight()` on every block — `Adaptive`'s
+    /// multi-tap filter has no single complex weight to read out at all,
+    /// and `WidebandDecorrelate`'s one weight per bin is exactly what the
+    /// radio's own combiner (one weight, full stop) cannot use (see
+    /// `RSR200_PLAN.md` §4's own note on why the wideband technique does
+    /// not apply to hardware diversity).
+    ///
+    /// Logged rather than written back into a settings field: there is no
+    /// wire from a running `IqSource` back into the settings dialog for
+    /// any backend yet (`RSR200_PLAN.md` step 5 hit the same gap for the
+    /// GPS/status readout) — copy the numbers from the log into the
+    /// Hardware diversity magnitude/phase fields, then switch Channels to
+    /// apply them.
+    fn log_hardware_diversity_solve(&self) {
+        if self.hw_diversity || self.div_cfg.technique != DiversityTechnique::Decorrelate {
+            tracing::warn!(
+                "RSR200: hardware-diversity solve needs Separate mode with whole-span \
+                 decorrelate selected — nothing to solve from the current settings."
+            );
+            return;
+        }
+        let Some((k0, k1)) = self.diversity.as_ref().and_then(Diversity::decorrelated_weight) else {
+            tracing::warn!("RSR200: nothing solved yet — give the filter a block or two, then try again.");
+            return;
+        };
+        let to64 = |c: Complex32| sdroxide_rsr200::protocol::Complex64::new(f64::from(c.re), f64::from(c.im));
+        let h = sdroxide_rsr200::protocol::hardware_weight_for(to64(k0), to64(k1));
+        if !h.representable {
+            let extra = if h.suggest_swap {
+                " (channel A contributes essentially nothing — this ratio wants the aerials \
+                 the other way round, but sdroxide has no channel-swap control yet)"
+            } else {
+                ""
+            };
+            tracing::warn!(
+                "RSR200: hardware-diversity solve is not representable in the radio's \
+                 0.001..8x range{extra}."
+            );
+            return;
+        }
+        tracing::info!(
+            "RSR200: hardware-diversity solve: magnitude {:.3}, phase {:+.1} deg — copy into the \
+             Hardware diversity fields and switch Channels to apply.",
+            h.magnitude,
+            h.phase_degrees
+        );
     }
 }
 
@@ -470,7 +569,7 @@ impl IqSource for Rsr200Source {
                 };
                 // A pure software swap -- discards whatever the previous
                 // combiner had converged or solved, but needs no reopen.
-                if self.dual {
+                if self.dual && !self.hw_diversity {
                     self.rebuild_combiner();
                 }
             }
@@ -480,6 +579,7 @@ impl IqSource for Rsr200Source {
                     wb.set_gate_db(self.div_cfg.gate_db);
                 }
             }
+            Rsr200Config::DIV_HW_SOLVE_ELEMENT if db >= 0.5 => self.log_hardware_diversity_solve(),
             _ => {}
         }
         Ok(())
@@ -518,7 +618,16 @@ impl IqSource for Rsr200Source {
              loss only at ÷2 (the highest rate) — its own, narrower throughput ceiling. \
              Either way, expect the link — not this driver — to be what limits the top end.",
         );
-        if self.dual {
+        if self.hw_diversity {
+            msg.push_str(
+                " Hardware diversity (the radio's own combiner) is confirmed against real \
+                 hardware: the mode switch and the channel-2 weight command both work, at \
+                 unity and at a real non-unity weight, with clean streaming afterward. Not \
+                 yet confirmed: that the combining itself is correct — which channel \
+                 carries the result, whether a solved weight actually nulls or combines \
+                 something real — that needs two real aerials and a human listening.",
+            );
+        } else if self.dual {
             match self.div_cfg.technique {
                 DiversityTechnique::WidebandDecorrelate => msg.push_str(
                     " Separate mode's decorrelate-per-bin technique does not work on this \

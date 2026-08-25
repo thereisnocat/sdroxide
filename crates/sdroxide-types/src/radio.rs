@@ -4280,6 +4280,17 @@ pub struct Rsr200Config {
     /// block that 16-bit does) — this field is the only piece that was
     /// missing to actually choose one.
     pub bits24: bool,
+    /// The weight the radio's own hardware combiner applies to channel 2
+    /// before summing it into channel 1, in [`Rsr200ChannelMode::HardwareDiversity`]
+    /// — 0.001 to just under 8 (16 bits at 1/8192 per LSB, the radio's own
+    /// expressible range; see `sdroxide_rsr200::protocol::HardwareWeight`).
+    /// 1.0 is unity — combine channel 2 unweighted. Reopens the device: the
+    /// weight is sent once at stream start, not adjustable live (the round
+    /// trip through the command channel is too slow for a control loop,
+    /// confirmed in the SDR++ sibling implementation).
+    pub hw_div_magnitude: f64,
+    /// The same weight's phase, in degrees.
+    pub hw_div_phase_deg: f64,
 }
 
 impl Default for Rsr200Config {
@@ -4297,17 +4308,17 @@ impl Default for Rsr200Config {
             channel_mode: Rsr200ChannelMode::Single,
             diversity: Rsr200Diversity::default(),
             bits24: false,
+            hw_div_magnitude: 1.0,
+            hw_div_phase_deg: 0.0,
         }
     }
 }
 
 /// The RSR200's own wire shape for how many ADCs are in use and what, if
 /// anything, combines them — `RSR200_PLAN.md` §4's "three distinct operating
-/// shapes." Only the first two exist here; the third (the radio's own
-/// *hardware* combiner, `OpMode::Diversity` on the wire, not to be confused
-/// with this software filter of the same name) is `RSR200_PLAN.md` step 6,
-/// not yet built — appending it later is exactly what this enum is shaped
-/// to do without disturbing either variant already here.
+/// shapes," all three now built (the third, the radio's own *hardware*
+/// combiner, `OpMode::Diversity` on the wire — not to be confused with the
+/// software filter of the same name — is `RSR200_PLAN.md` step 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Rsr200ChannelMode {
     /// One ADC. Plain `IqSource` passthrough — nothing dual-channel-shaped
@@ -4323,15 +4334,31 @@ pub enum Rsr200ChannelMode {
     /// and one sample clock" describes the RSR200's own resync event (DP
     /// 4.6) at least as precisely as it describes the RSPduo's.
     Separate,
+    /// Both ADCs on the wire in the *same* 2-channel format as `Separate`
+    /// (a real trap in the SDR++ sibling implementation's own live testing:
+    /// the first attempt assumed a hardware-combined result meant a
+    /// 1-channel wire format, which produced a live, audible
+    /// channel-deinterleaving comb of spurs instead) — but the radio itself
+    /// sums the two ADCs, weighted by [`Rsr200Config::hw_div_magnitude`]/
+    /// [`Rsr200Config::hw_div_phase_deg`], before a sample reaches the
+    /// host. Channel A carries the combined result (DP/OM's own "channel 2
+    /// is added to channel 1," confirmed live in that same sibling work);
+    /// channel B is raw ADC2, read off the wire but not used for anything.
+    /// Not `sdroxide_dsp::Diversity` — the radio has already done the
+    /// combining by the time a sample arrives, so there is nothing left
+    /// for a software filter to do (`RSR200_PLAN.md` §3).
+    HardwareDiversity,
 }
 
 impl Rsr200ChannelMode {
-    pub const ALL: [Rsr200ChannelMode; 2] = [Rsr200ChannelMode::Single, Rsr200ChannelMode::Separate];
+    pub const ALL: [Rsr200ChannelMode; 3] =
+        [Rsr200ChannelMode::Single, Rsr200ChannelMode::Separate, Rsr200ChannelMode::HardwareDiversity];
 
     pub fn label(self) -> &'static str {
         match self {
             Rsr200ChannelMode::Single => "Single channel",
             Rsr200ChannelMode::Separate => "Separate (software diversity)",
+            Rsr200ChannelMode::HardwareDiversity => "Hardware diversity (radio combines)",
         }
     }
 }
@@ -4444,6 +4471,16 @@ impl Rsr200Config {
     pub const DIV_RESET_ELEMENT: &'static str = "DIVRESET";
     pub const DIV_TECHNIQUE_ELEMENT: &'static str = "DIVTECH";
     pub const DIV_GATE_ELEMENT: &'static str = "DIVGATE";
+    /// Momentary: any value at or above 0.5 solves the current
+    /// [`Rsr200ChannelMode::Separate`] + [`DiversityTechnique::Decorrelate`]
+    /// weight for the radio's own hardware combiner and logs it (magnitude,
+    /// phase) — there is no wire from a running `IqSource` back into the
+    /// settings dialog for any backend yet, so the log is the honest way to
+    /// read it back, matching `RSR200_PLAN.md` step 5's own "the log is the
+    /// answer for now" precedent. Copy the logged values into
+    /// [`Self::hw_div_magnitude`]/[`Self::hw_div_phase_deg`] and switch
+    /// [`Self::channel_mode`] to apply them.
+    pub const DIV_HW_SOLVE_ELEMENT: &'static str = "DIVHWSOLVE";
 
     /// `decimation_exp` → the divisor it selects (`2^(exp+1)`), matching
     /// `sdroxide_rsr200::protocol::decimation_rate` without this crate

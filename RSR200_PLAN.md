@@ -499,8 +499,67 @@ separately and shipped each as it landed):
    genuinely been observed against real hardware, not just reasoned about from the protocol
    tests. `gps_discipline: false`'s own 0.1 Hz/LSB "measuring only" resolution was not
    separately exercised.
-6. **Hardware diversity (§3/§4's third mode)** — needs Separate mode's own solve-from-software
-   step to be meaningful, so it belongs after step 4, not before it.
+6. **Done. Hardware diversity (§3/§4's third mode)** (branch `rsr200`) — done last, per the
+   plan's own original sequencing note that it needs Separate mode's own solve-from-software
+   step to be meaningful.
+
+   Genuinely less new protocol work than the section title suggests: `Device::set_hardware_diversity`/
+   `set_hardware_diversity_from` and `protocol::hardware_weight_for`/`HardwareWeight` were already
+   built and tested at step 1 — "the hardware-diversity weight conversion (§4) including its
+   quantisation-through-the-wire-format round trip" was one of that step's original 19 protocol
+   tests. What step 6 actually added was wiring a `Backend::Rsr200` channel mode up to that
+   already-tested machinery. `Rsr200ChannelMode` gained a third variant, `HardwareDiversity` —
+   `format.channels` stays 2, the *same* wire shape `Separate` uses (a real trap in the SDR++
+   sibling implementation's own live testing: the first attempt there assumed a hardware-combined
+   result meant a 1-channel wire format, which produced a live, audible channel-deinterleaving
+   comb of spurs instead), and only `op_mode` changes, to `OpMode::Diversity`. `Rsr200Config`
+   gained `hw_div_magnitude`/`hw_div_phase_deg` (`f64`, reopen-triggering — sent once at stream
+   start, not adjustable live, since the round trip through the command channel is too slow for a
+   control loop, confirmed in that same sibling implementation). `stream.rs` sends the channel-2
+   weight via `Device::set_hardware_diversity` right after `apply_config` and before
+   `start_stream`, matching that implementation's own order.
+
+   **A real, proactive fix carried forward from the SDR++ sibling implementation's own live
+   testing**, not something this session's own testing found: OM §6.2 documents that channel 2's
+   magnitude/phase weight sits in the signal path even in Separate mode, and the vendor software
+   sets it to unity when switching there — without that, a Separate-mode session following a
+   hardware-diversity one on the same radio would inherit that session's own non-unity weight, and
+   channel 2 would read as a clean, exact zero (real ADC2 data multiplied by a zero weight looks
+   identical to no data at all). `stream.rs` now sends unity (1.0, 0°) whenever `channel_mode` is
+   `Separate` too, for exactly this reason — fixed before it could ever bite here, not after.
+
+   `src/rsr200_source.rs` gained `hw_diversity: bool` and `log_hardware_diversity_solve()` — the
+   plan's own "solve, then apply" flow, adapted to what `sdroxide_dsp::Diversity` actually offers:
+   unlike the SDR++ reference's `sigpath::phasing` (a global subsystem that can report a scalar
+   weight even for its own adaptive/manual modes), `Diversity`'s `decorrelated_weight()` only ever
+   has an answer in `DiversityTechnique::Decorrelate` — `Adaptive`'s multi-tap NLMS filter has no
+   single complex weight to read out at all, and `WidebandDecorrelate`'s one weight *per bin* is
+   exactly what a hardware combiner with one weight, full stop, cannot use (§4's own note on why
+   that technique doesn't apply to hardware diversity). So "solve" is simpler here than in the
+   reference: gated on Separate mode with Decorrelate selected, it reads the *already continuously
+   solving* live filter's own `decorrelated_weight()` directly — no separate capture step needed.
+   Logged rather than written back into a settings field: there is no wire from a running
+   `IqSource` back into the settings dialog for any backend yet (step 5 hit the same gap for its
+   own status readout) — copy the logged magnitude/phase into the new Hardware weight fields, then
+   switch Channels to apply them. `settings_rsr200_tab` grew a third Channels entry, the Hardware
+   weight fields (shown only in that mode), and a "Solve for hardware diversity" button (shown
+   only in Separate mode with Decorrelate selected). `PROTO_VERSION` 94 → 95.
+
+   **Verified against the real, physically-attached RSR200 the same day** (2026-08-24): a new
+   standalone example, `crates/sdroxide-rsr200/examples/usb_hwdiv_probe.rs`, opened through the
+   real `Rsr200Handle`/`stream.rs` path with `channel_mode: HardwareDiversity` — `OpMode::Diversity`
+   and the channel-2 weight command were both accepted, first at unity (1.0, 0°) and then at a
+   real non-unity weight (magnitude 0.5, phase 45°), with clean streaming (31M+ pairs per 5-second
+   run) and readable status either way. The proactive Separate-mode unity-weight fix was exercised
+   too, via the same real path (`usb_status_probe.rs` reconfigured to `Separate`): opened and
+   streamed cleanly (62M+ pairs), with a valid GPS correction reading throughout, confirming the
+   new `set_hardware_diversity` call in that mode does not itself break anything. **What these
+   runs do not prove**: that the *combining* itself is correct — which channel actually carries
+   the result (channel A, per DP/OM's own wording and the SDR++ reference's own live-hardware
+   confirmation, not independently re-confirmed here), and whether a solved weight actually nulls
+   or combines something real. That needs two real aerials and a human listening — the same
+   "confirmed on air" milestone Separate mode already reached for its own software path.
+   `open_status()` and the settings tab both say so plainly until it has been.
 7. **Done on Linux/macOS, Windows still open. USB transport** (branch `rsr200`) — done out of
    order, ahead of steps 4–6, at Ralph's request. `sdroxide-rsr200::ffi` (hand-written D3XX
    bindings, loaded with `dlopen` at runtime via `libloading` — same pattern as

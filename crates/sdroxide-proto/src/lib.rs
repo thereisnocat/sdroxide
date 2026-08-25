@@ -673,7 +673,17 @@ use sdroxide_types::{
 /// (`sdroxide_rsr200::protocol`); this only exposes the choice.
 /// `Rsr200Config` gained `bits24: bool`, appended at the tail for the same
 /// positional reason as every field above it.
-pub const PROTO_VERSION: u16 = 94;
+///
+/// **95** — the RSR200 (v91–94) gains hardware diversity: the radio's own
+/// combiner, `OpMode::Diversity` on the wire, as opposed to the software
+/// filter v93 already added (`RSR200_PLAN.md` step 6 — the last of the
+/// plan's eight steps to be built). [`sdroxide_types::Rsr200ChannelMode`]
+/// gained `HardwareDiversity`, appended last for the same reason every enum
+/// append before it was — a v94 peer handed this variant has none to decode
+/// it into. `Rsr200Config` gained `hw_div_magnitude`/`hw_div_phase_deg`
+/// (`f64`), appended at the tail for the same positional reason as every
+/// field above them.
+pub const PROTO_VERSION: u16 = 95;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1660,6 +1670,8 @@ mod tests {
                     gate_db: 35.0,
                 },
                 bits24: true,
+                hw_div_magnitude: 2.5,
+                hw_div_phase_deg: 45.0,
             },
             ..RadioConfig::default()
         };

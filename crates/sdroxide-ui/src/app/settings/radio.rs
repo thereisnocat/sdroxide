@@ -2155,6 +2155,8 @@ pub(in crate::app) fn settings_rsr200_tab(
         cfg.rsr200.usb_serial.clone(),
         cfg.rsr200.channel_mode,
         cfg.rsr200.bits24,
+        cfg.rsr200.hw_div_magnitude,
+        cfg.rsr200.hw_div_phase_deg,
     );
 
     egui::Grid::new("rsr200-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -2266,8 +2268,9 @@ pub(in crate::app) fn settings_rsr200_tab(
             "Single: one ADC, plain receiver. Separate: both ADCs, unrelated on the \
              wire — the radio does no combining of its own — and combined here in \
              software, the same filter the SDRplay RSPduo's own second-tuner mode \
-             uses. Not the radio's own hardware combiner, which this backend does \
-             not offer yet.",
+             uses. Hardware diversity: both ADCs still cross the wire, but the radio \
+             itself sums them, weighted by the magnitude/phase set below — nothing \
+             left for software to combine.",
         );
         ComboBox::from_id_salt("rsr200_channel_mode")
             .selected_text(cfg.rsr200.channel_mode.label())
@@ -2295,6 +2298,32 @@ pub(in crate::app) fn settings_rsr200_tab(
                 }
             });
         ui.end_row();
+
+        if cfg.rsr200.channel_mode == Rsr200ChannelMode::HardwareDiversity {
+            ui.label("Hardware weight").on_hover_text(
+                "The magnitude/phase the radio applies to channel 2 before summing it into \
+                 channel 1 — 0.001 to just under 8x, phase in degrees. Solve it first: run \
+                 in Separate mode with whole-span decorrelate selected, press \"Solve for \
+                 hardware diversity\" there, and copy the logged numbers here. Sent once at \
+                 Apply — not adjustable while running, the round trip through the command \
+                 channel is too slow for a live control.",
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    DragValue::new(&mut cfg.rsr200.hw_div_magnitude)
+                        .range(0.001..=7.999)
+                        .speed(0.01)
+                        .prefix("mag "),
+                );
+                ui.add(
+                    DragValue::new(&mut cfg.rsr200.hw_div_phase_deg)
+                        .range(-180.0..=180.0)
+                        .speed(0.5)
+                        .suffix(" deg"),
+                );
+            });
+            ui.end_row();
+        }
 
         ui.label("Attenuator 1");
         {
@@ -2457,6 +2486,23 @@ pub(in crate::app) fn settings_rsr200_tab(
                 }
             });
             ui.end_row();
+
+            if div.technique == DiversityTechnique::Decorrelate {
+                ui.label("Hardware diversity");
+                if ui
+                    .button("Solve for hardware diversity")
+                    .on_hover_text(
+                        "Reads the current whole-span decorrelate weight and prints its \
+                         magnitude/phase to the log — there is no live readout in this \
+                         dialog yet. Copy the numbers into the Hardware weight fields \
+                         above and switch Channels to Hardware diversity to apply them.",
+                    )
+                    .clicked()
+                {
+                    push_gain(cmds, Rsr200Config::DIV_HW_SOLVE_ELEMENT, 1.0);
+                }
+                ui.end_row();
+            }
         });
         ui.label(
             RichText::new(
@@ -2500,6 +2546,8 @@ pub(in crate::app) fn settings_rsr200_tab(
             cfg.rsr200.usb_serial.clone(),
             cfg.rsr200.channel_mode,
             cfg.rsr200.bits24,
+            cfg.rsr200.hw_div_magnitude,
+            cfg.rsr200.hw_div_phase_deg,
         )
     {
         *apply = true;
@@ -2510,11 +2558,15 @@ pub(in crate::app) fn settings_rsr200_tab(
         RichText::new(
             "Reuter RSR200 support is new: verified against real hardware over both LAN and \
              USB (Linux/macOS — Windows needs its own driver research first). Connection, \
-             address/port or serial, ADC clock, decimation, GPS discipline, channels and \
-             sample width take effect on Apply; the attenuators and (in Separate mode) the \
-             diversity controls apply as you move them. Temperature and the GPS-corrected \
+             address/port or serial, ADC clock, decimation, GPS discipline, channels, \
+             sample width and the hardware diversity weight take effect on Apply; the \
+             attenuators and (in Separate mode) the diversity controls apply as you move \
+             them. Hardware diversity's own mode switch and weight command are confirmed \
+             against real hardware; whether the *combining* itself is correct still needs \
+             two real aerials and a human listening. Temperature and the GPS-corrected \
              clock offset aren't shown here yet — no live readout exists in this dialog for \
-             any radio — but they now reach the log every 30 seconds while streaming.",
+             any radio — but they, and a solved hardware-diversity weight, all reach the \
+             log instead.",
         )
         .weak(),
     );

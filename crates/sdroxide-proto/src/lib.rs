@@ -666,7 +666,14 @@ use sdroxide_types::{
 /// [`sdroxide_types::SdrPlayDiversity`]'s own filter settings minus its two
 /// SDRplay-specific second-tuner gain fields), both appended at the tail for
 /// the same positional reason as every field above them.
-pub const PROTO_VERSION: u16 = 93;
+///
+/// **94** — the RSR200 (v91–93) gains a 24-bit sample width alongside its
+/// original 16-bit one (`RSR200_PLAN.md` step 5). The wire-geometry and
+/// unpacking math for both widths was already built and tested in step 1
+/// (`sdroxide_rsr200::protocol`); this only exposes the choice.
+/// `Rsr200Config` gained `bits24: bool`, appended at the tail for the same
+/// positional reason as every field above it.
+pub const PROTO_VERSION: u16 = 94;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1652,6 +1659,7 @@ mod tests {
                     technique: sdroxide_types::DiversityTechnique::Decorrelate,
                     gate_db: 35.0,
                 },
+                bits24: true,
             },
             ..RadioConfig::default()
         };

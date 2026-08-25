@@ -116,7 +116,11 @@ pub(crate) fn spawn(cfg: &Rsr200Config, center_hz: f64) -> Result<Rsr200Handle> 
 
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded::<Ctrl>();
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<f64>>(1);
-    let shared = Arc::new(Shared { alive: AtomicBool::new(true), last_rx_ms: AtomicU64::new(0) });
+    let shared = Arc::new(Shared {
+        alive: AtomicBool::new(true),
+        last_rx_ms: AtomicU64::new(0),
+        status: std::sync::Mutex::new(crate::protocol::Status::default()),
+    });
     let dual = cfg.channel_mode == Rsr200ChannelMode::Separate;
     let (rx_prod, rx_cons) = ring_for(cfg.sample_rate_hz(), if dual { QUAD } else { 2 });
 
@@ -182,19 +186,19 @@ fn run(
         },
     };
 
-    // 16 bit -- the only sample width either transport produces yet. One
-    // channel or two depending on `channel_mode`; `OpMode::Independent`
-    // either way -- it is the wire shape itself ("two unrelated channels,"
-    // per its own doc) that RSR200_PLAN.md section 4 calls "Separate," not
-    // a different op mode. The radio's own hardware combiner is a distinct
-    // op mode (`OpMode::Diversity`, step 6, not yet built) that this
-    // backend never selects.
+    // 16 or 24 bit per `bits24`, one channel or two depending on
+    // `channel_mode`; `OpMode::Independent` either way -- it is the wire
+    // shape itself ("two unrelated channels," per its own doc) that
+    // RSR200_PLAN.md section 4 calls "Separate," not a different op mode.
+    // The radio's own hardware combiner is a distinct op mode
+    // (`OpMode::Diversity`, step 6, not yet built) that this backend never
+    // selects.
     let dual = cfg.channel_mode == Rsr200ChannelMode::Separate;
     let mut dev_cfg = Config {
         adc_clock_hz: cfg.adc_clock_hz,
         gps_discipline: cfg.gps_discipline,
         decimation_exp: cfg.decimation_exp,
-        format: StreamFormat { channels: if dual { 2 } else { 1 }, bits: 16 },
+        format: StreamFormat { channels: if dual { 2 } else { 1 }, bits: if cfg.bits24 { 24 } else { 16 } },
         op_mode: OpMode::Independent,
         tuned_hz: center_hz,
         attenuator1: cfg.attenuator1,
@@ -294,6 +298,9 @@ fn run(
                         tracing::debug!("RSR200: RX ring full, {} sample(s) dropped", sb.frames);
                     }
                     shared.last_rx_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    if let Ok(mut s) = shared.status.lock() {
+                        *s = sb.status;
+                    }
                 }
             }
             None => {

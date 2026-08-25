@@ -15,8 +15,8 @@
 //! call, so they cannot come apart on the way into the ring the way two
 //! independently-arriving tuner callbacks could.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use sdroxide_types::Rsr200Config;
 
 use crate::error::Result;
+use crate::protocol::Status;
 
 /// A control message for the stream thread.
 ///
@@ -74,6 +75,13 @@ pub(crate) struct Shared {
     pub alive: AtomicBool,
     /// Milliseconds since the thread started, at the last sample delivered.
     pub last_rx_ms: AtomicU64,
+    /// The status header from the most recently delivered block —
+    /// temperature, GPS-corrected clock offset, per-channel overload —
+    /// `RSR200_PLAN.md` step 5's "GPS discipline/correction readout". A
+    /// `Mutex` rather than atomics: read once every few seconds by the
+    /// source glue, never on a hot path, so there is nothing to gain from
+    /// the extra ceremony atomics would need for a multi-field struct.
+    pub status: Mutex<Status>,
 }
 
 /// Push interleaved I/Q into the RX ring, keeping I and Q paired.
@@ -156,6 +164,17 @@ impl Rsr200Handle {
         let since_open = self.opened_at.elapsed();
         let last = Duration::from_millis(self.shared.last_rx_ms.load(Ordering::Relaxed));
         since_open.saturating_sub(last)
+    }
+
+    /// The status header from the most recently delivered block —
+    /// temperature, GPS-corrected clock offset, per-channel overload.
+    /// Default (all zero/false) before the first block has arrived.
+    pub fn status(&self) -> Status {
+        // A poisoned lock means the stream thread panicked while holding
+        // it -- the stale reading underneath is still better than a crash
+        // here, since `needs_reopen` (driven by `is_alive`/`silent_for`,
+        // not this) is what actually catches a dead thread.
+        *self.shared.status.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Both ADCs are running and the ring holds quadruples — see

@@ -2154,6 +2154,7 @@ pub(in crate::app) fn settings_rsr200_tab(
         cfg.rsr200.transport,
         cfg.rsr200.usb_serial.clone(),
         cfg.rsr200.channel_mode,
+        cfg.rsr200.bits24,
     );
 
     egui::Grid::new("rsr200-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -2274,6 +2275,22 @@ pub(in crate::app) fn settings_rsr200_tab(
                 for m in Rsr200ChannelMode::ALL {
                     if ui.selectable_label(cfg.rsr200.channel_mode == m, m.label()).clicked() {
                         cfg.rsr200.channel_mode = m;
+                    }
+                }
+            });
+        ui.end_row();
+
+        ui.label("Sample width").on_hover_text(
+            "24-bit gives more headroom before an attenuator is needed, at twice the bytes \
+             per sample over the wire — worth weighing against the same link-throughput \
+             ceilings the decimation control above already found on this connection.",
+        );
+        ComboBox::from_id_salt("rsr200_bits")
+            .selected_text(if cfg.rsr200.bits24 { "24-bit" } else { "16-bit" })
+            .show_styled(ui, |ui| {
+                for (label, v) in [("16-bit", false), ("24-bit", true)] {
+                    if ui.selectable_label(cfg.rsr200.bits24 == v, label).clicked() {
+                        cfg.rsr200.bits24 = v;
                     }
                 }
             });
@@ -2482,6 +2499,7 @@ pub(in crate::app) fn settings_rsr200_tab(
             cfg.rsr200.transport,
             cfg.rsr200.usb_serial.clone(),
             cfg.rsr200.channel_mode,
+            cfg.rsr200.bits24,
         )
     {
         *apply = true;
@@ -2491,10 +2509,12 @@ pub(in crate::app) fn settings_rsr200_tab(
     ui.label(
         RichText::new(
             "Reuter RSR200 support is new: verified against real hardware over both LAN and \
-             USB (Linux/macOS — Windows needs its own driver research first). 16-bit only — \
-             24-bit is not wired up yet. Connection, address/port or serial, ADC clock, \
-             decimation, GPS discipline and channels take effect on Apply; the attenuators \
-             and (in Separate mode) the diversity controls apply as you move them.",
+             USB (Linux/macOS — Windows needs its own driver research first). Connection, \
+             address/port or serial, ADC clock, decimation, GPS discipline, channels and \
+             sample width take effect on Apply; the attenuators and (in Separate mode) the \
+             diversity controls apply as you move them. Temperature and the GPS-corrected \
+             clock offset aren't shown here yet — no live readout exists in this dialog for \
+             any radio — but they now reach the log every 30 seconds while streaming.",
         )
         .weak(),
     );

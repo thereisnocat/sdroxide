@@ -441,8 +441,64 @@ separately and shipped each as it landed):
    `open_status()` and the settings tab both report per-technique status now: Decorrelate
    confirmed good, WidebandDecorrelate flagged in red as confirmed broken, Adaptive still
    unjudged on real antennas.
-5. **24-bit, decimation range, GPS discipline/correction readout** — each is a small, mostly
-   independent addition to `device.rs`/`protocol.rs` once the above is solid.
+5. **Done. 24-bit, decimation range, GPS discipline/correction readout** (branch `rsr200`) —
+   turned out to be smaller than the three items in its own title suggested, once actually
+   checked against what steps 1–4 had already done.
+
+   **Decimation range needed nothing.** `port_mode_byte`'s own clamp (`0..=5`) and
+   `Rsr200Config::DECIMATION_EXPS` already cover the full documented range — confirmed against
+   the C++ reference's own `portModeByte`, which clamps to the identical `0..=5`. Nothing to
+   add; the plan's own title bullet was already satisfied by step 3's work, not a gap.
+
+   **GPS discipline needed nothing either** — `gps_discipline` has been a real, wired-up
+   `Rsr200Config` field and settings-tab checkbox since step 3, sent on every `SET_ADC_CLOCK`
+   command. What was actually missing was the second half of the bullet: the *correction
+   readout*.
+
+   **24-bit** turned out to be a one-field addition, not new protocol work: `unpack`,
+   `lan_layout` and `usb_samples_per_packet` in `sdroxide_rsr200::protocol` already handle both
+   widths correctly — including the DP's own 24-bit/dual-channel block-length trap (§2) — since
+   step 1, tested, unused. `Rsr200Config` gained `bits24: bool`; `stream.rs` sets
+   `dev_cfg.format.bits` from it. `settings_rsr200_tab` grew a Sample width selector next to
+   Channels, both reopen-triggering fields. `PROTO_VERSION` 93 → 94.
+
+   **GPS/status readout** is the one piece that needed real new plumbing:
+   `sdroxide_rsr200::protocol::Status`/`parse_status`/`freq_correction_hz` were already built
+   and tested in step 1, but nothing between the wire and the app ever read them — `SampleBlock.status`
+   reached `stream.rs`'s pump loop and was discarded every single time. Fixed: `handle::Shared`
+   gained a `Mutex<Status>`, updated on every block; `Rsr200Handle::status()` reads it back.
+   `Rsr200Source` gained `log_status()` (mirroring `log_depth()`'s own periodic-logging
+   pattern, 30s interval) reporting temperature and GPS-corrected clock offset — correctly
+   suppressing the temperature figure while Auto-ATT is engaged, since the DP's own `0x80`
+   sentinel in that byte means "Auto-ATT active," not a real reading, a trap `parse_status`
+   already avoided but `log_status` still had to know about. `open_status()` gained standing
+   overload warnings for both ADCs, the same pattern `sdrplay_source.rs` already uses for its
+   own front end. No live numeric readout in the settings dialog itself — that would need a
+   wire from the running `IqSource` back into the settings UI that does not exist yet for *any*
+   backend, a materially bigger change than "a small, mostly independent addition" calls for;
+   the log is the honest answer for now, and the settings tab's own closing hint says so.
+
+   `cargo build -p sdroxide`: clean. Tests across the same five crates as steps 3/4: all green.
+   `cargo clippy --all-targets`: only the same pre-existing `for p in 0..pairs` pattern every
+   sibling backend's own `read()` already has.
+
+   **Verified against the real, physically-attached RSR200 the same day**, both pieces: a new
+   standalone example, `crates/sdroxide-rsr200/examples/usb_status_probe.rs` — unlike
+   `usb_live_probe.rs`/`usb_dual_probe.rs`, which drive `Device` directly, this one goes through
+   `Rsr200Handle::open` and `stream.rs`, the actual path the app uses — opened with `bits24:
+   true` and streamed 31M+ complex pairs over a 5-second run at the same 6.25 Msps the 16-bit
+   runs got (correct: bit depth changes sample size, not sample rate), confirming the geometry
+   math handles 24-bit end to end, not just in isolation. `handle.status()` read real, live
+   values throughout: temperature settling around 70–71°C, no overload on either channel. GPS
+   correction validity turned out to differ between two back-to-back runs of the identical
+   config — the first read `freq_correction_valid: false` (raw `-8192`, the documented "no
+   valid measurement" sentinel) for its whole 5 seconds; the second read a genuine valid
+   correction throughout (`-75.0 Hz`, `gps_discipline: true`'s 0.5 Hz/LSB resolution). Not
+   root-caused — GPS acquisition settling a few seconds after Start Stream is the obvious guess,
+   not confirmed — but it does mean both of `log_status`'s branches (valid and invalid) have now
+   genuinely been observed against real hardware, not just reasoned about from the protocol
+   tests. `gps_discipline: false`'s own 0.1 Hz/LSB "measuring only" resolution was not
+   separately exercised.
 6. **Hardware diversity (§3/§4's third mode)** — needs Separate mode's own solve-from-software
    step to be meaningful, so it belongs after step 4, not before it.
 7. **Done on Linux/macOS, Windows still open. USB transport** (branch `rsr200`) — done out of

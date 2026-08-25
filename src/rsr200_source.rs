@@ -18,10 +18,11 @@
 //! `sdrplay_source.rs`, which this file mirrors closely for exactly that
 //! reason.
 //!
-//! Single channel, 16-bit — the only wire shapes `sdroxide-rsr200` streams
-//! yet (`RSR200_PLAN.md` steps 1–4, 7). 24-bit and the radio's own
-//! *hardware* combiner (a third, distinct wire shape, step 6) are real
-//! capabilities of the radio with no host-side wiring for them here yet.
+//! Single or dual channel, 16- or 24-bit — [`Rsr200Config`]'s own
+//! `channel_mode`/`bits24` fields choose the wire shape (`RSR200_PLAN.md`
+//! steps 1–5, 7). The radio's own *hardware* combiner (a third, distinct
+//! wire shape, step 6) is a real capability of the radio with no
+//! host-side wiring for it here yet.
 //!
 //! Verified working against a real RSR200: real spectrum on screen, tuning
 //! and the attenuators all live. LAN (2026-08-24) over both WiFi and a
@@ -73,6 +74,12 @@ const WB_AVG_TC_SECS: f32 = 0.5;
 /// matching `sdrplay_source.rs`'s own interval and reasoning.
 const DEPTH_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How often the status header (temperature, GPS-corrected clock offset)
+/// reaches the log — `RSR200_PLAN.md` step 5. Coarser than
+/// [`DEPTH_LOG_INTERVAL`]: this is background telemetry, not something an
+/// operator is actively watching converge.
+const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
 pub struct Rsr200Source {
     handle: Rsr200Handle,
     center: f64,
@@ -109,7 +116,14 @@ pub struct Rsr200Source {
     aux_scratch: Vec<f32>,
     aux_buf: Vec<Complex32>,
     dual: bool,
+    /// Whether the radio was told to discipline its ADC clock from GPS —
+    /// [`sdroxide_rsr200::protocol::freq_correction_hz`]'s resolution
+    /// depends on it (0.5 Hz/LSB disciplining, 0.1 Hz/LSB only measuring).
+    /// A reopen-trigger in the config, so a plain mirror needs no live
+    /// updates.
+    gps_discipline: bool,
     last_depth_log: Instant,
+    last_status_log: Instant,
 }
 
 impl Rsr200Source {
@@ -137,7 +151,9 @@ impl Rsr200Source {
             aux_scratch: Vec::new(),
             aux_buf: Vec::new(),
             dual,
+            gps_discipline: cfg.gps_discipline,
             last_depth_log: Instant::now(),
+            last_status_log: Instant::now(),
             handle,
         };
         if dual {
@@ -233,6 +249,37 @@ impl Rsr200Source {
             }
         }
     }
+
+    /// Temperature and GPS-corrected clock offset, occasionally —
+    /// `RSR200_PLAN.md` step 5's "GPS discipline/correction readout". The
+    /// protocol-level parsing (`sdroxide_rsr200::protocol::Status`,
+    /// `freq_correction_hz`) was already built and tested in step 1; this
+    /// is what was missing to actually read it once the radio is running.
+    fn log_status(&mut self) {
+        if self.last_status_log.elapsed() < STATUS_LOG_INTERVAL {
+            return;
+        }
+        self.last_status_log = Instant::now();
+        let s = self.handle.status();
+        let correction = if s.freq_correction_valid {
+            format!(
+                "{:+.1} Hz clock correction ({})",
+                sdroxide_rsr200::protocol::freq_correction_hz(&s, self.gps_discipline),
+                if self.gps_discipline { "disciplining" } else { "measuring only" }
+            )
+        } else {
+            "no GPS fix".to_string()
+        };
+        // The temperature byte doubles as the Auto-ATT indicator (DP's own
+        // 0x80 sentinel) — `Status::temperature_c` is forced to 0 while
+        // engaged, which is not a real reading and must not be printed as
+        // one.
+        if s.auto_att_active {
+            tracing::info!("RSR200: Auto-ATT engaged, {correction}");
+        } else {
+            tracing::info!("RSR200: {}°C, {correction}", s.temperature_c);
+        }
+    }
 }
 
 /// The configuration's mode, as the DSP crate spells it.
@@ -280,6 +327,7 @@ impl IqSource for Rsr200Source {
     /// One block from the receiver — and, in Separate mode, the second ADC
     /// combined with the first.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        self.log_status();
         let need = buf.len() * 2;
         if self.rx_scratch.len() < need {
             self.rx_scratch.resize(need, 0.0);
@@ -465,11 +513,10 @@ impl IqSource for Rsr200Source {
         let mut msg = String::from(
             "Reuter RSR200 support is new: verified against real hardware over both LAN \
              (wired and WiFi) and USB (Linux/macOS — Windows needs its own driver research \
-             first). 16-bit only — 24-bit is not wired up yet. LAN's ÷8 decimation and \
-             coarser is solid over ordinary gigabit Ethernet; ÷4/÷2 broke up even wired. \
-             USB held up cleanly through ÷4, with real loss only at ÷2 (the highest rate) \
-             — its own, narrower throughput ceiling. Either way, expect the link — not \
-             this driver — to be what limits the top end.",
+             first). LAN's ÷8 decimation and coarser is solid over ordinary gigabit \
+             Ethernet; ÷4/÷2 broke up even wired. USB held up cleanly through ÷4, with real \
+             loss only at ÷2 (the highest rate) — its own, narrower throughput ceiling. \
+             Either way, expect the link — not this driver — to be what limits the top end.",
         );
         if self.dual {
             match self.div_cfg.technique {
@@ -489,6 +536,17 @@ impl IqSource for Rsr200Source {
                      real antennas — only whole-span decorrelate has.",
                 ),
             }
+        }
+        // Overload is worth a standing note the way sdrplay_source.rs's own
+        // is: nothing else about the session looks wrong when the front
+        // end is being driven into overload, and reading it costs nothing
+        // — the status header rides every block already.
+        let s = self.handle.status();
+        if s.overload_ch1 {
+            msg.push_str(" ADC1 is overloaded — raise the attenuator.");
+        }
+        if self.dual && s.overload_ch2 {
+            msg.push_str(" ADC2 is overloaded — raise its attenuator.");
         }
         Some(msg)
     }

@@ -4271,6 +4271,15 @@ pub struct Rsr200Config {
     /// The software diversity filter's own settings, live in
     /// [`Rsr200ChannelMode::Separate`] — see that variant's own doc.
     pub diversity: Rsr200Diversity,
+    /// 24-bit samples instead of 16. Reopens the device — the width is
+    /// fixed when the radio is configured, before streaming starts. Every
+    /// wire-geometry and sample-unpacking calculation in
+    /// `sdroxide_rsr200::protocol` already handles both widths (including
+    /// the trap DP notes: 24-bit block *length* stays the same across
+    /// channel counts, so 24-bit two-channel carries half the samples per
+    /// block that 16-bit does) — this field is the only piece that was
+    /// missing to actually choose one.
+    pub bits24: bool,
 }
 
 impl Default for Rsr200Config {
@@ -4287,6 +4296,7 @@ impl Default for Rsr200Config {
             usb_serial: String::new(),
             channel_mode: Rsr200ChannelMode::Single,
             diversity: Rsr200Diversity::default(),
+            bits24: false,
         }
     }
 }

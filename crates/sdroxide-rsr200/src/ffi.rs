@@ -304,46 +304,90 @@ fn lib_candidates() -> Vec<std::ffi::OsString> {
 /// if the driver install (or a bundled copy sitting beside `sdroxide.exe`,
 /// the way the SDR++ sibling's own Windows packaging script does it) put
 /// `FTD3XXWU.dll` somewhere Windows' own DLL search order already looks
-/// (the app's own directory, `System32`, `PATH`). The absolute fallback is
-/// where FTDI's SDK doc and the SDR++ sibling's `CMakeLists.txt` both point
-/// for *building against* the SDK, on the chance an install leaves the
-/// runtime DLL in the same place — not confirmed for a real end-user driver
-/// install specifically.
+/// (the app's own directory, `System32`, `PATH` — `LoadLibraryExW` with no
+/// search flags checks the application's own directory first, per its own
+/// documented default search order). The explicit `current_exe()` candidate
+/// exists only to remove any doubt about that default — same directory,
+/// named outright rather than relied on implicitly, in case something about
+/// a real install (a symlink, a working directory the loader doesn't expect)
+/// makes the bare name's implicit search behave differently than the
+/// documented case. The two absolute fallbacks are where FTDI's SDK doc and
+/// the SDR++ sibling's `CMakeLists.txt` both point for *building against*
+/// the SDK, on the chance an install leaves the runtime DLL there too — not
+/// confirmed for a real end-user driver install specifically.
 #[cfg(target_os = "windows")]
 fn lib_candidates() -> Vec<std::ffi::OsString> {
-    ["FTD3XXWU.dll", "C:/Program Files/FTD3XX/FTD3XXWU.dll", "C:/Program Files/FTD3XX/lib/FTD3XXWU.dll"]
-        .iter()
-        .map(Into::into)
-        .collect()
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    out.push("FTD3XXWU.dll".into());
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("FTD3XXWU.dll").into_os_string());
+        }
+    }
+    out.push("C:/Program Files/FTD3XX/FTD3XXWU.dll".into());
+    out.push("C:/Program Files/FTD3XX/lib/FTD3XXWU.dll".into());
+    out
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn lib_candidates() -> Vec<std::ffi::OsString> {
     Vec::new()
 }
 
+/// `libloading::Error`'s own `Display` is unhelpfully terse for exactly the
+/// case that matters most here — `LoadLibraryExW { .. } => write!(f,
+/// "LoadLibraryExW failed")`, full stop, with the actual `io::Error` (the one
+/// carrying Windows' real error code — "The specified module could not be
+/// found. (os error 126)" for a missing DLL, a different code entirely for a
+/// bitness mismatch or a missing dependency of the DLL itself, e.g. the VC++
+/// runtime) reachable only through [`std::error::Error::source`], never
+/// through `to_string()`/`{}`. Confirmed by reading the crate's own source,
+/// not assumed, after a real-world report from this generation of bindings
+/// came back saying only "(LoadLibraryExW failed)" with no further detail —
+/// useless for telling a missing DLL apart from a missing dependency of it.
+/// Walks the whole chain so the real OS error reaches the message.
+fn describe_error(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        out.push_str(": ");
+        out.push_str(&src.to_string());
+        cur = src.source();
+    }
+    out
+}
+
 impl Api {
     /// Load the vendor driver, or say why not (used verbatim in the UI).
+    /// Reports every candidate path tried and *that* candidate's own full
+    /// error, not just the last one attempted — see this module's own doc on
+    /// [`lib_candidates`] for why more than one path is tried at all, and
+    /// [`describe_error`] for why a bare `to_string()` on the underlying
+    /// error was hiding the actually-useful part of the message.
     pub fn load() -> Result<Api, String> {
-        let mut last = String::new();
+        let mut attempts: Vec<String> = Vec::new();
         for name in lib_candidates() {
             match unsafe { libloading::Library::new(&name) } {
                 Ok(lib) => return unsafe { Api::from_lib(lib) },
-                Err(e) => last = e.to_string(),
+                Err(e) => attempts.push(format!("{} ({})", name.to_string_lossy(), describe_error(&e))),
             }
         }
+        let tried = if attempts.is_empty() { "no candidate paths for this platform".to_string() } else { attempts.join("; ") };
         #[cfg(target_os = "windows")]
         {
             Err(format!(
-                "the FTDI D3XX WinUSB driver was not found ({last}) — install the \"WinUSB \
-                 D3XX driver\" package from ftdichip.com (not the older WDF-based one), then \
-                 rescan; if FTD3XXWU.dll isn't on PATH or beside sdroxide.exe, copy it there"
+                "the FTDI D3XX WinUSB driver was not found — tried: {tried} — install the \
+                 \"WinUSB D3XX driver\" package from ftdichip.com (not the older WDF-based \
+                 one), then rescan; if FTD3XXWU.dll isn't on PATH or beside sdroxide.exe, copy \
+                 it there. If it IS there and this still fails with \"module could not be \
+                 found\", the DLL's own dependency — the Microsoft Visual C++ x64 \
+                 Redistributable — is the next thing to check, not FTD3XXWU.dll itself."
             ))
         }
         #[cfg(not(target_os = "windows"))]
         {
             Err(format!(
-                "the FTDI D3XX driver was not found ({last}) — install it from ftdichip.com \
-                 (libftd3xx / FTD3XXWU), then rescan"
+                "the FTDI D3XX driver was not found — tried: {tried} — install it from \
+                 ftdichip.com (libftd3xx / FTD3XXWU), then rescan"
             ))
         }
     }

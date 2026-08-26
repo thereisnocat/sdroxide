@@ -272,7 +272,8 @@ the synthetic version of exactly what real air showed.
   `ref_band_enabled`/`ref_band_freq_hz`/`ref_band_width_hz` (`PROTO_VERSION` 96 → 97), exposed in
   both settings tabs as a checkbox + absolute frequency (MHz) + width (Hz) — no "centre on VFO"
   convenience yet (see `RSR200_PLAN.md`'s own note on why: `Diversity::process` runs on raw
-  wideband IQ, before any VFO/demod tuning exists to read). `sdroxide-dsp`'s new
+  wideband IQ, before any VFO/demod tuning exists to read; superseded the same night, see
+  "Reference frequency field removed" below). `sdroxide-dsp`'s new
   `a_reference_band_nulls_the_weak_interferer_the_whole_span_solve_misses` test reproduces the
   failure and the fix synthetically: two interferers at different frequencies and gains, one far
   stronger than the other — the whole-span solve, dominated by the strong one, does a mediocre job
@@ -313,6 +314,22 @@ the synthetic version of exactly what real air showed.
   once the dominant carrier is gone, or a downstream AGC/audio-chain difference) rather than a
   defect in sdroxide's decorrelation math specifically, though sdroxide's being more pronounced is
   a real, smaller gap worth a closer look another time.
+
+  **Reference frequency field removed; the reference band now follows the VFO transparently.**
+  Ralph: "I will never want to decorrelate against a different frequency than the one I'm tuned
+  to. The reference frequency adds needless friction." Confirmed by SDR++ itself — its own
+  `misc_modules/phasing/src/main.cpp` centres the reference band on the VFO automatically
+  ("Centred on VFO: %+.3f kHz"), never taking a typed frequency at all. Solved the
+  `Diversity::process`-runs-on-raw-wideband-IQ problem noted above not by teaching `Diversity`
+  about tuning, but by pushing the VFO frequency down into the source instead: `IqSource` gained
+  `set_vfo_hz(&mut self, hz: f64)` (no-op default), called by a new
+  `Engine::poll_ref_band_vfo()` every tick `state.rx_freq_hz()` (RIT-inclusive) actually changes.
+  `Rsr200Source`/`SdrPlaySource` track `vfo_hz` and recompute the reference band's offset from it
+  in `refresh_ref_band()` on every call, in place of the old `ref_band_freq_hz - center`
+  calculation. `ref_band_freq_hz` and `DIV_REFBAND_FREQ_ELEMENT` removed outright from
+  `Rsr200Diversity`/`SdrPlayDiversity` (`PROTO_VERSION` 97 → 98) — safe as a hard removal rather
+  than a deprecation because v97 was never released. The "Reference frequency" field is gone from
+  both settings tabs; only "Reference band" (enable) and "Reference width" remain.
 - Continuous-resolve vs. one-shot-then-freeze as the *default* behavior for scalar decorrelation
   in `Combine`-style use — both are worth having per the section above, but which one an operator
   gets without touching a setting is a real UX choice, not obviously either way.

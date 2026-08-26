@@ -754,9 +754,15 @@ separately and shipped each as it landed):
    which is exactly the open question this document's sibling, `DECORRELATION_PLAN.md`, had left
    unresolved ("whole-band solve, or an operator-selected reference sub-band?"). Built the same
    night — see that document's own "Open questions" entry for the full account, including the new
-   synthetic regression test. **Still needs a fresh real-air retest with the reference band
-   actually pointed at WNYC** — built and synthetically verified the same night as the A/B that
-   motivated it, not yet re-run against real hardware.
+   synthetic regression test. **Real-air retest also happened the same night**: the reference band
+   alone turned out not to be the fix (WNYC "essentially no difference" at any width tried); the
+   actual gap was a missing whitening/noise-calibration step, found by reading SDR++'s
+   `decorrelator.h` directly and confirmed on real air (WNYC and a Toronto 860 kHz station both
+   nulled completely after a noise capture). The reference band itself was kept — genuinely useful
+   for isolating one interferer from another — and later that same night was changed to follow the
+   VFO transparently rather than take a typed frequency, removing `ref_band_freq_hz` entirely
+   (`PROTO_VERSION` 98). Full account, including the residual "pops" investigation, in
+   `DECORRELATION_PLAN.md`'s "Open questions" entry.
 
    **A fifth real bug, found the same day, once Ralph turned VHF on and tuned to the FM broadcast
    band**: WBGO at 88.3 MHz displayed at roughly 800 kHz — real content, wildly mislabelled.

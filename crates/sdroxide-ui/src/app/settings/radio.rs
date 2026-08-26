@@ -2629,6 +2629,28 @@ pub(in crate::app) fn settings_rsr200_tab(
                     }
                     ui.end_row();
                 }
+
+                ui.label("Noise calibration").on_hover_text(
+                    "Point the radio at a quiet channel first — whatever is on the air while \
+                     this runs becomes \"noise\". Solving on the resulting whitened channels \
+                     corrects for a gain or noise-floor mismatch between the two aerials \
+                     instead of assuming they are already matched, which is what let SDR++ \
+                     and the Perseus22's own software null significantly deeper than the \
+                     un-whitened solve did on identical antennas.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Capture noise (1 s)").clicked() {
+                        push_gain(cmds, Rsr200Config::DIV_CAPTURE_NOISE_ELEMENT, 1.0);
+                    }
+                    if ui
+                        .button("Clear")
+                        .on_hover_text("Discard the calibration and go back to the un-whitened solve.")
+                        .clicked()
+                    {
+                        push_gain(cmds, Rsr200Config::DIV_CLEAR_WHITENING_ELEMENT, 1.0);
+                    }
+                });
+                ui.end_row();
             }
 
             if div.technique == DiversityTechnique::Decorrelate {
@@ -6593,6 +6615,31 @@ pub(in crate::app) fn settings_sdrplay_tab(
                             }
                             ui.end_row();
                         }
+
+                        ui.label("Noise calibration").on_hover_text(
+                            "Point the radio at a quiet channel first — whatever is on the \
+                             air while this runs becomes \"noise\". Solving on the resulting \
+                             whitened channels corrects for a gain or noise-floor mismatch \
+                             between the two aerials instead of assuming they are already \
+                             matched, which is what let SDR++ and the Perseus22's own \
+                             software null significantly deeper than the un-whitened solve \
+                             did on identical antennas.",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Capture noise (1 s)").clicked() {
+                                push_gain(cmds, SdrPlayConfig::DIV_CAPTURE_NOISE_ELEMENT, 1.0);
+                            }
+                            if ui
+                                .button("Clear")
+                                .on_hover_text(
+                                    "Discard the calibration and go back to the un-whitened solve.",
+                                )
+                                .clicked()
+                            {
+                                push_gain(cmds, SdrPlayConfig::DIV_CLEAR_WHITENING_ELEMENT, 1.0);
+                            }
+                        });
+                        ui.end_row();
                     }
                 },
             );

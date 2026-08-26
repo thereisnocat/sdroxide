@@ -253,10 +253,17 @@ impl SdrPlaySource {
         let slip_note =
             if slips > 0 { format!(", {slips} pairing restart(s)") } else { String::new() };
         if let Some(d) = self.diversity.as_ref() {
+            let whitening = if d.is_capturing_noise() {
+                ", noise calibration in progress"
+            } else if d.has_whitening() {
+                ", whitened"
+            } else {
+                ""
+            };
             match d.depth_db() {
                 Some(db) => tracing::info!(
                     "diversity: {db:.1} dB of the main aerial's signal is being \
-                     cancelled{}{slip_note}",
+                     cancelled{}{whitening}{slip_note}",
                     if d.frozen() { ", filter held" } else { "" },
                 ),
                 None if slips > 0 => tracing::debug!("diversity: combining{slip_note}"),
@@ -559,6 +566,18 @@ impl IqSource for SdrPlaySource {
             SdrPlayConfig::DIV_REFBAND_WIDTH_ELEMENT => {
                 self.div_cfg.ref_band_width_hz = db.max(1.0);
                 self.refresh_ref_band();
+            }
+            SdrPlayConfig::DIV_CAPTURE_NOISE_ELEMENT if db >= 0.5 => {
+                if let Some(d) = self.diversity.as_mut() {
+                    d.capture_noise(1.0, self.handle.out_rate_hz());
+                    tracing::info!("SDRplay: noise calibration armed — keep the radio on a quiet channel for ~1 s");
+                }
+            }
+            SdrPlayConfig::DIV_CLEAR_WHITENING_ELEMENT if db >= 0.5 => {
+                if let Some(d) = self.diversity.as_mut() {
+                    d.clear_whitening();
+                    tracing::info!("SDRplay: noise calibration cleared — back to the un-whitened solve");
+                }
             }
             _ => {}
         }

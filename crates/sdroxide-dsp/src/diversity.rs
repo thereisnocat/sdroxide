@@ -227,6 +227,152 @@ pub fn cancel_weight(null: Eigenpair) -> (Complex32, Complex32) {
 /// solve costs nothing genuine.
 const MAX_CANCEL_RATIO: f32 = 1.0e3;
 
+// -----------------------------------------------------------------------
+// Whitening -- a real gap [`Diversity::process_decorrelate`] had against two
+// independent, real-world implementations (SDR++ and the Perseus22's own
+// vendor software), both of which get a materially cleaner null on
+// identical antennas than the un-whitened solve below did. Ported from the
+// SDR++ sibling's own `dsp::combine` (`decorrelator.h`'s `inverseSqrt`/
+// `transform`/`combineCoefficients`, `phaser.h`'s `captureNoise`), whose own
+// doc names the mechanism plainly: solving for maximum power favours
+// whichever channel is noisiest unless the two are first normalised to
+// equal, uncorrelated noise -- "whitened". [`covariance_eigen`] has no
+// equivalent; it solves the raw covariance directly, which is fine when the
+// two channels already have comparable noise floors and biased otherwise.
+//
+// f64 throughout, and a second, un-conjugated eigendecomposition
+// ([`raw_eigen`]) rather than reusing [`covariance_eigen`]: building a
+// whitening matrix needs the actual eigenvectors, not that function's own
+// f32/"already conjugated, ready to apply" convention, and round-tripping
+// through the conjugate twice per calibration is more room for a sign error
+// than a second, independently-verified, closed-form solve costs.
+// -----------------------------------------------------------------------
+
+/// A 2×2 complex matrix, row-major — the whitening transform's own shape.
+/// Built once per calibration, not per-sample, so f64 costs nothing real.
+#[derive(Debug, Clone, Copy)]
+struct Matrix2 {
+    m: [[num_complex::Complex64; 2]; 2],
+}
+
+/// Unit-norms a raw (2-component) eigenvector — [`raw_eigen`]'s own helper,
+/// not [`Eigenpair`]'s: this one has no conjugate applied and no eigenvalue
+/// attached, since [`Matrix2`] construction needs the vector itself.
+fn normalize2(mut v: [num_complex::Complex64; 2]) -> [num_complex::Complex64; 2] {
+    let n = (v[0].norm_sqr() + v[1].norm_sqr()).sqrt();
+    if n > 1e-300 {
+        v[0] /= n;
+        v[1] /= n;
+    } else {
+        v = [num_complex::Complex64::new(1.0, 0.0), num_complex::Complex64::new(0.0, 0.0)];
+    }
+    v
+}
+
+/// The same closed-form 2×2 Hermitian solve [`covariance_eigen`] does, in
+/// f64 and returning the *raw*, un-conjugated, unit-norm eigenvectors —
+/// what building or applying a whitening transform needs. Returns
+/// `(λ_min, u_min, λ_max, u_max)`.
+fn raw_eigen(
+    raa: f64,
+    rbb: f64,
+    rab: num_complex::Complex64,
+) -> (f64, [num_complex::Complex64; 2], f64, [num_complex::Complex64; 2]) {
+    let trace = raa + rbb;
+    let det = raa * rbb - rab.norm_sqr();
+    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+    let lambda_max = 0.5 * (trace + disc);
+    let lambda_min = 0.5 * (trace - disc);
+
+    let one = num_complex::Complex64::new(1.0, 0.0);
+    let zero = num_complex::Complex64::new(0.0, 0.0);
+    let (u_min, u_max) = if rab.norm_sqr() > 1e-300 {
+        (
+            normalize2([rab, num_complex::Complex64::new(lambda_min - raa, 0.0)]),
+            normalize2([rab, num_complex::Complex64::new(lambda_max - raa, 0.0)]),
+        )
+    } else if raa <= rbb {
+        ([one, zero], [zero, one])
+    } else {
+        ([zero, one], [one, zero])
+    };
+    (lambda_min, u_min, lambda_max, u_max)
+}
+
+/// `R^(-1/2)`, for whitening. Applied to a channel pair it produces two
+/// outputs of equal power that are uncorrelated — the manual's own
+/// "orthonormalisation". Calibrated on noise-only data (see
+/// [`Diversity::capture_noise`]), it is what turns a maximum-power
+/// combination into a maximum-SNR one: without it, combining for power
+/// alone favours whichever channel is noisiest.
+fn inverse_sqrt(raa: f64, rbb: f64, rab: num_complex::Complex64) -> Matrix2 {
+    let (lambda_min, u_min, lambda_max, u_max) = raw_eigen(raa.max(0.0), rbb.max(0.0), rab);
+    let s_min = 1.0 / lambda_min.max(1e-300).sqrt();
+    let s_max = 1.0 / lambda_max.max(1e-300).sqrt();
+    let mut m = [[num_complex::Complex64::new(0.0, 0.0); 2]; 2];
+    for (r, row) in m.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            *cell = s_max * u_max[r] * u_max[c].conj() + s_min * u_min[r] * u_min[c].conj();
+        }
+    }
+    Matrix2 { m }
+}
+
+/// `R' = W·R·Wᴴ` — a covariance measured on the raw channels, expressed in
+/// whitened coordinates, without touching a single sample.
+///
+/// A genuine 2×2 matrix multiply, where each output element reads from both
+/// input matrices at different indices — an iterator over one side's own
+/// elements has nothing to enumerate against the other side, so a plain
+/// index loop is the clearer way to write it, not a range clippy would
+/// rather see turned into one.
+#[allow(clippy::needless_range_loop)]
+fn transform(raa: f64, rbb: f64, rab: num_complex::Complex64, w: &Matrix2) -> (f64, f64, num_complex::Complex64) {
+    let r = [[num_complex::Complex64::new(raa, 0.0), rab], [rab.conj(), num_complex::Complex64::new(rbb, 0.0)]];
+    let mut wr = [[num_complex::Complex64::new(0.0, 0.0); 2]; 2];
+    for i in 0..2 {
+        for j in 0..2 {
+            wr[i][j] = w.m[i][0] * r[0][j] + w.m[i][1] * r[1][j];
+        }
+    }
+    let mut out = [[num_complex::Complex64::new(0.0, 0.0); 2]; 2];
+    for i in 0..2 {
+        for j in 0..2 {
+            out[i][j] = wr[i][0] * w.m[j][0].conj() + wr[i][1] * w.m[j][1].conj();
+        }
+    }
+    (out[0][0].re, out[1][1].re, out[0][1])
+}
+
+/// A whitened-space eigenvector `u`, folded back into coefficients for the
+/// *raw* channels: `y = k0·main + k1·aux`. Whitening never touches a
+/// sample — it only reshapes the covariance the solve runs on — so the
+/// transform has to be folded into the coefficients instead. For a
+/// Hermitian `W` (which [`inverse_sqrt`] always produces), `conj(u)·W` and
+/// `conj(W^H·u)` are the same value — the identity the SDR++ sibling's own
+/// `combineCoefficients(..., whitened=true, ...)` uses, verified against
+/// this file's own [`covariance_eigen`] convention (`k0`/`k1` already
+/// conjugated, ready to apply directly) rather than assumed to match it.
+fn whitened_to_raw(u: [num_complex::Complex64; 2], w: &Matrix2) -> (Complex32, Complex32) {
+    let cu = [u[0].conj(), u[1].conj()];
+    let k0 = cu[0] * w.m[0][0] + cu[1] * w.m[1][0];
+    let k1 = cu[0] * w.m[0][1] + cu[1] * w.m[1][1];
+    (Complex32::new(k0.re as f32, k0.im as f32), Complex32::new(k1.re as f32, k1.im as f32))
+}
+
+/// A noise-only calibration in progress — see [`Diversity::capture_noise`].
+/// Accumulates the same `raa`/`rbb`/`rab` a normal solve would, over
+/// [`Self::samples_wanted`] samples, then finalises into
+/// [`Diversity::whitening`] and clears itself.
+struct NoiseCapture {
+    raa: f64,
+    rbb: f64,
+    rab: num_complex::Complex64,
+    terms: u64,
+    samples_seen: u64,
+    samples_wanted: u64,
+}
+
 /// Slowest and fastest normalised step size the rate control reaches.
 ///
 /// The bottom is a filter that takes tens of seconds to settle and then sits
@@ -442,6 +588,13 @@ pub struct Diversity {
     /// sibling's own "always construct it, gate it with a flag" shape.
     ref_band: RefBand,
     ref_enabled: bool,
+    /// The whitening transform [`Self::capture_noise`] calibrates, or
+    /// `None` before that has ever been done — in which case
+    /// [`Self::process_decorrelate`] solves the raw covariance directly,
+    /// exactly as it always has.
+    whitening: Option<Matrix2>,
+    /// A calibration in progress — see [`Self::capture_noise`].
+    noise_capture: Option<NoiseCapture>,
 }
 
 impl Diversity {
@@ -481,6 +634,8 @@ impl Diversity {
             decorr_solved: false,
             ref_band: RefBand::default(),
             ref_enabled: false,
+            whitening: None,
+            noise_capture: None,
         }
     }
 
@@ -496,6 +651,88 @@ impl Diversity {
         self.ref_enabled = enabled;
         if enabled {
             self.ref_band.configure(sample_rate_hz, offset_hz, width_hz);
+        }
+    }
+
+    /// Arm a noise-only calibration: point the radio at a quiet channel
+    /// first — whatever is on the air while this runs becomes "noise".
+    /// The next `seconds` of covariance — measured the same way a normal
+    /// solve is, respecting [`Self::set_ref_band`] if it is on — is taken
+    /// as the receive chain's own noise floor and inverted into a
+    /// whitening transform. After this, [`DiversityAlgorithm::Decorrelate`]
+    /// solves in whitened coordinates: a maximum-power combination becomes
+    /// a maximum-SNR one, correcting for whatever gain/noise-floor mismatch
+    /// exists between the two channels instead of assuming they are
+    /// already matched. See this module's own "Whitening" section for the
+    /// mechanism and why it was added — two independent, real-world
+    /// implementations (SDR++, and the Perseus22's own vendor software)
+    /// got a materially cleaner null than the un-whitened solve did, on
+    /// identical antennas.
+    ///
+    /// Capturing takes priority over [`Self::frozen`] — it is a deliberate,
+    /// one-off operator action, not something Hold should be able to block
+    /// — and leaves whatever was already being applied untouched while it
+    /// runs, the same as being frozen already does.
+    pub fn capture_noise(&mut self, seconds: f64, sample_rate_hz: f64) {
+        let samples_wanted = (seconds.max(0.05) * sample_rate_hz).round().max(1.0) as u64;
+        self.noise_capture = Some(NoiseCapture {
+            raa: 0.0,
+            rbb: 0.0,
+            rab: num_complex::Complex64::new(0.0, 0.0),
+            terms: 0,
+            samples_seen: 0,
+            samples_wanted,
+        });
+    }
+
+    /// Whether a [`Self::capture_noise`] calibration is still accumulating.
+    pub fn is_capturing_noise(&self) -> bool {
+        self.noise_capture.is_some()
+    }
+
+    /// Whether [`Self::capture_noise`] has ever completed — `false` means
+    /// [`Self::process_decorrelate`] is solving the raw, un-whitened
+    /// covariance, exactly as it always has.
+    pub fn has_whitening(&self) -> bool {
+        self.whitening.is_some()
+    }
+
+    /// Discard a calibration (or one in progress) and go back to solving
+    /// the raw covariance directly — the comparison this whole feature was
+    /// motivated by needs an easy way back to the un-whitened baseline.
+    pub fn clear_whitening(&mut self) {
+        self.whitening = None;
+        self.noise_capture = None;
+    }
+
+    /// This block's `raa`/`rbb`/`rab`, either the whole-span raw sum or
+    /// [`Self::ref_band`]'s own restricted measurement — the same
+    /// accumulation a normal solve and [`Self::capture_noise`] both want,
+    /// so there is one implementation of "measure this block" rather than
+    /// two that could quietly drift apart.
+    fn measure_covariance(
+        &mut self,
+        main: &[Complex32],
+        aux: &[Complex32],
+    ) -> (f64, f64, num_complex::Complex64, usize) {
+        if self.ref_enabled {
+            let mut raa = 0.0f64;
+            let mut rbb = 0.0f64;
+            let mut rab = num_complex::Complex64::new(0.0, 0.0);
+            let terms = self.ref_band.accumulate(main, aux, &mut raa, &mut rbb, &mut rab);
+            (raa, rbb, rab, terms)
+        } else {
+            let mut raa = 0.0f64;
+            let mut rbb = 0.0f64;
+            let mut rab = num_complex::Complex64::new(0.0, 0.0);
+            let n = main.len().min(aux.len());
+            for i in 0..n {
+                raa += f64::from(main[i].norm_sqr());
+                rbb += f64::from(aux[i].norm_sqr());
+                rab += num_complex::Complex64::new(f64::from(main[i].re), f64::from(main[i].im))
+                    * num_complex::Complex64::new(f64::from(aux[i].re), -f64::from(aux[i].im));
+            }
+            (raa, rbb, rab, n)
         }
     }
 
@@ -727,25 +964,30 @@ impl Diversity {
             return;
         }
 
-        if !self.frozen {
-            let (raa, rbb, rab, terms) = if self.ref_enabled {
-                let mut raa = 0.0f64;
-                let mut rbb = 0.0f64;
-                let mut rab = num_complex::Complex64::new(0.0, 0.0);
-                let terms = self.ref_band.accumulate(&main[..n], &aux[..n], &mut raa, &mut rbb, &mut rab);
-                (raa, rbb, rab, terms)
-            } else {
-                let mut raa = 0.0f64;
-                let mut rbb = 0.0f64;
-                let mut rab = num_complex::Complex64::new(0.0, 0.0);
-                for i in 0..n {
-                    raa += f64::from(main[i].norm_sqr());
-                    rbb += f64::from(aux[i].norm_sqr());
-                    rab += num_complex::Complex64::new(f64::from(main[i].re), f64::from(main[i].im))
-                        * num_complex::Complex64::new(f64::from(aux[i].re), -f64::from(aux[i].im));
+        if self.noise_capture.is_some() {
+            // Measured first, before the mutable borrow of `noise_capture`
+            // below -- `measure_covariance` needs `&mut self.ref_band`,
+            // which would conflict with holding `noise_capture` mutably at
+            // the same time.
+            let (raa, rbb, rab, terms) = self.measure_covariance(&main[..n], &aux[..n]);
+            let capture = self.noise_capture.as_mut().expect("checked above");
+            capture.raa += raa;
+            capture.rbb += rbb;
+            capture.rab += rab;
+            capture.terms += terms as u64;
+            capture.samples_seen += n as u64;
+            if capture.samples_seen >= capture.samples_wanted {
+                if capture.terms > 0 {
+                    let inv = 1.0 / capture.terms as f64;
+                    self.whitening = Some(inverse_sqrt(capture.raa * inv, capture.rbb * inv, capture.rab * inv));
                 }
-                (raa, rbb, rab, n)
-            };
+                self.noise_capture = None;
+            }
+            // Calibrating is not itself a reason to change what is heard --
+            // whatever weight was already solved (or the safe unity
+            // default) stays exactly where it is, the same as `frozen`.
+        } else if !self.frozen {
+            let (raa, rbb, rab, terms) = self.measure_covariance(&main[..n], &aux[..n]);
             // A block shorter than the reference band's own decimator period
             // legitimately produces zero terms -- nothing to solve from yet,
             // not a reason to solve on all-zero and null the whole signal.
@@ -753,30 +995,42 @@ impl Diversity {
             // is the first block) exactly as `frozen` already does.
             if terms > 0 {
                 let inv = 1.0 / terms as f64;
-                let raa = (raa * inv) as f32;
-                let rbb = (rbb * inv) as f32;
-                let rab = Complex32::new((rab.re * inv) as f32, (rab.im * inv) as f32);
-                let (null, combine) = covariance_eigen(raa, rbb, rab);
-                match self.mode {
-                    DiversityMode::Cancel => {
+                let (raa, rbb, rab) = (raa * inv, rbb * inv, rab * inv);
+
+                let (k0, k1) = if let Some(w) = self.whitening {
+                    // Solved in whitened coordinates -- see this module's
+                    // own "Whitening" section -- then folded back into
+                    // coefficients for the raw channels.
+                    let (raa_w, rbb_w, rab_w) = transform(raa, rbb, rab, &w);
+                    let (lambda_min, u_min, _lambda_max, u_max) = raw_eigen(raa_w.max(0.0), rbb_w.max(0.0), rab_w);
+                    match self.mode {
+                        DiversityMode::Cancel => {
+                            let (k0, k1) = whitened_to_raw(u_min, &w);
+                            cancel_weight(Eigenpair { eigenvalue: lambda_min as f32, k0, k1 })
+                        }
+                        DiversityMode::Combine => whitened_to_raw(u_max, &w),
+                    }
+                } else {
+                    let raa = raa as f32;
+                    let rbb = rbb as f32;
+                    let rab = Complex32::new(rab.re as f32, rab.im as f32);
+                    let (null, combine) = covariance_eigen(raa, rbb, rab);
+                    match self.mode {
                         // The raw null eigenvector is jointly unit-norm across
                         // *both* channels, so applied directly it scales `main`
                         // itself by less than one -- unlike the adaptive filter's
                         // `main - W*aux`, which leaves a signal `aux` cannot hear
                         // untouched by construction. Rescaling to unity gain on
                         // `main` restores that guarantee -- see `cancel_weight`.
-                        let (k0, k1) = cancel_weight(null);
-                        self.decorr_k0 = k0;
-                        self.decorr_k1 = k1;
+                        DiversityMode::Cancel => cancel_weight(null),
+                        // Combining has no such expectation -- both branches are
+                        // meant to be weighted by quality, `main` included -- so
+                        // the raw maximal-ratio eigenvector is applied as solved.
+                        DiversityMode::Combine => (combine.k0, combine.k1),
                     }
-                    // Combining has no such expectation -- both branches are
-                    // meant to be weighted by quality, `main` included -- so the
-                    // raw maximal-ratio eigenvector is applied as solved.
-                    DiversityMode::Combine => {
-                        self.decorr_k0 = combine.k0;
-                        self.decorr_k1 = combine.k1;
-                    }
-                }
+                };
+                self.decorr_k0 = k0;
+                self.decorr_k1 = k1;
                 self.decorr_solved = true;
             }
         }
@@ -865,6 +1119,72 @@ mod tests {
         let before: Vec<Complex32> = (n - 20_000..n).map(|i| qrm[i - delay] * h).collect();
         let depth = 10.0 * (power(&before) / power(tail)).log10();
         assert!(depth > 30.0, "only {depth:.1} dB of the noise source was removed");
+    }
+
+    /// The real-air case whitening exists for, reproduced synthetically: two
+    /// antennas hearing the same interferer, but one channel's own front-end
+    /// noise is much louder than the other's — exactly a real gain/noise-
+    /// floor mismatch between two different aerials, not anything about the
+    /// interferer itself. Without whitening, the raw covariance solve is
+    /// dominated by whichever channel is loudest overall (mostly its own
+    /// noise here, not the correlated interferer) and finds essentially no
+    /// useful null. Calibrating on noise-only data with the same mismatch
+    /// (what actually tuning to a quiet channel first gives) and solving in
+    /// the resulting whitened coordinates finds the interferer's *true*
+    /// gain/phase relationship almost exactly and nulls deep — matching what
+    /// SDR++ and the Perseus22's own vendor software get on real antennas
+    /// that sdroxide's un-whitened solve did not.
+    #[test]
+    fn whitening_finds_the_null_a_channel_noise_floor_mismatch_hides() {
+        let n = 200_000;
+        let qrm = noise(n, 0xA1);
+        // The path from the interferer to main: 0.6 of the amplitude,
+        // rotated 40°. Aux hears it at unity gain.
+        let h = Complex32::from_polar(0.6, 0.7);
+        // Aux's own front end is thirty times noisier than main's -- a real
+        // mismatch, not a subtle one.
+        let noise_main: Vec<Complex32> = noise(n, 0xB2).iter().map(|s| s * 0.1).collect();
+        let noise_aux: Vec<Complex32> = noise(n, 0xC3).iter().map(|s| s * 3.0).collect();
+        let build_main = |nm: &[Complex32]| -> Vec<Complex32> { (0..n).map(|i| qrm[i] * h + nm[i]).collect() };
+        let build_aux = |na: &[Complex32]| -> Vec<Complex32> { (0..n).map(|i| qrm[i] + na[i]).collect() };
+
+        let mut d_raw = Diversity::new(DiversityMode::Cancel, 1, 0.8);
+        d_raw.set_algorithm(DiversityAlgorithm::Decorrelate);
+        let mut main_raw = build_main(&noise_main);
+        d_raw.process(&mut main_raw, &build_aux(&noise_aux));
+
+        let mut d_w = Diversity::new(DiversityMode::Cancel, 1, 0.8);
+        d_w.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d_w.capture_noise(1.0, n as f64);
+        // Calibration is a fresh realisation of the same per-channel noise
+        // mismatch, not a replay of `noise_main`/`noise_aux` -- what tuning
+        // to a genuinely quiet channel actually gives.
+        let mut calib_main: Vec<Complex32> = noise(n, 0xD4).iter().map(|s| s * 0.1).collect();
+        let calib_aux: Vec<Complex32> = noise(n, 0xE5).iter().map(|s| s * 3.0).collect();
+        d_w.process(&mut calib_main, &calib_aux);
+        assert!(d_w.has_whitening(), "calibration did not complete in one block");
+
+        let mut main_w = build_main(&noise(n, 0xF6).iter().map(|s| s * 0.1).collect::<Vec<_>>());
+        d_w.process(&mut main_w, &build_aux(&noise(n, 0x17).iter().map(|s| s * 3.0).collect::<Vec<_>>()));
+
+        // Matched-filter correlation against the known interferer waveform:
+        // how much of it specifically remains, independent of how much of
+        // aux's own much-louder noise also rides along in the output --
+        // raw output power would conflate the two.
+        let before: Vec<Complex32> = qrm.iter().map(|q| q * h).collect();
+        let qrm_power = power(&before);
+        let residual_db = |out: &[Complex32]| -> f32 {
+            let corr: Complex32 = out.iter().zip(&before).map(|(&o, &b)| o * b.conj()).sum::<Complex32>() / n as f32;
+            20.0 * (qrm_power / corr.norm()).log10()
+        };
+        let depth_raw = residual_db(&main_raw);
+        let depth_w = residual_db(&main_w);
+        assert!(depth_raw < 10.0, "raw solve should barely null under this mismatch, got {depth_raw:.1} dB");
+        assert!(depth_w > 40.0, "whitened solve should null deep, got only {depth_w:.1} dB");
+        assert!(
+            depth_w > depth_raw + 30.0,
+            "whitening should be a large, unambiguous improvement: raw {depth_raw:.1} dB, whitened {depth_w:.1} dB"
+        );
     }
 
     /// The real-air case a reference band exists for, reproduced

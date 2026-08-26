@@ -4579,6 +4579,17 @@ impl Rsr200Config {
     pub const DIV_REFBAND_FREQ_ELEMENT: &'static str = "DIVREFBANDFREQ";
     /// [`Rsr200Diversity::ref_band_width_hz`] — the raw Hz value.
     pub const DIV_REFBAND_WIDTH_ELEMENT: &'static str = "DIVREFBANDWID";
+    /// Momentary: any value at or above 0.5 arms a ~1 second noise-only
+    /// calibration for [`DiversityTechnique::Decorrelate`]'s covariance
+    /// solve — point the radio at a quiet channel first. Not a persisted
+    /// setting: the calibration is receiver-environment-specific and would
+    /// go stale the moment conditions change, so nothing here survives a
+    /// reopen or a settings save the way [`Rsr200Diversity::ref_band_enabled`]
+    /// and its neighbours do.
+    pub const DIV_CAPTURE_NOISE_ELEMENT: &'static str = "DIVCAPNOISE";
+    /// Momentary: any value at or above 0.5 discards a calibration (or one
+    /// in progress) and goes back to the un-whitened solve.
+    pub const DIV_CLEAR_WHITENING_ELEMENT: &'static str = "DIVCLEARWHT";
 
     /// `decimation_exp` → the divisor it selects (`2^(exp+1)`), matching
     /// `sdroxide_rsr200::protocol::decimation_rate` without this crate
@@ -5344,6 +5355,14 @@ impl SdrPlayConfig {
     pub const DIV_REFBAND_FREQ_ELEMENT: &'static str = "DIVREFBANDFREQ";
     /// [`SdrPlayDiversity::ref_band_width_hz`] — the raw Hz value.
     pub const DIV_REFBAND_WIDTH_ELEMENT: &'static str = "DIVREFBANDWID";
+    /// Momentary: any value at or above 0.5 arms a ~1 second noise-only
+    /// calibration for [`DiversityTechnique::Decorrelate`]'s covariance
+    /// solve — point the radio at a quiet channel first. Not persisted,
+    /// same reasoning as `Rsr200Config`'s own copy of this element.
+    pub const DIV_CAPTURE_NOISE_ELEMENT: &'static str = "DIVCAPNOISE";
+    /// Momentary: any value at or above 0.5 discards a calibration (or one
+    /// in progress) and goes back to the un-whitened solve.
+    pub const DIV_CLEAR_WHITENING_ELEMENT: &'static str = "DIVCLEARWHT";
 
     /// IF gain reduction limits, in dB, from the API (`NORMAL_MIN_GR` and
     /// `MAX_BB_GR`).

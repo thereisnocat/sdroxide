@@ -315,9 +315,16 @@ impl Rsr200Source {
         }
         self.last_depth_log = Instant::now();
         if let Some(d) = self.diversity.as_ref() {
+            let whitening = if d.is_capturing_noise() {
+                ", noise calibration in progress"
+            } else if d.has_whitening() {
+                ", whitened"
+            } else {
+                ""
+            };
             if let Some(db) = d.depth_db() {
                 tracing::info!(
-                    "diversity: {db:.1} dB of the main ADC's signal is being cancelled{}",
+                    "diversity: {db:.1} dB of the main ADC's signal is being cancelled{}{whitening}",
                     if d.frozen() { ", filter held" } else { "" },
                 );
             }
@@ -635,6 +642,18 @@ impl IqSource for Rsr200Source {
             Rsr200Config::DIV_REFBAND_WIDTH_ELEMENT => {
                 self.div_cfg.ref_band_width_hz = db.max(1.0);
                 self.refresh_ref_band();
+            }
+            Rsr200Config::DIV_CAPTURE_NOISE_ELEMENT if db >= 0.5 => {
+                if let Some(d) = self.diversity.as_mut() {
+                    d.capture_noise(1.0, self.handle.sample_rate_hz);
+                    tracing::info!("RSR200: noise calibration armed — keep the radio on a quiet channel for ~1 s");
+                }
+            }
+            Rsr200Config::DIV_CLEAR_WHITENING_ELEMENT if db >= 0.5 => {
+                if let Some(d) = self.diversity.as_mut() {
+                    d.clear_whitening();
+                    tracing::info!("RSR200: noise calibration cleared — back to the un-whitened solve");
+                }
             }
             _ => {}
         }

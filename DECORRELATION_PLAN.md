@@ -256,11 +256,30 @@ the synthetic version of exactly what real air showed.
 
 ## Open questions
 
-- Whole-band solve, or an operator-selected reference sub-band? The original work used the
-  whole visible/processed span for the wideband version (no reference band needed — that's what
-  makes it handle multiple simultaneous interferers without being pointed at any one of them);
-  a global scalar solve over a *narrow* band the operator picks might behave differently and is
-  worth deciding deliberately rather than defaulting to "whatever's easiest to wire up."
+- **Answered and built, 2026-08-25 (branch `rsr200`)**: a global scalar solve over an
+  operator-selected reference sub-band — real-air evidence made the decision, not a deliberation
+  in the abstract. Ralph ran a direct A/B on 820 kHz (WNYC) with two working antennas: sdroxide's
+  whole-span `DiversityAlgorithm::Decorrelate` left far more of WNYC audible, and sounded choppier,
+  than the SDR++ sibling's own automatic decorrelate on the identical antennas and frequency — the
+  same technique, worse result. Root cause, confirmed by reading the SDR++ implementation directly
+  rather than guessing: its own `dsp::combine::RefBand` restricts the covariance measurement the
+  solve is based on to a slice of spectrum the operator points at the interferer, so the weight is
+  solved from the interferer specifically rather than from whatever the whole span happens to make
+  loudest and most correlated. Ported as `sdroxide_dsp::diversity::RefBand` (private to the crate;
+  `Diversity::set_ref_band(enabled, sample_rate_hz, offset_hz, width_hz)` is the public surface) —
+  two cascaded boxcar decimators, exactly the original's own design, feeding the same `raa`/`rbb`/
+  `rab` inputs `covariance_eigen` already took. `Rsr200Diversity`/`SdrPlayDiversity` both gained
+  `ref_band_enabled`/`ref_band_freq_hz`/`ref_band_width_hz` (`PROTO_VERSION` 96 → 97), exposed in
+  both settings tabs as a checkbox + absolute frequency (MHz) + width (Hz) — no "centre on VFO"
+  convenience yet (see `RSR200_PLAN.md`'s own note on why: `Diversity::process` runs on raw
+  wideband IQ, before any VFO/demod tuning exists to read). `sdroxide-dsp`'s new
+  `a_reference_band_nulls_the_weak_interferer_the_whole_span_solve_misses` test reproduces the
+  failure and the fix synthetically: two interferers at different frequencies and gains, one far
+  stronger than the other — the whole-span solve, dominated by the strong one, does a mediocre job
+  on the weak one; the reference band, pointed at the weak one specifically, nulls it deep
+  regardless of what the strong one is doing elsewhere. **Not yet re-verified against real
+  hardware** — built and tested synthetically the same night the A/B that motivated it happened;
+  a fresh real-air retest with the reference band pointed at WNYC is the natural next step.
 - Continuous-resolve vs. one-shot-then-freeze as the *default* behavior for scalar decorrelation
   in `Combine`-style use — both are worth having per the section above, but which one an operator
   gets without touching a setting is a real UX choice, not obviously either way.

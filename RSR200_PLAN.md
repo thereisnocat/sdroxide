@@ -744,6 +744,20 @@ separately and shipped each as it landed):
    and does not have either — `format.channels` is already unconditionally 2 for `HardwareDiversity`
    via the same `is_dual()` fixed above, and channel A is already the one read as output.
 
+   **The retest happened the same night.** Ralph found the disconnected antenna, reconnected it,
+   and ran a direct A/B on 820 kHz (WNYC) — sdroxide's whole-span Decorrelate against the SDR++
+   sibling's own automatic decorrelate, same technique, on the identical antennas and frequency.
+   sdroxide left far more of WNYC audible, and sounded choppier. This was a real finding, not a
+   restatement of the disconnected-antenna caveat above: reading the SDR++ implementation directly
+   found `dsp::combine::RefBand`, a component sdroxide had no equivalent of — restricting the
+   covariance solve to an operator-chosen slice of spectrum rather than the whole received span,
+   which is exactly the open question this document's sibling, `DECORRELATION_PLAN.md`, had left
+   unresolved ("whole-band solve, or an operator-selected reference sub-band?"). Built the same
+   night — see that document's own "Open questions" entry for the full account, including the new
+   synthetic regression test. **Still needs a fresh real-air retest with the reference band
+   actually pointed at WNYC** — built and synthetically verified the same night as the A/B that
+   motivated it, not yet re-run against real hardware.
+
    **A fifth real bug, found the same day, once Ralph turned VHF on and tuned to the FM broadcast
    band**: WBGO at 88.3 MHz displayed at roughly 800 kHz — real content, wildly mislabelled.
    Root cause was `src/main.rs`'s `rsr200_caps()`, pre-dating step 8 entirely: it reported the

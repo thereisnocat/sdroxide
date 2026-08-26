@@ -2587,6 +2587,51 @@ pub(in crate::app) fn settings_rsr200_tab(
             ui.end_row();
 
             if div.technique == DiversityTechnique::Decorrelate {
+                ui.label("Reference band").on_hover_text(
+                    "Restrict the solve to a slice of spectrum around a chosen frequency \
+                     instead of the whole received span. Without this, the solve nulls \
+                     whatever is loudest and most correlated across the entire span — which \
+                     may not be the specific interferer you actually want gone. Point it at \
+                     the interferer's own frequency and it targets that specifically. Read \
+                     the target frequency off the spectrum/waterfall and type it in below.",
+                );
+                if ui.checkbox(&mut div.ref_band_enabled, "Reference band").changed() {
+                    push_gain(
+                        cmds,
+                        Rsr200Config::DIV_REFBAND_ENABLED_ELEMENT,
+                        f64::from(u8::from(div.ref_band_enabled)),
+                    );
+                }
+                ui.end_row();
+
+                if div.ref_band_enabled {
+                    ui.label("Reference frequency");
+                    let mut mhz = div.ref_band_freq_hz / 1e6;
+                    if crate::chrome::field(ui, DragValue::new(&mut mhz).suffix(" MHz").speed(0.001))
+                        .changed()
+                    {
+                        div.ref_band_freq_hz = mhz * 1e6;
+                        push_gain(cmds, Rsr200Config::DIV_REFBAND_FREQ_ELEMENT, div.ref_band_freq_hz);
+                    }
+                    ui.end_row();
+
+                    ui.label("Reference width");
+                    if crate::chrome::field(
+                        ui,
+                        DragValue::new(&mut div.ref_band_width_hz)
+                            .range(100.0..=500_000.0)
+                            .suffix(" Hz")
+                            .speed(100.0),
+                    )
+                    .changed()
+                    {
+                        push_gain(cmds, Rsr200Config::DIV_REFBAND_WIDTH_ELEMENT, div.ref_band_width_hz);
+                    }
+                    ui.end_row();
+                }
+            }
+
+            if div.technique == DiversityTechnique::Decorrelate {
                 ui.label("Hardware diversity");
                 if ui
                     .button("Solve for hardware diversity")
@@ -2621,10 +2666,22 @@ pub(in crate::app) fn settings_rsr200_tab(
                      no carriers survive, only noise. Not yet root-caused. Whole-span \
                      decorrelate nulls well; use that instead until this is understood.",
                 DiversityTechnique::Decorrelate =>
-                    "Confirmed on real air: nulls well on the current frequency.",
+                    if div.ref_band_enabled {
+                        "Not yet confirmed against real hardware with a reference band — \
+                         added specifically because the unrestricted, whole-span solve left \
+                         much of a real interferer audible on real air (see below)."
+                    } else {
+                        "Whole-span, unrestricted: confirmed on real air to leave much of a \
+                         real interferer (WNYC, 820 kHz) still audible — the solve nulls \
+                         whatever is loudest and most correlated across the entire span, \
+                         which was not the interferer. The SDR++ sibling's own \
+                         reference-band-restricted solve, on the identical antennas and \
+                         frequency, nulled it completely. Turn on Reference band above and \
+                         point it at the interferer."
+                    },
                 DiversityTechnique::Adaptive =>
-                    "Not yet judged against two real antennas — only whole-span decorrelate \
-                     has been.",
+                    "Not yet judged against two genuinely independent, both-connected \
+                     antennas — only whole-span decorrelate has been.",
             })
             .color(if div.technique == DiversityTechnique::WidebandDecorrelate {
                 Color32::from_rgb(230, 90, 80)
@@ -6480,6 +6537,63 @@ pub(in crate::app) fn settings_sdrplay_tab(
                         }
                     });
                     ui.end_row();
+
+                    if div.technique == DiversityTechnique::Decorrelate {
+                        ui.label("Reference band").on_hover_text(
+                            "Restrict the solve to a slice of spectrum around a chosen \
+                             frequency instead of the whole received span. Without this, the \
+                             solve nulls whatever is loudest and most correlated across the \
+                             entire span — which may not be the specific interferer you \
+                             actually want gone. Point it at the interferer's own frequency \
+                             and it targets that specifically. Read the target frequency off \
+                             the spectrum/waterfall and type it in below.",
+                        );
+                        if ui.checkbox(&mut div.ref_band_enabled, "Reference band").changed() {
+                            push_gain(
+                                cmds,
+                                SdrPlayConfig::DIV_REFBAND_ENABLED_ELEMENT,
+                                f64::from(u8::from(div.ref_band_enabled)),
+                            );
+                        }
+                        ui.end_row();
+
+                        if div.ref_band_enabled {
+                            ui.label("Reference frequency");
+                            let mut mhz = div.ref_band_freq_hz / 1e6;
+                            if crate::chrome::field(
+                                ui,
+                                DragValue::new(&mut mhz).suffix(" MHz").speed(0.001),
+                            )
+                            .changed()
+                            {
+                                div.ref_band_freq_hz = mhz * 1e6;
+                                push_gain(
+                                    cmds,
+                                    SdrPlayConfig::DIV_REFBAND_FREQ_ELEMENT,
+                                    div.ref_band_freq_hz,
+                                );
+                            }
+                            ui.end_row();
+
+                            ui.label("Reference width");
+                            if crate::chrome::field(
+                                ui,
+                                DragValue::new(&mut div.ref_band_width_hz)
+                                    .range(100.0..=500_000.0)
+                                    .suffix(" Hz")
+                                    .speed(100.0),
+                            )
+                            .changed()
+                            {
+                                push_gain(
+                                    cmds,
+                                    SdrPlayConfig::DIV_REFBAND_WIDTH_ELEMENT,
+                                    div.ref_band_width_hz,
+                                );
+                            }
+                            ui.end_row();
+                        }
+                    }
                 },
             );
             ui.label(

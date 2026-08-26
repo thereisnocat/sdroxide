@@ -4449,6 +4449,38 @@ pub struct Rsr200Diversity {
     /// work this was ported from — a starting point to retune against this
     /// chain's own noise floor, not a constant to trust unquestioned.
     pub gate_db: f32,
+    /// Restrict [`DiversityTechnique::Decorrelate`]'s covariance solve to a
+    /// slice of spectrum around [`Self::ref_band_freq_hz`] instead of the
+    /// whole received span. Off by default, matching the technique's
+    /// original whole-span behavior. `DiversityTechnique::Adaptive`/
+    /// `WidebandDecorrelate` ignore this — the first has its own,
+    /// per-sample convergence with no equivalent restriction, and the
+    /// second already solves independently per FFT bin.
+    ///
+    /// Without this, minimising total covariance nulls whatever is loudest
+    /// and most correlated across the *whole* span — which, tuned to the
+    /// interferer itself, is the interferer, but on a wider view can just as
+    /// easily be something else entirely. Real-air finding this was built
+    /// from: sdroxide's whole-span Decorrelate left far more of a real
+    /// interferer (WNYC, 820 kHz) audible than the SDR++ sibling
+    /// implementation's own reference-band-restricted solve on the
+    /// identical antennas and frequency — ported from that implementation's
+    /// own `dsp::combine::RefBand`, whose doc comment states the case for
+    /// this plainly: "it is the thing an SDR can do that an analogue
+    /// phasing box cannot."
+    pub ref_band_enabled: bool,
+    /// Where the reference band is centred, in Hz — an absolute RF
+    /// frequency, converted to an offset from the tuned centre when the
+    /// solve runs. Read the target frequency off the spectrum/waterfall and
+    /// type it in; there is no "centre on VFO" convenience yet, since this
+    /// runs on the raw wideband IQ before any VFO/demod tuning exists to
+    /// read (see `rsr200_source.rs`'s own module doc for why).
+    pub ref_band_freq_hz: f64,
+    /// The reference band's nominal width, in Hz. 20 kHz is the SDR++
+    /// sibling's own default; narrow enough to exclude an interferer even a
+    /// few hundred kHz away, wide enough to hold a broadcast-width carrier
+    /// without needing pinpoint tuning.
+    pub ref_band_width_hz: f64,
 }
 
 impl Default for Rsr200Diversity {
@@ -4460,6 +4492,9 @@ impl Default for Rsr200Diversity {
             frozen: false,
             technique: DiversityTechnique::Adaptive,
             gate_db: 20.0,
+            ref_band_enabled: false,
+            ref_band_freq_hz: 0.0,
+            ref_band_width_hz: 20_000.0,
         }
     }
 }
@@ -4538,6 +4573,12 @@ impl Rsr200Config {
     /// [`Self::hw_div_magnitude`]/[`Self::hw_div_phase_deg`] and switch
     /// [`Self::channel_mode`] to apply them.
     pub const DIV_HW_SOLVE_ELEMENT: &'static str = "DIVHWSOLVE";
+    /// [`Rsr200Diversity::ref_band_enabled`] — 0.5 or above is on.
+    pub const DIV_REFBAND_ENABLED_ELEMENT: &'static str = "DIVREFBANDEN";
+    /// [`Rsr200Diversity::ref_band_freq_hz`] — the raw Hz value.
+    pub const DIV_REFBAND_FREQ_ELEMENT: &'static str = "DIVREFBANDFREQ";
+    /// [`Rsr200Diversity::ref_band_width_hz`] — the raw Hz value.
+    pub const DIV_REFBAND_WIDTH_ELEMENT: &'static str = "DIVREFBANDWID";
 
     /// `decimation_exp` → the divisor it selects (`2^(exp+1)`), matching
     /// `sdroxide_rsr200::protocol::decimation_rate` without this crate
@@ -5158,6 +5199,18 @@ pub struct SdrPlayDiversity {
     /// work this was ported from — a starting point to retune against this
     /// chain's own noise floor, not a constant to trust unquestioned.
     pub gate_db: f32,
+    /// Restrict [`DiversityTechnique::Decorrelate`]'s covariance solve to a
+    /// slice of spectrum around [`Self::ref_band_freq_hz`] instead of the
+    /// whole received span — see [`Rsr200Diversity::ref_band_enabled`]'s own
+    /// doc for the full case and where it came from. Off by default.
+    pub ref_band_enabled: bool,
+    /// Where the reference band is centred, in Hz — an absolute RF
+    /// frequency, converted to an offset from the tuned centre when the
+    /// solve runs.
+    pub ref_band_freq_hz: f64,
+    /// The reference band's nominal width, in Hz. 20 kHz is the SDR++
+    /// sibling's own default.
+    pub ref_band_width_hz: f64,
 }
 
 impl Default for SdrPlayDiversity {
@@ -5172,6 +5225,9 @@ impl Default for SdrPlayDiversity {
             taps: 8,
             rate: 0.7,
             frozen: false,
+            ref_band_enabled: false,
+            ref_band_freq_hz: 0.0,
+            ref_band_width_hz: 20_000.0,
             technique: DiversityTechnique::Adaptive,
             gate_db: 20.0,
         }
@@ -5282,6 +5338,12 @@ impl SdrPlayConfig {
     pub const DIV_RESET_ELEMENT: &'static str = "DIVRESET";
     pub const DIV_TECHNIQUE_ELEMENT: &'static str = "DIVTECH";
     pub const DIV_GATE_ELEMENT: &'static str = "DIVGATE";
+    /// [`SdrPlayDiversity::ref_band_enabled`] — 0.5 or above is on.
+    pub const DIV_REFBAND_ENABLED_ELEMENT: &'static str = "DIVREFBANDEN";
+    /// [`SdrPlayDiversity::ref_band_freq_hz`] — the raw Hz value.
+    pub const DIV_REFBAND_FREQ_ELEMENT: &'static str = "DIVREFBANDFREQ";
+    /// [`SdrPlayDiversity::ref_band_width_hz`] — the raw Hz value.
+    pub const DIV_REFBAND_WIDTH_ELEMENT: &'static str = "DIVREFBANDWID";
 
     /// IF gain reduction limits, in dB, from the API (`NORMAL_MIN_GR` and
     /// `MAX_BB_GR`).

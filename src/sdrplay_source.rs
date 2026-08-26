@@ -186,6 +186,10 @@ impl SdrPlaySource {
                 d.set_frozen(self.div_cfg.frozen);
                 self.diversity = Some(d);
                 self.wideband = None;
+                // See `Self::refresh_ref_band`'s own doc: harmless when the
+                // technique is Adaptive (unused there), and needs `self.diversity`
+                // to already be `Some`, which it now is.
+                self.refresh_ref_band();
             }
             DiversityTechnique::WidebandDecorrelate => {
                 let mut wb = WidebandDecorrelator::new(
@@ -199,6 +203,23 @@ impl SdrPlaySource {
                 self.wideband = Some(wb);
                 self.diversity = None;
             }
+        }
+    }
+
+    /// Push [`Self::div_cfg`]'s current reference-band settings into the live
+    /// combiner — a pure parameter update, not a rebuild: `decorr_k0`/
+    /// `decorr_k1` (whatever is currently solved or frozen) survive it. A
+    /// no-op when the active technique isn't [`DiversityTechnique::Decorrelate`]
+    /// — see `Rsr200Diversity::ref_band_enabled`'s own doc, the field this
+    /// mirrors, for the full case.
+    fn refresh_ref_band(&mut self) {
+        if let Some(d) = self.diversity.as_mut() {
+            d.set_ref_band(
+                self.div_cfg.ref_band_enabled,
+                self.handle.out_rate_hz(),
+                self.div_cfg.ref_band_freq_hz - self.center,
+                self.div_cfg.ref_band_width_hz,
+            );
         }
     }
 
@@ -526,6 +547,18 @@ impl IqSource for SdrPlaySource {
                 if let Some(wb) = self.wideband.as_mut() {
                     wb.set_gate_db(self.div_cfg.gate_db);
                 }
+            }
+            SdrPlayConfig::DIV_REFBAND_ENABLED_ELEMENT => {
+                self.div_cfg.ref_band_enabled = db >= 0.5;
+                self.refresh_ref_band();
+            }
+            SdrPlayConfig::DIV_REFBAND_FREQ_ELEMENT => {
+                self.div_cfg.ref_band_freq_hz = db;
+                self.refresh_ref_band();
+            }
+            SdrPlayConfig::DIV_REFBAND_WIDTH_ELEMENT => {
+                self.div_cfg.ref_band_width_hz = db.max(1.0);
+                self.refresh_ref_band();
             }
             _ => {}
         }

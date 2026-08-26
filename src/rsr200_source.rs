@@ -261,6 +261,10 @@ impl Rsr200Source {
                 d.set_frozen(self.div_cfg.frozen);
                 self.diversity = Some(d);
                 self.wideband = None;
+                // See `Self::refresh_ref_band`'s own doc: harmless when the
+                // technique is Adaptive (unused there), and needs `self.diversity`
+                // to already be `Some`, which it now is.
+                self.refresh_ref_band();
             }
             DiversityTechnique::WidebandDecorrelate => {
                 let mut wb = WidebandDecorrelator::new(
@@ -274,6 +278,26 @@ impl Rsr200Source {
                 self.wideband = Some(wb);
                 self.diversity = None;
             }
+        }
+    }
+
+    /// Push [`Self::div_cfg`]'s current reference-band settings into the live
+    /// combiner — a pure parameter update, like [`Rsr200Config::DIV_GATE_ELEMENT`]'s
+    /// own handler, not a rebuild: `decorr_k0`/`decorr_k1` (whatever is
+    /// currently solved or frozen) survive it. A no-op when the active
+    /// technique isn't [`DiversityTechnique::Decorrelate`] (`self.diversity`
+    /// is `None` for `WidebandDecorrelate`, and `set_ref_band` on an
+    /// `Adaptive`-algorithm `Diversity` is harmless but unused — see
+    /// [`Rsr200Diversity::ref_band_enabled`]'s own doc for why it applies to
+    /// neither).
+    fn refresh_ref_band(&mut self) {
+        if let Some(d) = self.diversity.as_mut() {
+            d.set_ref_band(
+                self.div_cfg.ref_band_enabled,
+                self.handle.sample_rate_hz,
+                self.div_cfg.ref_band_freq_hz - self.center,
+                self.div_cfg.ref_band_width_hz,
+            );
         }
     }
 
@@ -600,6 +624,18 @@ impl IqSource for Rsr200Source {
                 }
             }
             Rsr200Config::DIV_HW_SOLVE_ELEMENT if db >= 0.5 => self.log_hardware_diversity_solve(),
+            Rsr200Config::DIV_REFBAND_ENABLED_ELEMENT => {
+                self.div_cfg.ref_band_enabled = db >= 0.5;
+                self.refresh_ref_band();
+            }
+            Rsr200Config::DIV_REFBAND_FREQ_ELEMENT => {
+                self.div_cfg.ref_band_freq_hz = db;
+                self.refresh_ref_band();
+            }
+            Rsr200Config::DIV_REFBAND_WIDTH_ELEMENT => {
+                self.div_cfg.ref_band_width_hz = db.max(1.0);
+                self.refresh_ref_band();
+            }
             _ => {}
         }
         Ok(())

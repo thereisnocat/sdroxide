@@ -259,6 +259,157 @@ const WNORM_INTERVAL: usize = 256;
 /// Only the reported depth depends on this, not the filter.
 const POWER_DECAY: f32 = 0.9;
 
+/// Accumulates the correlations [`Diversity::process_decorrelate`] needs —
+/// `Σ main·conj(aux)`, `Σ|aux|²`, `Σ|main|²` — optionally restricted to a
+/// slice of spectrum rather than the whole received span. Ported from the
+/// SDR++ sibling implementation's own `dsp::combine::RefBand`
+/// (`core/src/dsp/combine/ref_band.h`), which is where this whole idea comes
+/// from — its own comment is worth keeping verbatim as the reason it exists:
+///
+/// > Minimising total output power nulls whatever is loudest, which when the
+/// > DX peaks is the DX. Pointing the adaptation at a stretch of spectrum
+/// > containing only the interferer... lets the weight be solved from the
+/// > pest alone and then applied to the whole band. It is the thing an SDR
+/// > can do that an analogue phasing box cannot.
+///
+/// Real-air evidence this matters, not just theory: whole-span
+/// `covariance_eigen` (no restriction) left far more of a real interferer
+/// (WNYC, 820 kHz) audible than the SDR++ sibling's own reference-band-
+/// restricted solve on the identical antennas and frequency — see the
+/// commit that added this struct.
+///
+/// The restriction is two cascaded boxcar decimators, not a designed filter
+/// — matching the original's own reasoning: a sharp filter at these ratios
+/// would need hundreds of taps at the full sample rate, while a two-stage
+/// cascade costs about one add per sample and gives a triangular response
+/// with roughly −26 dB sidelobes, ample for weighting the correlation toward
+/// a chosen part of the spectrum. This is not a channel filter — nearby
+/// strong signals still pull on the estimate somewhat.
+///
+/// Both channels are mixed by the *same* rotation and decimated by the
+/// *same* cascade, so their relative phase — the entire quantity being
+/// measured — survives untouched.
+struct RefBand {
+    sample_rate_hz: f64,
+    rot: num_complex::Complex64,
+    rot_step: num_complex::Complex64,
+    acc1a: num_complex::Complex64,
+    acc1b: num_complex::Complex64,
+    acc2a: num_complex::Complex64,
+    acc2b: num_complex::Complex64,
+    len1: usize,
+    len2: usize,
+    n1: usize,
+    n2: usize,
+}
+
+impl Default for RefBand {
+    fn default() -> Self {
+        RefBand {
+            sample_rate_hz: 1.0,
+            rot: num_complex::Complex64::new(1.0, 0.0),
+            rot_step: num_complex::Complex64::new(1.0, 0.0),
+            acc1a: num_complex::Complex64::new(0.0, 0.0),
+            acc1b: num_complex::Complex64::new(0.0, 0.0),
+            acc2a: num_complex::Complex64::new(0.0, 0.0),
+            acc2b: num_complex::Complex64::new(0.0, 0.0),
+            len1: 1,
+            len2: 1,
+            n1: 0,
+            n2: 0,
+        }
+    }
+}
+
+impl RefBand {
+    /// `offset_hz` is where the reference band sits relative to the centre
+    /// of whatever `main`/`aux` are baseband IQ around (positive = above
+    /// centre); `width_hz` is its nominal width — the cascade's decimation
+    /// is chosen so the first null of its response sits at
+    /// `sample_rate_hz / D`, i.e. `D ≈ sample_rate_hz / width_hz`.
+    fn configure(&mut self, sample_rate_hz: f64, offset_hz: f64, width_hz: f64) {
+        self.sample_rate_hz = sample_rate_hz;
+        let inc = -2.0 * std::f64::consts::PI * offset_hz / sample_rate_hz.max(1.0);
+        self.rot_step = num_complex::Complex64::from_polar(1.0, inc);
+
+        let w = width_hz.max(1.0);
+        let d = (sample_rate_hz / w).round().clamp(1.0, 65536.0) as usize;
+        self.len1 = d.min(32);
+        self.len2 = (d / self.len1.max(1)).max(1);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.rot = num_complex::Complex64::new(1.0, 0.0);
+        self.acc1a = num_complex::Complex64::new(0.0, 0.0);
+        self.acc1b = num_complex::Complex64::new(0.0, 0.0);
+        self.acc2a = num_complex::Complex64::new(0.0, 0.0);
+        self.acc2b = num_complex::Complex64::new(0.0, 0.0);
+        self.n1 = 0;
+        self.n2 = 0;
+    }
+
+    /// Correlation restricted to the configured band, added into
+    /// `raa`/`rbb`/`rab`. State persists across calls so the decimator does
+    /// not restart mid-stream; returns how many decimated terms this call
+    /// contributed, so a caller normalising by term count (as
+    /// [`covariance_eigen`] wants) knows the true denominator — a narrow
+    /// band yields far fewer terms than samples fed in, and a block shorter
+    /// than the cascade's own period can legitimately contribute zero.
+    fn accumulate(
+        &mut self,
+        main: &[Complex32],
+        aux: &[Complex32],
+        raa: &mut f64,
+        rbb: &mut f64,
+        rab: &mut num_complex::Complex64,
+    ) -> usize {
+        let mut terms = 0;
+        for (a, b) in main.iter().zip(aux.iter()) {
+            // One rotation, applied to both channels, so the relative phase
+            // survives.
+            let av = num_complex::Complex64::new(f64::from(a.re), f64::from(a.im)) * self.rot;
+            let bv = num_complex::Complex64::new(f64::from(b.re), f64::from(b.im)) * self.rot;
+            self.rot *= self.rot_step;
+
+            self.acc1a += av;
+            self.acc1b += bv;
+            self.n1 += 1;
+            if self.n1 < self.len1 {
+                continue;
+            }
+            let y1a = self.acc1a / self.len1 as f64;
+            let y1b = self.acc1b / self.len1 as f64;
+            self.acc1a = num_complex::Complex64::new(0.0, 0.0);
+            self.acc1b = num_complex::Complex64::new(0.0, 0.0);
+            self.n1 = 0;
+
+            self.acc2a += y1a;
+            self.acc2b += y1b;
+            self.n2 += 1;
+            if self.n2 < self.len2 {
+                continue;
+            }
+            let y2a = self.acc2a / self.len2 as f64;
+            let y2b = self.acc2b / self.len2 as f64;
+            self.acc2a = num_complex::Complex64::new(0.0, 0.0);
+            self.acc2b = num_complex::Complex64::new(0.0, 0.0);
+            self.n2 = 0;
+
+            *rab += y2a * y2b.conj();
+            *rbb += y2b.norm_sqr();
+            *raa += y2a.norm_sqr();
+            terms += 1;
+        }
+        // Keep the mixer on the unit circle.
+        let m = self.rot.norm();
+        if m > 0.0 {
+            self.rot /= m;
+        }
+        terms
+    }
+}
+
 pub struct Diversity {
     mode: DiversityMode,
     algorithm: DiversityAlgorithm,
@@ -284,6 +435,13 @@ pub struct Diversity {
     decorr_k1: Complex32,
     /// Distinguishes "never solved yet" from a genuinely all-zero weight.
     decorr_solved: bool,
+    /// Restricts [`Self::process_decorrelate`]'s covariance measurement to a
+    /// chosen slice of spectrum instead of the whole received span — see
+    /// [`RefBand`]'s own doc for why this exists. Always present, only
+    /// consulted when [`Self::ref_enabled`] is set — matching the SDR++
+    /// sibling's own "always construct it, gate it with a flag" shape.
+    ref_band: RefBand,
+    ref_enabled: bool,
 }
 
 impl Diversity {
@@ -306,6 +464,23 @@ impl Diversity {
             decorr_k0: Complex32::new(0.0, 0.0),
             decorr_k1: Complex32::new(0.0, 0.0),
             decorr_solved: false,
+            ref_band: RefBand::default(),
+            ref_enabled: false,
+        }
+    }
+
+    /// Restrict [`DiversityAlgorithm::Decorrelate`]'s covariance solve to a
+    /// slice of spectrum — see [`RefBand`]'s own doc for the mechanism and
+    /// why it matters. `offset_hz` is where the reference band sits relative
+    /// to the centre of the IQ [`Self::process`] receives (positive = above
+    /// centre); `width_hz` is its nominal width. Disabling reverts to the
+    /// original whole-span measurement; re-enabling (or changing the
+    /// offset/width while enabled) resets the internal decimator, since its
+    /// state has no meaning across a configuration change.
+    pub fn set_ref_band(&mut self, enabled: bool, sample_rate_hz: f64, offset_hz: f64, width_hz: f64) {
+        self.ref_enabled = enabled;
+        if enabled {
+            self.ref_band.configure(sample_rate_hz, offset_hz, width_hz);
         }
     }
 
@@ -534,37 +709,57 @@ impl Diversity {
         }
 
         if !self.frozen {
-            let mut raa = 0.0f32;
-            let mut rbb = 0.0f32;
-            let mut rab = Complex32::new(0.0, 0.0);
-            for i in 0..n {
-                raa += main[i].norm_sqr();
-                rbb += aux[i].norm_sqr();
-                rab += main[i] * aux[i].conj();
-            }
-            let inv = 1.0 / n as f32;
-            let (null, combine) = covariance_eigen(raa * inv, rbb * inv, rab * inv);
-            match self.mode {
-                DiversityMode::Cancel => {
-                    // The raw null eigenvector is jointly unit-norm across
-                    // *both* channels, so applied directly it scales `main`
-                    // itself by less than one -- unlike the adaptive filter's
-                    // `main - W*aux`, which leaves a signal `aux` cannot hear
-                    // untouched by construction. Rescaling to unity gain on
-                    // `main` restores that guarantee -- see `cancel_weight`.
-                    let (k0, k1) = cancel_weight(null);
-                    self.decorr_k0 = k0;
-                    self.decorr_k1 = k1;
+            let (raa, rbb, rab, terms) = if self.ref_enabled {
+                let mut raa = 0.0f64;
+                let mut rbb = 0.0f64;
+                let mut rab = num_complex::Complex64::new(0.0, 0.0);
+                let terms = self.ref_band.accumulate(&main[..n], &aux[..n], &mut raa, &mut rbb, &mut rab);
+                (raa, rbb, rab, terms)
+            } else {
+                let mut raa = 0.0f64;
+                let mut rbb = 0.0f64;
+                let mut rab = num_complex::Complex64::new(0.0, 0.0);
+                for i in 0..n {
+                    raa += f64::from(main[i].norm_sqr());
+                    rbb += f64::from(aux[i].norm_sqr());
+                    rab += num_complex::Complex64::new(f64::from(main[i].re), f64::from(main[i].im))
+                        * num_complex::Complex64::new(f64::from(aux[i].re), -f64::from(aux[i].im));
                 }
-                // Combining has no such expectation -- both branches are
-                // meant to be weighted by quality, `main` included -- so the
-                // raw maximal-ratio eigenvector is applied as solved.
-                DiversityMode::Combine => {
-                    self.decorr_k0 = combine.k0;
-                    self.decorr_k1 = combine.k1;
+                (raa, rbb, rab, n)
+            };
+            // A block shorter than the reference band's own decimator period
+            // legitimately produces zero terms -- nothing to solve from yet,
+            // not a reason to solve on all-zero and null the whole signal.
+            // Skipping leaves whatever was last solved (or nothing, if this
+            // is the first block) exactly as `frozen` already does.
+            if terms > 0 {
+                let inv = 1.0 / terms as f64;
+                let raa = (raa * inv) as f32;
+                let rbb = (rbb * inv) as f32;
+                let rab = Complex32::new((rab.re * inv) as f32, (rab.im * inv) as f32);
+                let (null, combine) = covariance_eigen(raa, rbb, rab);
+                match self.mode {
+                    DiversityMode::Cancel => {
+                        // The raw null eigenvector is jointly unit-norm across
+                        // *both* channels, so applied directly it scales `main`
+                        // itself by less than one -- unlike the adaptive filter's
+                        // `main - W*aux`, which leaves a signal `aux` cannot hear
+                        // untouched by construction. Rescaling to unity gain on
+                        // `main` restores that guarantee -- see `cancel_weight`.
+                        let (k0, k1) = cancel_weight(null);
+                        self.decorr_k0 = k0;
+                        self.decorr_k1 = k1;
+                    }
+                    // Combining has no such expectation -- both branches are
+                    // meant to be weighted by quality, `main` included -- so the
+                    // raw maximal-ratio eigenvector is applied as solved.
+                    DiversityMode::Combine => {
+                        self.decorr_k0 = combine.k0;
+                        self.decorr_k1 = combine.k1;
+                    }
                 }
+                self.decorr_solved = true;
             }
-            self.decorr_solved = true;
         }
 
         let mut in_acc = 0.0f32;
@@ -601,6 +796,30 @@ mod tests {
         x.iter().map(|s| s.norm_sqr()).sum::<f32>() / x.len() as f32
     }
 
+    /// A pure complex exponential at `freq_hz`, sampled at `sample_rate_hz` —
+    /// a synthetic "one carrier, one frequency" signal to correlate against.
+    fn tone(n: usize, freq_hz: f64, sample_rate_hz: f64) -> Vec<Complex32> {
+        let inc = 2.0 * std::f64::consts::PI * freq_hz / sample_rate_hz;
+        (0..n)
+            .map(|i| {
+                let (s, c) = (inc * i as f64).sin_cos();
+                Complex32::new(c as f32, s as f32)
+            })
+            .collect()
+    }
+
+    /// How much of `reference` (a known pure tone) is present in `signal`, in
+    /// amplitude — a matched-filter correlation, which isolates one tone's
+    /// own contribution even when `signal` also carries other, sufficiently
+    /// far-apart frequencies (their own correlation against `reference`
+    /// averages toward zero over enough samples).
+    fn tone_amplitude(signal: &[Complex32], reference: &[Complex32]) -> f32 {
+        let n = signal.len().min(reference.len());
+        let sum: Complex32 =
+            signal[..n].iter().zip(&reference[..n]).map(|(&s, &r)| s * r.conj()).sum();
+        (sum / n as f32).norm()
+    }
+
     /// The case the mode exists for: one noise source reaching two aerials
     /// through different paths — a complex gain *and* a delay, which is what a
     /// single-weight canceller cannot follow across a span.
@@ -627,6 +846,69 @@ mod tests {
         let before: Vec<Complex32> = (n - 20_000..n).map(|i| qrm[i - delay] * h).collect();
         let depth = 10.0 * (power(&before) / power(tail)).log10();
         assert!(depth > 30.0, "only {depth:.1} dB of the noise source was removed");
+    }
+
+    /// The real-air case a reference band exists for, reproduced
+    /// synthetically: two interferers reach both aerials, at different
+    /// frequencies with different gain/phase relationships, and one is far
+    /// stronger than the other. A whole-span [`DiversityAlgorithm::Decorrelate`]
+    /// solve is dominated by whichever one contributes more covariance —
+    /// the strong one — and does a mediocre job on the weak one, whatever it
+    /// actually is. Restricting the solve to a band around the weak one
+    /// (`RefBand`) targets it specifically and nulls it properly, regardless
+    /// of what the strong one is doing elsewhere in the span. This is the
+    /// synthetic version of what real air showed on 820 kHz the day this was
+    /// added: sdroxide's whole-span Decorrelate left far more of a real
+    /// interferer audible than the SDR++ sibling implementation's own
+    /// reference-band-restricted solve on the identical antennas and
+    /// frequency.
+    #[test]
+    fn a_reference_band_nulls_the_weak_interferer_the_whole_span_solve_misses() {
+        let n = 40_000;
+        let sr = 1_000_000.0;
+        // Strong: 200 kHz, unity amplitude, gain (1.0 ∠ 0.3 rad) to aux.
+        let strong = tone(n, 200_000.0, sr);
+        let g_strong = Complex32::from_polar(1.0, 0.3);
+        // Weak: -350 kHz, 5% the amplitude, a *different* gain/phase to aux --
+        // a single compromise weight fit to the strong one does not also fit
+        // this one.
+        let weak = tone(n, -350_000.0, sr);
+        let weak_amp = 0.05;
+        let g_weak = Complex32::from_polar(1.0, -1.2);
+
+        let build_main = || -> Vec<Complex32> {
+            strong.iter().zip(&weak).map(|(&s, &w)| s + w * weak_amp).collect()
+        };
+        let build_aux = || -> Vec<Complex32> {
+            strong.iter().zip(&weak).map(|(&s, &w)| s * g_strong + w * weak_amp * g_weak).collect()
+        };
+
+        let weak_before = tone_amplitude(&build_main(), &weak);
+        assert!((weak_before - weak_amp).abs() < 0.005, "sanity: {weak_before} vs {weak_amp}");
+
+        let mut whole_span_out = build_main();
+        let mut d_whole = Diversity::new(DiversityMode::Cancel, 1, 0.8);
+        d_whole.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d_whole.process(&mut whole_span_out, &build_aux());
+        let weak_after_whole = tone_amplitude(&whole_span_out, &weak);
+
+        let mut ref_band_out = build_main();
+        let mut d_ref = Diversity::new(DiversityMode::Cancel, 1, 0.8);
+        d_ref.set_algorithm(DiversityAlgorithm::Decorrelate);
+        // 50 kHz wide, centred on the weak interferer -- the strong one at
+        // +200 kHz is 550 kHz away, well outside this band's rolloff.
+        d_ref.set_ref_band(true, sr, -350_000.0, 50_000.0);
+        d_ref.process(&mut ref_band_out, &build_aux());
+        let weak_after_ref = tone_amplitude(&ref_band_out, &weak);
+
+        let depth_whole = 20.0 * (weak_amp / weak_after_whole).log10();
+        let depth_ref = 20.0 * (weak_amp / weak_after_ref).log10();
+        assert!(
+            depth_ref > depth_whole + 15.0,
+            "reference band ({depth_ref:.1} dB) should null the weak interferer much deeper \
+             than the whole-span solve ({depth_whole:.1} dB), not comparably"
+        );
+        assert!(depth_ref > 25.0, "reference band only nulled the weak interferer {depth_ref:.1} dB");
     }
 
     /// And the wanted signal survives it, as long as the auxiliary aerial

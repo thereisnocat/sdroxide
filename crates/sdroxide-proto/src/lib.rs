@@ -706,7 +706,24 @@ use sdroxide_types::{
 /// "confirmed on air" meant for every earlier diversity test, which is why
 /// they're recorded here alongside the version that actually shipped the
 /// fix.
-pub const PROTO_VERSION: u16 = 96;
+///
+/// **97** — both [`sdroxide_types::Rsr200Diversity`] and
+/// [`sdroxide_types::SdrPlayDiversity`] gain `ref_band_enabled` (`bool`),
+/// `ref_band_freq_hz`/`ref_band_width_hz` (`f64`), appended at the tail of
+/// each for the same positional reason as every field above them — a
+/// reference-band restriction for `DiversityTechnique::Decorrelate`'s
+/// covariance solve, ported from the SDR++ sibling implementation's own
+/// `dsp::combine::RefBand`. Motivated by a real-air A/B the same day: on
+/// identical antennas and frequency (820 kHz, WNYC), sdroxide's whole-span
+/// Decorrelate left far more of the interferer audible than the SDR++
+/// sibling's own reference-band-restricted solve — the whole-span solve
+/// nulls whatever is loudest and most correlated across the *entire*
+/// received span, which is not necessarily the specific signal the operator
+/// is pointed at. Restricting the covariance measurement to a chosen slice
+/// of spectrum fixes that; `sdroxide-dsp`'s own new
+/// `a_reference_band_nulls_the_weak_interferer_the_whole_span_solve_misses`
+/// test reproduces the failure and the fix synthetically.
+pub const PROTO_VERSION: u16 = 97;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1611,6 +1628,9 @@ mod tests {
                     frozen: true,
                     technique: sdroxide_types::DiversityTechnique::WidebandDecorrelate,
                     gate_db: 14.5,
+                    ref_band_enabled: true,
+                    ref_band_freq_hz: 820_000.0,
+                    ref_band_width_hz: 12_000.0,
                 },
                 ..sdroxide_types::SdrPlayConfig::default()
             },
@@ -1691,6 +1711,9 @@ mod tests {
                     frozen: true,
                     technique: sdroxide_types::DiversityTechnique::Decorrelate,
                     gate_db: 35.0,
+                    ref_band_enabled: true,
+                    ref_band_freq_hz: 820_000.0,
+                    ref_band_width_hz: 15_000.0,
                 },
                 bits24: true,
                 hw_div_magnitude: 2.5,

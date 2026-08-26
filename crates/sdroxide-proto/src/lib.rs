@@ -723,7 +723,22 @@ use sdroxide_types::{
 /// of spectrum fixes that; `sdroxide-dsp`'s own new
 /// `a_reference_band_nulls_the_weak_interferer_the_whole_span_solve_misses`
 /// test reproduces the failure and the fix synthetically.
-pub const PROTO_VERSION: u16 = 97;
+///
+/// **98** — both `Rsr200Diversity` and `SdrPlayDiversity` **lose**
+/// `ref_band_freq_hz`, the one v97 added — a genuine field removal, not
+/// just an append, which this crate's own positional-wire discipline
+/// otherwise never does. Safe here specifically because v97 was never
+/// released or pushed anywhere; nothing outside this same night's local,
+/// unpushed commits ever had the field, so there is no compatibility to
+/// preserve. Reference band's centre is no longer a typed-in frequency at
+/// all: it now tracks the operator's VFO live
+/// (`sdroxide_radio::source::IqSource::set_vfo_hz`, polled every tick by
+/// `sdroxide_radio::engine`'s own `poll_ref_band_vfo`), the same way SDR++'s
+/// own equivalent control does. Motivated directly by Ralph's own use of
+/// the v97 field the same night: "I will never want to decorrelate against
+/// a different frequency than the one I'm tuned to. The reference frequency
+/// adds needless friction."
+pub const PROTO_VERSION: u16 = 98;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1629,7 +1644,6 @@ mod tests {
                     technique: sdroxide_types::DiversityTechnique::WidebandDecorrelate,
                     gate_db: 14.5,
                     ref_band_enabled: true,
-                    ref_band_freq_hz: 820_000.0,
                     ref_band_width_hz: 12_000.0,
                 },
                 ..sdroxide_types::SdrPlayConfig::default()
@@ -1712,7 +1726,6 @@ mod tests {
                     technique: sdroxide_types::DiversityTechnique::Decorrelate,
                     gate_db: 35.0,
                     ref_band_enabled: true,
-                    ref_band_freq_hz: 820_000.0,
                     ref_band_width_hz: 15_000.0,
                 },
                 bits24: true,

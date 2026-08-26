@@ -116,6 +116,16 @@ pub trait IqSource: Send {
     fn center_hz(&self) -> f64;
     fn set_center_hz(&mut self, hz: f64) -> Result<()>;
 
+    /// Where the operator is currently listening — called by
+    /// [`crate::engine`]'s own `poll_ref_band_vfo` every tick the VFO has
+    /// moved. For a front end whose `Diversity` combiner runs on raw
+    /// wideband IQ, from before any VFO/demod tuning exists to read (the
+    /// RSR200, the SDRplay RSPduo), this is the only way a reference-band
+    /// solve can track the dial live instead of needing a separately typed
+    /// frequency. Default: a no-op, right for every source that has no such
+    /// use for it.
+    fn set_vfo_hz(&mut self, _hz: f64) {}
+
     /// How far above the operator's VFO this front end wants its LO parked, or
     /// `0.0` to tune the LO straight to the VFO.
     ///

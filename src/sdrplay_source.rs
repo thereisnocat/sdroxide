@@ -44,6 +44,11 @@ const WB_AVG_TC_SECS: f32 = 0.5;
 pub struct SdrPlaySource {
     handle: SdrPlayHandle,
     center: f64,
+    /// Where the operator is actually listening, pushed live by
+    /// `sdroxide_radio::engine`'s own `poll_ref_band_vfo` (see
+    /// `IqSource::set_vfo_hz`) — what `Self::refresh_ref_band` centres the
+    /// reference band on. Starts equal to `center`.
+    vfo_hz: f64,
     rx_scratch: Vec<f32>,
     label: String,
     lo_offset: f64,
@@ -118,6 +123,7 @@ impl SdrPlaySource {
         );
         let mut src = SdrPlaySource {
             center: center_hz,
+            vfo_hz: center_hz,
             rx_scratch: Vec::new(),
             label,
             lo_offset,
@@ -217,7 +223,7 @@ impl SdrPlaySource {
             d.set_ref_band(
                 self.div_cfg.ref_band_enabled,
                 self.handle.out_rate_hz(),
-                self.div_cfg.ref_band_freq_hz - self.center,
+                self.vfo_hz - self.center,
                 self.div_cfg.ref_band_width_hz,
             );
         }
@@ -332,6 +338,14 @@ impl IqSource for SdrPlaySource {
         self.center = hz;
         self.handle.set_center_hz(hz);
         Ok(())
+    }
+
+    /// Keeps [`Self::refresh_ref_band`]'s own offset current with wherever
+    /// the operator is actually listening — see `IqSource::set_vfo_hz`'s
+    /// own doc for why this exists at all.
+    fn set_vfo_hz(&mut self, hz: f64) {
+        self.vfo_hz = hz;
+        self.refresh_ref_band();
     }
 
     fn lo_offset_hz(&self) -> f64 {
@@ -557,10 +571,6 @@ impl IqSource for SdrPlaySource {
             }
             SdrPlayConfig::DIV_REFBAND_ENABLED_ELEMENT => {
                 self.div_cfg.ref_band_enabled = db >= 0.5;
-                self.refresh_ref_band();
-            }
-            SdrPlayConfig::DIV_REFBAND_FREQ_ELEMENT => {
-                self.div_cfg.ref_band_freq_hz = db;
                 self.refresh_ref_band();
             }
             SdrPlayConfig::DIV_REFBAND_WIDTH_ELEMENT => {

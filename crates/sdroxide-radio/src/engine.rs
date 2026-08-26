@@ -1921,6 +1921,11 @@ struct Engine {
     /// caught up with. See [`EngineConfig::store_sync`].
     store_sync: Option<Arc<crate::StoreSync>>,
     shared_gen_seen: u64,
+    /// The VFO frequency [`Self::poll_ref_band_vfo`] last pushed to
+    /// [`IqSource::set_vfo_hz`] — `None` before the first tick, so a source
+    /// whose combiner wants to track the VFO (a reference-band solve, say)
+    /// gets told where it is even if the operator never retunes at all.
+    last_vfo_pushed_hz: Option<f64>,
 }
 
 /// Target width of the CW skimmer window (Hz); the Ddc snaps to the nearest
@@ -2368,6 +2373,7 @@ fn engine_thread(
         cw_gate_until: None,
         shared_gen_seen: engine_cfg.store_sync.as_ref().map_or(0, |s| s.generation()),
         store_sync: engine_cfg.store_sync,
+        last_vfo_pushed_hz: None,
     };
     // After the struct, not before: the preference has to be applied through
     // the same path a reconnect uses, so both land on the same port.
@@ -2557,6 +2563,9 @@ fn engine_thread(
         // Attach (or re-attach) the configured radio on its own when the
         // front-end is only a stand-in — no trip through Settings.
         engine.poll_reconnect();
+        // Keep a source whose combiner tracks the VFO live (see
+        // `IqSource::set_vfo_hz`) in sync with wherever the dial actually is.
+        engine.poll_ref_band_vfo();
 
         if engine.tx_active {
             // Blocking TX write paces this loop at ~10 ms per block.
@@ -8408,6 +8417,28 @@ impl Engine {
                 self.retry_every = (self.retry_every * 2).min(RETRY_MAX);
                 self.retry_at = Some(now + self.retry_every);
             }
+        }
+    }
+
+    /// Keeps a front end whose own combiner wants to track the VFO live —
+    /// [`IqSource::set_vfo_hz`], a reference-band decorrelate solve
+    /// restricted to wherever the operator is actually listening, rather
+    /// than a separately typed-in frequency (real friction the RSR200's own
+    /// reference band had at first: "I will never want to decorrelate
+    /// against a different frequency than the one I'm tuned to").
+    ///
+    /// Polled every tick, like the engine's other `poll_*` checks, rather
+    /// than called from each of the dozen places `vfo_a_hz`/`vfo_b_hz` can
+    /// change — one call site that is always right, instead of one more
+    /// thing every future VFO-moving code path would have to remember.
+    /// `rx_freq_hz()`, not `active_freq_hz()`, because RIT shifts what is
+    /// actually being demodulated and a reference band should follow that,
+    /// not the dial underneath it.
+    fn poll_ref_band_vfo(&mut self) {
+        let hz = self.state.rx_freq_hz();
+        if self.last_vfo_pushed_hz != Some(hz) {
+            self.source.set_vfo_hz(hz);
+            self.last_vfo_pushed_hz = Some(hz);
         }
     }
 

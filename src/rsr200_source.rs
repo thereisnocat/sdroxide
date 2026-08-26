@@ -127,6 +127,12 @@ const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 pub struct Rsr200Source {
     handle: Rsr200Handle,
     center: f64,
+    /// Where the operator is actually listening, pushed live by
+    /// `sdroxide_radio::engine`'s own `poll_ref_band_vfo` (see
+    /// `IqSource::set_vfo_hz`) — what `Self::refresh_ref_band` centres the
+    /// reference band on. Starts equal to `center` (a reasonable guess
+    /// before the engine's first tick actually reports it).
+    vfo_hz: f64,
     rx_scratch: Vec<f32>,
     label: String,
     /// Mirrors of the settings the panel drives live, so `current_gains`
@@ -197,6 +203,7 @@ impl Rsr200Source {
         );
         let mut src = Rsr200Source {
             center: center_hz,
+            vfo_hz: center_hz,
             rx_scratch: Vec::new(),
             label,
             attenuator1: cfg.attenuator1,
@@ -295,7 +302,7 @@ impl Rsr200Source {
             d.set_ref_band(
                 self.div_cfg.ref_band_enabled,
                 self.handle.sample_rate_hz,
-                self.div_cfg.ref_band_freq_hz - self.center,
+                self.vfo_hz - self.center,
                 self.div_cfg.ref_band_width_hz,
             );
         }
@@ -474,6 +481,14 @@ impl IqSource for Rsr200Source {
         Ok(())
     }
 
+    /// Keeps [`Self::refresh_ref_band`]'s own offset current with wherever
+    /// the operator is actually listening — see `IqSource::set_vfo_hz`'s
+    /// own doc for why this exists at all.
+    fn set_vfo_hz(&mut self, hz: f64) {
+        self.vfo_hz = hz;
+        self.refresh_ref_band();
+    }
+
     /// One block from the receiver — and, in Separate mode, the second ADC
     /// combined with the first.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -633,10 +648,6 @@ impl IqSource for Rsr200Source {
             Rsr200Config::DIV_HW_SOLVE_ELEMENT if db >= 0.5 => self.log_hardware_diversity_solve(),
             Rsr200Config::DIV_REFBAND_ENABLED_ELEMENT => {
                 self.div_cfg.ref_band_enabled = db >= 0.5;
-                self.refresh_ref_band();
-            }
-            Rsr200Config::DIV_REFBAND_FREQ_ELEMENT => {
-                self.div_cfg.ref_band_freq_hz = db;
                 self.refresh_ref_band();
             }
             Rsr200Config::DIV_REFBAND_WIDTH_ELEMENT => {

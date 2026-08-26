@@ -14,8 +14,13 @@
 //! wired up to a `Backend::Rsr200` channel mode in step 6), and step 8's own
 //! Auto-ATT, Serial mode, VHF/preamp switching and swap-channels. Steps 6, 7
 //! and 8 were all done out of their own originally-suggested order, at
-//! Ralph's request; Windows USB still needs its own research spike, see
-//! `RSR200_PLAN.md` §6.
+//! Ralph's request. Windows USB bindings (`ffi::Api`'s Windows-specific
+//! signatures, `usb.rs`'s three cfg-gated call sites) are now written too,
+//! against the vendor header and the SDR++ sibling's own hardware-verified
+//! Windows implementation directly rather than guessed at — see `ffi.rs`'s
+//! own module doc for the three real ABI differences from Linux/macOS. Not
+//! yet run against a real Windows machine with the radio attached, unlike
+//! everything else this doc comment claims as verified below.
 //!
 //! Verified against a real RSR200: LAN wired and over WiFi, USB on
 //! Linux/macOS single-channel, Separate mode, hardware diversity, and

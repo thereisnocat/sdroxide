@@ -698,11 +698,14 @@ impl IqSource for Rsr200Source {
     fn open_status(&self) -> Option<String> {
         let mut msg = String::from(
             "Reuter RSR200 support is new: verified against real hardware over both LAN \
-             (wired and WiFi) and USB (Linux/macOS — Windows needs its own driver research \
-             first). LAN's ÷8 decimation and coarser is solid over ordinary gigabit \
-             Ethernet; ÷4/÷2 broke up even wired. USB held up cleanly through ÷4, with real \
-             loss only at ÷2 (the highest rate) — its own, narrower throughput ceiling. \
-             Either way, expect the link — not this driver — to be what limits the top end.",
+             (wired and WiFi) and USB on Linux/macOS. Windows USB bindings are written \
+             (against the vendor D3XX header and a sibling implementation's own \
+             hardware-verified Windows path) but not yet run against a real Windows machine \
+             with the radio attached. LAN's ÷8 decimation and coarser is solid over ordinary \
+             gigabit Ethernet; ÷4/÷2 broke up even wired. USB held up cleanly through ÷4, \
+             with real loss only at ÷2 (the highest rate) — its own, narrower throughput \
+             ceiling. Either way, expect the link — not this driver — to be what limits the \
+             top end.",
         );
         if self.hw_diversity {
             msg.push_str(

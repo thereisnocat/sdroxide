@@ -38,6 +38,9 @@ const CHUNK_BYTES: usize = USB_PACKET_BYTES * PACKETS_PER_READ;
 /// The FIFO-channel-not-endpoint-address conversion — see [`crate::ffi`]'s
 /// own doc for why this exists and how it was confirmed. Scoped to the one
 /// call that needs it, matching the C++ original's own `toFifoChannel`.
+/// Linux/macOS only: Windows' own `FT_ReadPipeEx` takes the raw endpoint
+/// address directly (see [`queue_read`]).
+#[cfg(not(target_os = "windows"))]
 fn to_fifo_channel(endpoint_address: u8) -> u8 {
     (endpoint_address & 0x0F) - 2
 }
@@ -209,6 +212,14 @@ impl UsbTransport {
         // while nothing is wrong.
         unsafe { (self.api.set_pipe_timeout)(self.handle, USB_ENDPOINT_IN, 0) };
 
+        // FT_SetStreamPipe's two flags are the narrower `BOOLEAN` on
+        // Windows, the wider `BOOL` everywhere else — see `crate::ffi`'s own
+        // top-level doc, point 3.
+        #[cfg(target_os = "windows")]
+        let st = unsafe {
+            (self.api.set_stream_pipe)(self.handle, ffi::FALSE_B, ffi::FALSE_B, USB_ENDPOINT_IN, CHUNK_BYTES as u32)
+        };
+        #[cfg(not(target_os = "windows"))]
         let st = unsafe {
             (self.api.set_stream_pipe)(self.handle, ffi::FALSE, ffi::FALSE, USB_ENDPOINT_IN, CHUNK_BYTES as u32)
         };
@@ -233,10 +244,17 @@ impl UsbTransport {
 
     fn queue_read(&mut self, slot: usize) -> Result<(), String> {
         let mut got: u32 = 0;
+        // Windows' FT_ReadPipeEx takes the raw endpoint address directly;
+        // Linux/macOS's FT_ReadPipeAsync wants a FIFO channel index instead
+        // — see `crate::ffi`'s own top-level doc and `to_fifo_channel`'s.
+        #[cfg(target_os = "windows")]
+        let pipe = USB_ENDPOINT_IN;
+        #[cfg(not(target_os = "windows"))]
+        let pipe = to_fifo_channel(USB_ENDPOINT_IN);
         let st = unsafe {
             (self.api.read_pipe_async)(
                 self.handle,
-                to_fifo_channel(USB_ENDPOINT_IN),
+                pipe,
                 self.buffers[slot].as_mut_ptr(),
                 CHUNK_BYTES as u32,
                 &mut got,
@@ -274,7 +292,14 @@ impl UsbTransport {
                 unsafe { (self.api.get_overlapped_result)(self.handle, ov, &mut got, ffi::TRUE) };
                 unsafe { (self.api.release_overlapped)(self.handle, ov) };
             }
-            unsafe { (self.api.clear_stream_pipe)(self.handle, ffi::FALSE, ffi::FALSE, USB_ENDPOINT_IN) };
+            #[cfg(target_os = "windows")]
+            unsafe {
+                (self.api.clear_stream_pipe)(self.handle, ffi::FALSE_B, ffi::FALSE_B, USB_ENDPOINT_IN)
+            };
+            #[cfg(not(target_os = "windows"))]
+            unsafe {
+                (self.api.clear_stream_pipe)(self.handle, ffi::FALSE, ffi::FALSE, USB_ENDPOINT_IN)
+            };
         }
         unsafe { (self.api.close)(self.handle) };
         self.handle = std::ptr::null_mut();
@@ -305,13 +330,28 @@ impl Transport for UsbTransport {
             return false;
         }
         let mut written: u32 = 0;
-        // A plain blocking write with a 1-second timeout. Commands are rare
-        // (config changes, acks) and small (8/12/16 bytes per DP 4), so
-        // there is no need for the overlapped machinery the read side needs
-        // for throughput.
-        const WRITE_TIMEOUT_MS: u32 = 1000;
+        // A plain blocking write. Commands are rare (config changes, acks)
+        // and small (8/12/16 bytes per DP 4), so there is no need for the
+        // overlapped machinery the read side needs for throughput. On
+        // Linux/macOS that means a 1-second timeout; on Windows, FT_WritePipe
+        // takes an LPOVERLAPPED instead of a timeout, and NULL there is the
+        // documented way to get the same synchronous, blocking behavior —
+        // see `crate::ffi`'s own top-level doc, point 2.
         let mut buf = data.to_vec();
+        #[cfg(target_os = "windows")]
         let st = unsafe {
+            (self.api.write_pipe)(
+                self.handle,
+                USB_ENDPOINT_OUT,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        #[cfg(not(target_os = "windows"))]
+        let st = unsafe {
+            const WRITE_TIMEOUT_MS: u32 = 1000;
             (self.api.write_pipe)(
                 self.handle,
                 USB_ENDPOINT_OUT,

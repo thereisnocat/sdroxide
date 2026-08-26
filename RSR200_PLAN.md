@@ -287,6 +287,57 @@ phase with its own research spike for the Windows question above, and accept fro
 Linux/macOS USB is real FFI work against a proprietary vendor library — not a corner that can be
 cut by reaching for `nusb` the way every sibling crate here did.
 
+**The Windows research spike happened, resolved by reading the vendor header directly rather
+than continuing to guess.** No `nusb`/WinUSB shortcut: Windows' "FTD3XXWU" driver is still its
+own vendor DLL (`FTD3XXWU.dll`, from FTDI's *WinUSB D3XX driver package* — not the older,
+deprecated WDF-based one, which has no `FTD3XXWU` import library at all), needing the same kind
+of FFI binding as Linux/macOS, just against a differently-shaped SDK. The header itself
+(`FTD3XX.h`) was available directly — the SDR++ sibling project vendors it (and the matching
+`FTD3XXWU.lib`/`.dll`) at `third_party/ftd3xx_winusb/` for its own CI, having already extracted
+it from FTDI's real WinUSB package and built a working, **hardware-verified (0.00% packet loss)**
+Windows implementation against it (`source_modules/rsr200_source/src/transport_usb.{h,cpp}`) —
+so this wasn't a guess at an unverified binding, it was reading a header and a working
+reference implementation that happens to live in a sibling repo. Three real ABI differences
+from the Linux/macOS SDK, confirmed against that header directly:
+
+1. The overlapped read call is named `FT_ReadPipeEx` on Windows (`FT_ReadPipeAsync` on
+   Linux/macOS) — same Rust-level signature shape either way, just a different symbol to
+   resolve.
+2. `FT_WritePipe`'s last parameter is an `LPOVERLAPPED` on Windows (`NULL` for the documented
+   synchronous/blocking behavior) versus a millisecond timeout `DWORD` on Linux/macOS — a real
+   width/meaning difference, not just a rename.
+3. `FT_SetStreamPipe`/`FT_ClearStreamPipe`'s two flag parameters are the narrower `BOOLEAN`
+   (1 byte) on Windows, where the Linux/macOS SDK's own `Types.h` uses the wider 4-byte `BOOL`
+   for the same two calls (and for `FT_GetOverlappedResult`'s `bWait`, which stays 4-byte `BOOL`
+   on *both* platforms — only the stream-pipe flags are the narrower type on Windows).
+
+Plus the already-known FIFO-channel-vs-endpoint-address split (§ above) turns out to be
+Linux/macOS-only: Windows' `FT_ReadPipeEx` takes the raw endpoint address directly, confirmed
+against real hardware in the SDR++ sibling's own code comment. And `OVERLAPPED` itself is a
+different, larger struct on Windows — the real Win32 one from `<windows.h>` (32 bytes on
+x86_64: two 8-byte `ULONG_PTR`s where the Linux/macOS SDK's own smaller struct of the same name
+has two 4-byte fields), not reusable across platforms.
+
+**Built the same way as Linux/macOS — `dlopen`/`LoadLibrary` via `libloading` at runtime, not a
+build-time link** — so this crate keeps building and shipping everywhere regardless of whether
+the driver is installed on the machine doing the build. `sdroxide-rsr200::ffi::Api`'s three
+affected fields (`write_pipe`, `set_stream_pipe`, `clear_stream_pipe`) are declared twice, each
+half `#[cfg]`-gated to the right platform's real signature; `usb.rs`'s three call sites that
+touch those (plus the FIFO-channel conversion) are similarly cfg-gated. Type-checked clean
+against the `x86_64-pc-windows-gnu` target (`cargo check -p sdroxide-rsr200 --target
+x86_64-pc-windows-gnu`, added as a rustup target for exactly this) — catches ABI/signature
+mistakes without needing a Windows machine or a local mingw-w64 linker, neither of which this
+desk has. **Not yet run against a real Windows machine with the radio attached** — that's the
+next real step, whenever Ralph has one available; the Windows MSI build (`windows-msi.yml`,
+already existing CI on an actual `windows-latest` runner) will compile it on every run from now
+on, which is the first real signal beyond `cargo check` here. `Api::load()`'s Windows DLL search
+tries the bare `FTD3XXWU.dll` name first (catches the app's own directory, `System32`, `PATH` —
+matching how the SDR++ sibling's own Windows packaging script copies the DLL next to its `.exe`
+rather than installing it system-wide), then the absolute path its own `CMakeLists.txt` links
+against at build time, on the chance a real driver install leaves the runtime DLL there too —
+genuinely unconfirmed for an end-user install specifically, flagged as such in `ffi.rs`'s own
+doc.
+
 ## 7. Suggested build order
 
 Each stage independently useful and independently testable, matching this workspace's own
@@ -594,9 +645,11 @@ separately and shipped each as it landed):
    is correct" (this entry's own closing line) has still not been tested with a real, physically
    independent second aerial in the loop, and now that the routing bug is fixed, it still needs to
    be.
-7. **Done on Linux/macOS, Windows still open. USB transport** (branch `rsr200`) — done out of
-   order, ahead of steps 4–6, at Ralph's request. `sdroxide-rsr200::ffi` (hand-written D3XX
-   bindings, loaded with `dlopen` at runtime via `libloading` — same pattern as
+7. **Done on Linux/macOS, hardware-verified; Windows bindings written and type-checked, not yet
+   hardware-verified — see §6's own "Windows research spike happened" entry for the full
+   account.** USB transport (branch `rsr200`) — done out of order, ahead of steps 4–6, at
+   Ralph's request. `sdroxide-rsr200::ffi` (hand-written D3XX bindings, loaded with
+   `dlopen`/`LoadLibrary` at runtime via `libloading` on every platform — same pattern as
    `sdroxide-sdrplay`'s own `ffi.rs`, so this crate still builds and ships everywhere and
    merely finds USB missing where the driver is not installed) and `sdroxide-rsr200::usb`
    (`UsbTransport: Transport`, a direct port of the already-hardware-verified
@@ -606,11 +659,8 @@ separately and shipped each as it landed):
    `Usb`) and `usb_serial`, and `settings_rsr200_tab` grew a Connection selector — matching
    `sdroxide-rtlsdr`'s own USB-and-`tcp/`-in-one-crate precedent and the SDR++ reference's own
    "Transport combo" UI shape (§1), not the `RtlSdr`/`RtlTcp`-style split-Backend convention,
-   since USB and LAN really are the same radio with the same command protocol here. Windows is
-   deliberately unimplemented — `Api::load()` fails there with a clear message pointing at this
-   section — rather than guess at the differently-shaped Windows D3XX SDK (`FT_ReadPipeEx` as
-   the *overlapped* call there, an inversion from Linux/macOS) without the research spike §6
-   itself called for. `PROTO_VERSION` 91 → 92.
+   since USB and LAN really are the same radio with the same command protocol here.
+   `PROTO_VERSION` 91 → 92.
 
    **Verified against the real, physically-attached RSR200 the same day** (2026-08-24), not
    just built: a standalone example (`crates/sdroxide-rsr200/examples/usb_live_probe.rs`, a
@@ -812,9 +862,11 @@ separately and shipped each as it landed):
   nothing in this plan has begun implementation yet.
 - Priority between LAN and USB as the very first milestone — this plan recommends LAN for the
   reasons in §6, but that's a recommendation, not something to lock in without your sign-off.
-- Whether the Windows `FTD3XXWU`/WinUSB question in §6 is worth spiking *before* LAN is proven,
-  in case it changes how much of the USB phase is genuinely new work versus reachable through
-  `nusb` the way every sibling crate manages.
+- ~~Whether the Windows `FTD3XXWU`/WinUSB question in §6 is worth spiking before LAN is proven~~
+  — moot; both LAN and USB shipped and were hardware-verified long before this got revisited.
+  Resolved directly: no `nusb` shortcut exists, Windows needs its own FFI binding the same way
+  Linux/macOS does, just against a differently-shaped SDK — see §6's own "Windows research spike
+  happened" entry.
 - `SW_REMOTE_PWR_CH2`/`SW_REMOTE_CTRL_CH2` (channel 2's own remote antenna power/control, for an
   RLA4/RFA2/RAP-style active antenna on HF2) are defined in `protocol.rs` and untouched by step 8
   — that step's own title said "VHF/preamp switching," which the DP and this codebase have both

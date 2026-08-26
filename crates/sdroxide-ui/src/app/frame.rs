@@ -321,6 +321,8 @@ impl eframe::App for SdroxideApp {
         // Built once for both panadapter call sites: the same devices are
         // labelled whichever layout is on screen.
         let ism_labels = self.ism_overlay();
+        // Likewise the memory marks along the bottom of the waterfall.
+        let mem_marks = self.memory_overlay();
         // Remaining space: the panadapter (+ FT8/FT4 operating panel).
         if let Some(err) = self.error.clone() {
             let offer_retry = self.ctrl.can_reconnect();
@@ -509,7 +511,8 @@ impl eframe::App for SdroxideApp {
             // waterfall would be time that never happened — a switched-off
             // radio (or any stalled stream) freezes instead.
             let live = frame.is_some() && now - self.last_spectrum_at < STREAM_STALE_S;
-            let wf_tuning = self.wf_tick(live);
+            self.note_panadapter_width(ui);
+            let wf_tuning = self.wf_tick(live, ui.ctx().pixels_per_point());
             if show_wf {
                 ui.allocate_ui(egui::vec2(width, wf_h), |ui| {
                     let pan =
@@ -561,6 +564,7 @@ impl eframe::App for SdroxideApp {
                         &net_alpha,
                         &mut clicked_spot,
                         &ism_labels,
+                        &mem_marks,
                         self.input.cfg.wheel,
                         pan,
                         wf_tuning,
@@ -656,7 +660,8 @@ impl eframe::App for SdroxideApp {
             let frame = self.frame.take();
             // As on the digital path: no fresh frames, no scroll.
             let live = frame.is_some() && now - self.last_spectrum_at < STREAM_STALE_S;
-            let wf_tuning = self.wf_tick(live);
+            self.note_panadapter_width(ui);
+            let wf_tuning = self.wf_tick(live, ui.ctx().pixels_per_point());
             // CW is the one analog mode with a panel under the panadapter. It
             // is not a digital mode and does not take the digital path — the
             // demodulated tone stays audible and the view stays wherever the
@@ -718,6 +723,7 @@ impl eframe::App for SdroxideApp {
                         &net_alpha,
                         &mut clicked_spot,
                         &ism_labels,
+                        &mem_marks,
                         self.input.cfg.wheel,
                         pan,
                         wf_tuning,
@@ -835,11 +841,13 @@ impl eframe::App for SdroxideApp {
             }
         }
 
-        // The skimmers decode only what is on screen, so they need the real
-        // visible span — not `SpectrumConfig::viewport`, which is padded so that
-        // panning doesn't clear the waterfall. Debounced on the same timer: a
-        // drag would otherwise re-cut the tracked set every frame, and every
-        // re-cut throws away decoders that were part-way through a callsign.
+        // The skimmers decode only what is on screen, and on a front end wider
+        // than their window it is also what decides which slice of the band they
+        // read at all — so they need the real visible span, not
+        // `SpectrumConfig::viewport`, which is padded so that panning doesn't
+        // clear the waterfall. Debounced on the same timer: a drag would
+        // otherwise re-cut the tracked set every frame, and every re-cut throws
+        // away decoders that were part-way through a callsign.
         if self.state.skimmer.any_enabled() && !self.view.is_unset() {
             let want = (self.view.view_lo_hz, self.view.view_hi_hz);
             let tol = (want.1 - want.0).abs() * 0.01;
@@ -962,6 +970,10 @@ impl SdroxideApp {
         while let Some(answer) = self.ctrl.poll_probe() {
             self.apply_probe_answer(ctx, answer);
         }
+        // Whether a panadapter frame has already landed in this pass, so the
+        // next one knows it is superseding a picture nothing will ever draw —
+        // see the `Spectrum` arm below.
+        let mut superseded = false;
         while let Some(ev) = self.ctrl.poll_event() {
             match ev {
                 RadioEvent::Capabilities(c) => {
@@ -1021,7 +1033,25 @@ impl SdroxideApp {
                         self.speech.announcer.on_state(&self.state, now);
                     }
                 }
-                RadioEvent::Spectrum(f) => {
+                RadioEvent::Spectrum(mut f) => {
+                    // This runs once per repaint and only the frame it leaves
+                    // here is drawn, so anything it replaces mid-pass is a
+                    // picture nobody sees. Its *rows* are another matter: the
+                    // waterfall's time axis is spaced on the assumption that
+                    // every row the engine clocked reaches the texture, so
+                    // dropping them makes the timestamps outrun the picture by
+                    // exactly the time thrown away, and go on doing it. They
+                    // ride on with the frame that superseded them instead.
+                    //
+                    // A client redrawing more slowly than it asked the engine
+                    // to publish is the ordinary case for this, and the browser
+                    // client is where it shows: its socket delivers in bursts
+                    // between animation frames, so several frames routinely
+                    // arrive in one pass.
+                    if superseded && let Some(prev) = self.frame.as_deref() {
+                        f.carry_rows_from(prev);
+                    }
+                    superseded = true;
                     self.frame = Some(std::sync::Arc::new(f));
                     self.last_spectrum_at = now;
                 }

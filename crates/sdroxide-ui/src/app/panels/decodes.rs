@@ -7,29 +7,13 @@
 //! rebuilt from scratch every frame.
 
 use eframe::egui::{self, Color32, RichText};
-use sdroxide_types::{Command, Decode, Mode};
+use sdroxide_types::{Command, Decode, DecodeSort, Mode};
 
 use crate::theme::ThemedScroll;
 use crate::time::now_unix;
 
 use crate::app::panels::widgets::{row_cell, row_cell_ui, snr_color, station_card};
 use crate::app::{SdroxideApp, rx_only_hint, tx_gated};
-
-/// How the FT8/FT4 decode list orders the stations — within each turn, or
-/// across the whole list when the single-list view is on.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub(in crate::app) enum DecodeSort {
-    /// As received (no reordering).
-    #[default]
-    None,
-    /// Strongest signal first.
-    Signal,
-    /// Farthest (DX) first.
-    Distance,
-    /// Grouped by DXCC entity, alphabetically — what a band opening looks like
-    /// when you are counting countries rather than reading callsigns.
-    Country,
-}
 
 /// One decode as the list draws it: the entry itself, plus everything the row
 /// needs resolved once up front — how far away they are, whether this is a CQ
@@ -95,32 +79,39 @@ impl SdroxideApp {
         // row keeps a uniform height, and wrapping happens between rows' items
         // rather than through the middle of a stacked group.
         //
-        // Ordering, grouping and filters for the decode list.
+        // Ordering, grouping and filters for the decode list. All five are
+        // remembered in `[ui]` with the rest of this screen's preferences —
+        // they say how the operator reads a band, and that does not change
+        // because the program was restarted. Edited through locals and written
+        // back once below, so a frame that touches nothing writes nothing.
+        let was = (
+            self.ui_settings.decode_sort,
+            self.ui_settings.decode_sort_desc,
+            self.ui_settings.decode_single_list,
+            self.ui_settings.decode_cq_only,
+            self.ui_settings.decode_new_only,
+        );
+        let (mut sort_by, mut sort_desc, mut single, mut cq_only, mut new_only) = was;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(RichText::new("Sort").size(9.5).color(crate::theme::CYAN_DIM()));
-            for (m, base) in [
-                (DecodeSort::None, "None"),
-                (DecodeSort::Signal, "SNR"),
-                (DecodeSort::Distance, "Dist"),
-                (DecodeSort::Country, "Country"),
-            ] {
-                let active = self.digi_sort == m;
+            for m in DecodeSort::ALL {
+                let active = sort_by == m;
                 // Active mode shows its direction; re-pressing it flips direction.
                 let lbl = if active && m != DecodeSort::None {
-                    format!("{base} {}", if self.digi_sort_desc { "↓" } else { "↑" })
+                    format!("{} {}", m.label(), if sort_desc { "↓" } else { "↑" })
                 } else {
-                    base.to_string()
+                    m.label().to_string()
                 };
                 if crate::chrome::chip(ui, active, lbl).clicked() {
                     if active && m != DecodeSort::None {
-                        self.digi_sort_desc = !self.digi_sort_desc;
+                        sort_desc = !sort_desc;
                     } else {
-                        self.digi_sort = m;
+                        sort_by = m;
                         // Strongest and farthest first, but countries A to Z:
                         // "descending" is the useful end of a number and the
                         // wrong end of an alphabet.
-                        self.digi_sort_desc = m != DecodeSort::Country;
+                        sort_desc = m != DecodeSort::Country;
                     }
                 }
             }
@@ -128,7 +119,7 @@ impl SdroxideApp {
             // Grouping: odd/even turn blocks, or everything in one list.
             // Beside the Sort chips because it decides what they sort — each
             // turn on its own, or the whole list at once.
-            if crate::chrome::chip(ui, self.digi_single_list, "Single list")
+            if crate::chrome::chip(ui, single, "Single list")
                 .on_hover_text(
                     "Every decode in one list, newest turn first, instead of odd/even turn \
                      blocks. The Sort chips then order the whole list rather than each turn, \
@@ -137,10 +128,10 @@ impl SdroxideApp {
                 )
                 .clicked()
             {
-                self.digi_single_list = !self.digi_single_list;
+                single = !single;
             }
             ui.add_space(8.0);
-            if crate::chrome::chip(ui, self.digi_cq_only, "CQ only")
+            if crate::chrome::chip(ui, cq_only, "CQ only")
                 .on_hover_text(
                     "Only stations calling CQ — and only the calls you may answer: a directed \
                      CQ (DX, EU, JA, POTA, TEST …) is listed when it names you and hidden when \
@@ -148,15 +139,23 @@ impl SdroxideApp {
                 )
                 .clicked()
             {
-                self.digi_cq_only = !self.digi_cq_only;
+                cq_only = !cq_only;
             }
-            if crate::chrome::chip(ui, self.digi_new_only, "New only")
+            if crate::chrome::chip(ui, new_only, "New only")
                 .on_hover_text("Only stations that would be new: entity, band-slot, grid, or call")
                 .clicked()
             {
-                self.digi_new_only = !self.digi_new_only;
+                new_only = !new_only;
             }
         });
+        if (sort_by, sort_desc, single, cq_only, new_only) != was {
+            self.ui_settings.decode_sort = sort_by;
+            self.ui_settings.decode_sort_desc = sort_desc;
+            self.ui_settings.decode_single_list = single;
+            self.ui_settings.decode_cq_only = cq_only;
+            self.ui_settings.decode_new_only = new_only;
+            crate::app::persist::persist_ui_settings(&self.ui_settings);
+        }
         // The transmit row: who picks our frequency, the frequency itself, and
         // the list-clearing button at the end.
         ui.horizontal_wrapped(|ui| {
@@ -354,17 +353,17 @@ impl SdroxideApp {
         let mut new_preview: Option<Option<(String, (f64, f64))>> = None;
         // Location of the row hovered this frame → yellow dot on the map.
         let mut hover_ll: Option<(f64, f64)> = None;
-        let cq_only = self.digi_cq_only;
-        let new_only = self.digi_new_only;
+        let cq_only = self.ui_settings.decode_cq_only;
+        let new_only = self.ui_settings.decode_new_only;
         // Read once for the whole list: every row's REPLY and queue chip asks
         // the same question of the same radio.
         let tx_ok = self.tx_capable();
         let auto_tx_freq = self.digi_status.as_ref().map(|s| s.config.auto_tx_freq).unwrap_or(true);
         let hold_tx_freq =
             self.digi_status.as_ref().map(|s| s.config.hold_tx_freq).unwrap_or(false);
-        let sort = self.digi_sort;
-        let desc = self.digi_sort_desc;
-        let single = self.digi_single_list;
+        let sort = self.ui_settings.decode_sort;
+        let desc = self.ui_settings.decode_sort_desc;
+        let single = self.ui_settings.decode_single_list;
         // Turn parity needs the mode's slot length (FT8 15 s, FT4 7.5 s). JS8's
         // is an operator setting rather than implied by the mode, so it comes
         // from the status — otherwise Turbo draws one turn header per 2.5 turns.

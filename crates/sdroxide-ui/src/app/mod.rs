@@ -55,7 +55,6 @@ use crate::waterfall_gpu;
 use crate::widgets::spectrum_view;
 
 use self::logbook::LogEditForm;
-use self::panels::decodes::DecodeSort;
 use self::panels::fsq::fsq_load_contacts;
 use self::panels::rf_paint::RfPaintUi;
 use self::panels::sstv::SstvUi;
@@ -135,6 +134,24 @@ pub struct SdroxideApp {
     sent_cfg: Option<SpectrumConfig>,
     desired_cfg: Option<SpectrumConfig>,
     desired_at: f64,
+    /// What this machine's renderer will carry, gathered once when the window
+    /// opened. `None` where there is no wgpu at all (a headless test), which
+    /// reads as "the width sdroxide has always drawn".
+    display_class: Option<waterfall_gpu::DisplayClass>,
+    /// The display's pixels per egui point, as of the last panadapter draw.
+    ///
+    /// Kept because the row rate asked of the engine has to carry it — the
+    /// waterfall stores one line per device pixel — and the config is built
+    /// outside the frame that measures it.
+    wf_row_scale: f32,
+    /// The widest the panadapter has been this session, in *device pixels*.
+    ///
+    /// Only ever grows. A window dragged narrower keeps the detail it had,
+    /// because re-cutting the frame costs the waterfall its scrollback and buys
+    /// back nothing but bandwidth — where a window dragged wider is the
+    /// operator moving onto the screen they bought this for. It also keeps the
+    /// width from thrashing against `cfg_still_good` while a window is resized.
+    panadapter_px: u32,
     /// The visible span last handed to the skimmers, the one waiting to be, and
     /// when it settled. Separate from `sent_cfg` because the spectrum viewport
     /// carries deliberate slack and this must not.
@@ -251,6 +268,10 @@ pub struct SdroxideApp {
     hackrf_devices: Vec<sdroxide_types::HackRfDevice>,
     /// RSPs the SDRplay API service reported on the last Rescan.
     sdrplay_devices: Vec<sdroxide_types::SdrPlayDevice>,
+    /// The interface whose device list was last asked for, so switching to
+    /// another one inside the open dialog asks for that one's — once, not
+    /// every frame. `None` while the dialog is shut.
+    iface_probed: Option<sdroxide_types::Backend>,
     /// SoapySDR devices from the last enumeration (dialog-open on the SoapySDR
     /// interface, or Rescan). `None` = not enumerated yet, which is a different
     /// thing from "enumerated and found nothing".
@@ -424,6 +445,21 @@ pub struct SdroxideApp {
     fsq_rx_images: Vec<egui::TextureHandle>,
     /// Picked-image inbox for FSQ image transmit (raw file bytes).
     fsq_img_inbox: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// Packet: who the terminal's CONNECT button calls.
+    packet_target: String,
+    /// Packet: the digipeater path typed beside it.
+    packet_via: String,
+    /// Packet: what is typed on the terminal's input line but not yet sent.
+    packet_draft: String,
+    /// Packet: lines already sent, newest last, for the up-arrow.
+    ///
+    /// A node's command line is retyped constantly — the same `L`, the same
+    /// `C CALL`, the same `B` — and at 300 baud retyping is where the typos
+    /// come from.
+    packet_history: Vec<String>,
+    /// Packet: how far back through [`Self::packet_history`] the operator has
+    /// walked. `None` means they are typing something new.
+    packet_history_at: Option<usize>,
     /// APRS: the station icons, decoded once and kept as textures.
     aprs_icons: crate::aprs_icons::AprsIcons,
     /// APRS: the map's centre, zoom and selected station.
@@ -488,17 +524,6 @@ pub struct SdroxideApp {
     /// Location of the decode row hovered this frame, shown on the map as a
     /// bright yellow dot. Frame-scoped (set by the decode list, read by the map).
     digi_hover_ll: Option<(f64, f64)>,
-    /// Decode-list ordering within each turn, and whether to show CQ only.
-    digi_sort: DecodeSort,
-    /// Sort direction: `true` = descending (strongest / farthest first).
-    digi_sort_desc: bool,
-    digi_cq_only: bool,
-    /// Decode-list filter: only stations that would put something new in the
-    /// log (new entity, new band-slot, new grid, or a callsign never worked).
-    digi_new_only: bool,
-    /// Show every decode as one list — sorted across all turns — instead of
-    /// grouped into odd/even turn blocks.
-    digi_single_list: bool,
     /// The FT8 free-text entry, sent verbatim in the next transmit slot.
     digi_free_text: String,
     /// Country-flag textures, uploaded on first use and kept for the session.
@@ -588,7 +613,7 @@ pub struct SdroxideApp {
     login_tests_pending: std::collections::HashSet<sdroxide_types::LoginTarget>,
     /// Inbox for an ADIF file chosen via the native "Import" dialog (a picker
     /// thread writes; the UI drains it each frame).
-    adif_import_inbox: Arc<Mutex<Option<String>>>,
+    adif_import_inbox: crate::download::LoadInbox,
     /// Callsigns queued for lookup, drained into commands each frame.
     pending_lookups: Vec<String>,
     /// Everything callsign lookup has resolved this session, by callsign. Kept
@@ -900,6 +925,19 @@ impl SdroxideApp {
         crate::theme::set_spot_colors(&ui_settings.spot_colors);
         crate::theme::set_bandplan_colors(&ui_settings.bandplan_colors);
         crate::theme::apply(egui_ctx);
+        // What this renderer will carry. Gathered here because it is the one
+        // place that holds the render state and the controller at once, and
+        // because none of it changes for the life of the window.
+        let display_class = wgpu_render_state.as_ref().map(|rs| {
+            let info = rs.adapter.get_info();
+            waterfall_gpu::DisplayClass {
+                max_texture_dim: rs.device.limits().max_texture_dimension_2d,
+                device_type: info.device_type,
+                backend: info.backend,
+                remote: ctrl.engine_is_remote(),
+                cores: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
+            }
+        });
         if let Some(rs) = &wgpu_render_state {
             waterfall_gpu::init(rs);
         }
@@ -919,6 +957,9 @@ impl SdroxideApp {
         let _ = &wgpu_render_state;
         SdroxideApp {
             ctrl,
+            display_class,
+            wf_row_scale: 1.0,
+            panadapter_px: 0,
             caps: None,
             state: RadioState::default(),
             frame: None,
@@ -982,6 +1023,7 @@ impl SdroxideApp {
             hydrasdr_devices: Vec::new(),
             hackrf_devices: Vec::new(),
             sdrplay_devices: Vec::new(),
+            iface_probed: None,
             soapy_devices: None,
             tci_test_result: None,
             icomnet_test_result: None,
@@ -1057,6 +1099,11 @@ impl SdroxideApp {
             aprs_map: crate::aprs_map::AprsMapState::default(),
             aprs_target: String::new(),
             aprs_draft: String::new(),
+            packet_target: String::new(),
+            packet_via: String::new(),
+            packet_draft: String::new(),
+            packet_history: Vec::new(),
+            packet_history_at: None,
             aprs_show_traffic: false,
             aprs_filter: String::new(),
             aprs_lat_buf: String::new(),
@@ -1076,11 +1123,6 @@ impl SdroxideApp {
             prop_heat: Default::default(),
             wspr_spots: Vec::new(),
             digi_hover_ll: None,
-            digi_sort: DecodeSort::None,
-            digi_sort_desc: true,
-            digi_cq_only: false,
-            digi_new_only: false,
-            digi_single_list: false,
             digi_free_text: String::new(),
             flags: Default::default(),
             show_logbook: false,
@@ -1409,15 +1451,22 @@ impl SdroxideApp {
     /// sign-in screen never runs either: a station's second radio would sit at
     /// a challenge nobody can see, staying unconnected until it was clicked,
     /// even though the operator signed in to that very station a moment ago.
-    pub(crate) fn poll_auth(&mut self) {
+    ///
+    /// Returns whether this tab has an answer ready and is only waiting its
+    /// turn at the station — a station judges one sign-in at a time. The shell
+    /// keeps asking for frames while that is true, because a hidden tab has no
+    /// other reason to be redrawn and its turn comes on somebody else's socket.
+    pub(crate) fn poll_auth(&mut self) -> bool {
         let phase = self.ctrl.auth_phase();
         self.login.settle(&phase, &self.station_key());
         if !phase.is_pending() {
-            return;
+            return false;
         }
         if let Some(a) = self.login.answer_without_asking(&phase) {
             self.ctrl.send_auth(a.username, a.password);
+            return false;
         }
+        self.login.waiting_for_turn()
     }
 
     /// Detach from this radio: disconnect the engine, drop the audio streams,

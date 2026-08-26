@@ -7,8 +7,11 @@
 //!
 //! # Two receive paths
 //!
-//! No Icom offers I/Q, over any interface. What the LAN gives instead is two
-//! different things, and the operator picks between them:
+//! No Icom offers I/Q over its network port — the IC-7760's RF deck has a USB
+//! 3.0 socket that does, at 1.92 Msps, but it is reached through a
+//! manufacturer-supplied FTDI D3XX driver and shares nothing with this
+//! protocol. What the LAN gives instead is two different things, and the
+//! operator picks between them:
 //!
 //! * **AF** — the radio demodulates and we get audio, exactly as with a CAT rig
 //!   and a sound card. `caps.audio_mode` is set, and the *main* panadapter is
@@ -32,11 +35,15 @@
 //!
 //! # Status
 //!
-//! An IC-705 has received through this over WiFi, on the 12 kHz IF. Everything
-//! else — transmit, the other models' menu numbering, the meters — is still
-//! only exercised against `sdroxide_icomnet::sim`, and the session trace is
-//! copyable from the settings tab so a user with a radio can report what
-//! actually happened.
+//! An IC-705 has received through this over WiFi, on the 12 kHz IF. An IC-7760
+//! has connected over its RF deck's LAN port and streamed audio, its dial, its
+//! meter and its scope (issue #183) — but that session ran *before* the model
+//! was in the table, so what the trace proves is the transport, not the menu
+//! writes or the 689-bin sweep now built from its CI-V reference guide.
+//! Everything else — transmit, the other models' menu numbering, the meters —
+//! is still only exercised against `sdroxide_icomnet::sim`, and the session
+//! trace is copyable from the settings tab so a user with a radio can report
+//! what actually happened.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -49,34 +56,36 @@ use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
 use sdroxide_types::{CwKeying, IcomNetConfig, IcomRxSource, Mode, TxTelemetry};
 
 use crate::dial::Dial;
+use crate::session_trace::TraceStore;
 
-/// The last session's trace, kept after the source is dropped.
-///
-/// A connection that fails or misbehaves is usually replaced immediately — by
-/// the engine's background retry, or by the operator pressing Apply — and the
-/// trace of the *interesting* session would go with it. Holding the most recent
-/// one here is what lets Settings → Radio still offer it afterwards.
-static LAST_TRACE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The last session's trace of each radio, kept after the source is dropped.
+/// See [`crate::session_trace`] — including why there is one per radio rather
+/// than one for the process.
+static TRACES: TraceStore = TraceStore::new();
 
-/// The most recent Icom LAN session trace, for a bug report.
-pub fn last_diagnostics() -> Option<String> {
-    LAST_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+/// What tells two Icoms on one LAN apart, in the one form both sides of the
+/// question can spell: the source knows what it dialled, and the tab asking for
+/// the report knows what its own `radio.json` says.
+fn session_key(cfg: &IcomNetConfig) -> String {
+    format!("{}:{}", cfg.address.trim().to_ascii_lowercase(), cfg.control_port)
 }
 
-/// The trace if there is one, and an explanation of what to do with it either
-/// way — the settings dialog offers the button whether or not a session has run.
-pub fn diagnostics_or_hint() -> String {
-    match last_diagnostics() {
+/// The trace of the radio *this* configuration names, and an explanation of
+/// what to do with it either way — the settings dialog offers the button
+/// whether or not a session has run.
+pub fn diagnostics_or_hint(cfg: &IcomNetConfig) -> String {
+    match TRACES.get(&session_key(cfg)) {
         Some(t) => format!("{t}\n{}\n", sdroxide_icomnet::FIELD_REPORT_HINT),
         None => format!(
-            "No Icom LAN session has run yet — connect to a radio first.\n\n{}\n",
+            "No Icom LAN session has run yet for {} — connect to that radio first.\n\n{}\n",
+            if cfg.address.trim().is_empty() { "this radio" } else { cfg.address.trim() },
             sdroxide_icomnet::FIELD_REPORT_HINT
         ),
     }
 }
 
-fn record_trace(dev: &IcomNetDevice) {
-    *LAST_TRACE.lock().unwrap_or_else(|e| e.into_inner()) = Some(dev.trace().dump());
+fn record_trace(key: &str, dev: &IcomNetDevice) {
+    TRACES.record(key, dev.trace().dump());
 }
 
 /// The IF the radio puts in the audio stream when its LAN output is set to IF.
@@ -120,14 +129,20 @@ const SCOPE_STALL: Duration = Duration::from_secs(3);
 const SCOPE_RETRY: Duration = Duration::from_secs(2);
 const SCOPE_RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// The scope's amplitude scale is 0..=160 with no documented dB per step. The
-/// engine's `auto_levels` normalises whatever it is given, so this only has to
-/// put the trace in a plausible range and keep it linear; the constant is a
-/// calibration knob for whoever first sees one against a known signal.
+/// The scope's amplitude scale runs from 0 to the model's own full scale, and
+/// Icom documents no dB per step for any of them. The engine's `auto_levels`
+/// normalises whatever it is given, so this only has to put the trace in a
+/// plausible range and keep it linear; the constant is a calibration knob for
+/// whoever first sees one against a known signal.
 const SCOPE_DB_PER_UNIT: f32 = 0.5;
 
 pub struct IcomNetSource {
     dev: IcomNetDevice,
+    /// Which radio this session is with, for [`TRACES`]. Held rather than
+    /// rebuilt from the configuration on the way out: the trace has to be
+    /// filed under the address it was actually dialled at, even if the
+    /// operator has retyped that address since.
+    key: String,
     audio: rtrb::Consumer<f32>,
     tx: Option<rtrb::Producer<f32>>,
     rate: f64,
@@ -200,10 +215,11 @@ impl IcomNetSource {
             },
             trace.clone(),
         );
+        let key = session_key(cfg);
         let dev = match dev {
             Ok(dev) => dev,
             Err(e) => {
-                *LAST_TRACE.lock().unwrap_or_else(|x| x.into_inner()) = Some(trace.dump());
+                TRACES.record(&key, trace.dump());
                 return Err(e.into());
             }
         };
@@ -227,6 +243,7 @@ impl IcomNetSource {
 
         let mut src = IcomNetSource {
             dev,
+            key,
             audio,
             tx,
             rate: match rx_source {
@@ -324,9 +341,12 @@ impl IcomNetSource {
         // naturally not in the table.
         if cfg.set_mod_input_on_open && self.can_transmit() {
             match model.lan_mod_input {
-                Some((data_off, data_on, lan)) => {
-                    self.send(civ::set_menu_frame(self.civ_addr, data_off, &[lan]));
-                    self.send(civ::set_menu_frame(self.civ_addr, data_on, &[lan]));
+                Some((items, lan)) => {
+                    // DATA-OFF and every DATA slot the radio has: two on an
+                    // IC-7300MK2, four on an IC-7760.
+                    for item in items {
+                        self.send(civ::set_menu_frame(self.civ_addr, *item, &[lan]));
+                    }
                 }
                 None => notes.push(
                     "sdroxide does not know this model's menu numbering, so it cannot switch \
@@ -670,15 +690,18 @@ impl IqSource for IcomNetSource {
 
     /// The radio's own scope, as the full-band panadapter.
     ///
-    /// These are finished magnitude bins on the radio's 0..=160 scale, not
-    /// anything derived from I/Q — there is no I/Q on this interface. Mapping
-    /// them onto a dB axis is a linear guess with an uncalibrated slope; the
-    /// engine's auto-levelling makes the picture right even where the absolute
-    /// numbers are not.
+    /// These are finished magnitude bins on the radio's own scale — 0..=160 on
+    /// the IC-7300 generation, 0..=200 on an IC-7760 — not anything derived
+    /// from I/Q, of which there is none on this interface. Mapping them onto a
+    /// dB axis is a linear guess with an uncalibrated slope; the engine's
+    /// auto-levelling makes the picture right even where the absolute numbers
+    /// are not, which is also why reading the top of the scale off the wrong
+    /// model is a 20 dB offset rather than a broken trace.
     fn wide_spectrum_db(&mut self, out: &mut Vec<f32>) -> Option<(f64, f64)> {
         let (center, span, bins) = self.scope_frame.take()?;
+        let full = f32::from(self.dev.info().model.scope_full_scale);
         out.clear();
-        out.extend(bins.iter().map(|&b| (f32::from(b) - 160.0) * SCOPE_DB_PER_UNIT));
+        out.extend(bins.iter().map(|&b| (f32::from(b) - full) * SCOPE_DB_PER_UNIT));
         Some((center, span))
     }
 
@@ -838,14 +861,14 @@ impl IqSource for IcomNetSource {
     fn needs_reopen(&self) -> bool {
         if !self.dev.is_alive() {
             // The session that just died is the one worth reporting on.
-            record_trace(&self.dev);
+            record_trace(&self.key, &self.dev);
             return true;
         }
         false
     }
 
     fn release(&mut self) {
-        record_trace(&self.dev);
+        record_trace(&self.key, &self.dev);
         self.dev.shutdown();
     }
 }
@@ -888,6 +911,40 @@ mod tests {
                 .unwrap();
         let src = IcomNetSource::open(&cfg(&sim)).expect("open");
         assert_eq!(src.center_hz(), 7_074_000.0, "the radio's own dial, not 0");
+    }
+
+    /// Two Icoms on one LAN, each keeping its own session trace.
+    ///
+    /// The trace is what a field report is built from, and a station with an
+    /// IC-7300 and an IC-9700 on it is the ordinary case. One slot for the
+    /// process handed whichever of them last hung up to whoever pressed the
+    /// button — so the 9700's tab answered with the 7300's conversation, which
+    /// is worse than answering with nothing (issue #169).
+    #[test]
+    fn each_radio_keeps_its_own_session_trace() {
+        let a = Sim::start(SimOptions { civ_address: 0xB6, scope: false, ..Default::default() })
+            .unwrap();
+        let b = Sim::start(SimOptions { civ_address: 0xA2, scope: false, ..Default::default() })
+            .unwrap();
+        let (ca, cb) = (cfg(&a), cfg(&b));
+        let mut sa = IcomNetSource::open(&ca).expect("open the first radio");
+        let mut sb = IcomNetSource::open(&cb).expect("open the second radio");
+        // Both sessions end, in the order that used to decide the answer.
+        sa.release();
+        sb.release();
+
+        // Each radio's CI-V address is in its own frames and nowhere else, so
+        // it says which conversation came back.
+        let (ra, rb) = (diagnostics_or_hint(&ca), diagnostics_or_hint(&cb));
+        assert!(ra.contains("fe fe b6"), "the first radio's report is not its own session");
+        assert!(!ra.contains("fe fe a2"), "the first radio's report carries the second's session");
+        assert!(rb.contains("fe fe a2"), "the second radio's report is not its own session");
+        assert!(!rb.contains("fe fe b6"), "the second radio's report carries the first's session");
+
+        // And a radio nothing has connected to says so, rather than handing
+        // over the nearest session it can find.
+        let never = IcomNetConfig { address: "192.0.2.7".into(), ..Default::default() };
+        assert!(diagnostics_or_hint(&never).contains("No Icom LAN session has run yet"));
     }
 
     #[test]
@@ -1218,6 +1275,78 @@ mod tests {
         // And never the USB port's copy of the same setting, one item block
         // earlier — that would leave the network stream on AF.
         assert!(!menu(0x01, 0x09, 0x01), "the USB output select is not ours to write");
+    }
+
+    /// Field report, issue #183: an IC-7760 over its RF deck's LAN port came
+    /// up with both "menu numbering unknown" notes, so its LAN output stayed on
+    /// AF — a 3 kHz-wide audio FFT where the operator had asked for the 12 kHz
+    /// IF — and nothing it transmitted was modulated by sdroxide at all.
+    #[test]
+    fn an_ic7760_gets_its_own_menu_numbers_and_every_one_of_its_data_slots() {
+        let sim = Sim::start(SimOptions {
+            civ_address: 0xB2,
+            radio_name: "IC-7760".into(),
+            scope: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut c = cfg(&sim);
+        c.rx_source = IcomRxSource::If12k;
+        let src = IcomNetSource::open(&c).expect("open");
+        assert_eq!(src.open_status(), None, "nothing left for the operator to do by hand");
+
+        let menu = |hi: u8, lo: u8, value: u8| {
+            sim.civ_frames().iter().any(|f| {
+                f.len() >= 10
+                    && f[4] == 0x1A
+                    && f[5] == 0x05
+                    && f[6] == hi
+                    && f[7] == lo
+                    && f[8] == value
+            })
+        };
+        wait_for("the IC-7760 menu writes", || {
+            // LAN AF/IF Output > Output Select = IF, and DATA OFF plus all
+            // three DATA slots to LAN — which is `09` on this radio.
+            menu(0x01, 0x23, 0x01)
+                && menu(0x01, 0x29, 0x09)
+                && menu(0x01, 0x30, 0x09)
+                && menu(0x01, 0x31, 0x09)
+                && menu(0x01, 0x32, 0x09)
+        });
+        // Never the [USB B] port's or the LINE-OUT socket's copy of the output
+        // select, and never the MK2's or the IC-705's value for "LAN" — `03`
+        // is ACC on this radio and `05` is MIC+LINE-IN.
+        assert!(!menu(0x01, 0x03, 0x01), "the USB output select is not ours to write");
+        assert!(!menu(0x01, 0x10, 0x01), "the LINE-OUT output select is not ours either");
+        assert!(!menu(0x01, 0x29, 0x03) && !menu(0x01, 0x29, 0x05), "another model's LAN value");
+    }
+
+    /// The IC-7760 is the first LAN Icom whose sweep is neither 475 bins nor a
+    /// 0..=160 scale: 689 points on 0..=200. Reading the old shape would draw
+    /// the right band at the wrong width and 20 dB out.
+    #[test]
+    fn an_ic7760_sweep_arrives_as_689_bins_on_its_own_taller_scale() {
+        let sim = Sim::start(SimOptions {
+            civ_address: 0xB2,
+            radio_name: "IC-7760".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut src = IcomNetSource::open(&cfg(&sim)).expect("open");
+
+        let mut buf = vec![Complex32::default(); 1024];
+        let mut bins = Vec::new();
+        wait_for("a scope sweep", || {
+            let _ = src.read(&mut buf);
+            src.wide_spectrum_db(&mut bins).is_some()
+        });
+        assert_eq!(bins.len(), 689, "the whole sweep, in the one frame a LAN Icom sends");
+        // The simulator plants its peak just below full scale, so the loudest
+        // bin has to land just below 0 dB. On the 0..=160 scale the other
+        // models use, the same byte would come out well above it.
+        let peak = bins.iter().copied().fold(f32::MIN, f32::max);
+        assert!((-10.0..0.0).contains(&peak), "peak came back at {peak} dB");
     }
 
     #[test]

@@ -57,10 +57,11 @@ pub(in crate::app) fn panel_panes(mode: Mode) -> &'static [&'static str] {
         Mode::Wspr => &["SPOTS", "MAP", "STATUS"],
         Mode::Fsq => &["HEARD", "TRAFFIC"],
         Mode::Sstv | Mode::Rifp => &["RECEIVE", "SEND"],
-        // MONITOR is every frame heard on the channel, LINK is the connected
-        // session — the two things a packet operator watches, and they move
-        // independently, so they get a pane each rather than sharing one.
-        Mode::Packet | Mode::PacketHf => &["MONITOR", "LINK"],
+        // MONITOR is every frame heard on the channel, TERMINAL is the
+        // connected session — the two things a packet operator watches, and
+        // they move independently, so they get a pane each rather than sharing
+        // one.
+        Mode::Packet | Mode::PacketHf => &["MONITOR", "TERMINAL"],
         // Three, because an APRS operator watches three things that move
         // independently: who is out there, where they are, and what they said.
         Mode::Aprs => &["STATIONS", "MESSAGES", "MAP"],

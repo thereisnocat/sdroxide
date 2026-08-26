@@ -158,6 +158,18 @@ fn pan_view(view: &mut ViewState, dhz: f64, dev_center: f64, dev_span: f64) -> f
 /// The engine reports the centre it actually reached (an RX-888's downconverter
 /// clamps its own, at the ends of the half-spectrum), so the picture simply
 /// stops there.
+/// Where a tuning gesture has the dial after one more frame's delta.
+///
+/// `carried` is what this gesture had last frame — `None` on the frame it
+/// starts — and `echoed` is the dial in the state the engine last sent. The
+/// gesture's own value wins whenever it has one, and that is the whole point:
+/// `echoed` lags, so building on it throws away every delta sent since it was
+/// stamped. See the `gesture-dial` comment in the interaction handler for what
+/// that looks like on screen.
+fn gesture_step(carried: Option<f64>, echoed: f64, dhz: f64) -> f64 {
+    carried.unwrap_or(echoed) + dhz
+}
+
 fn pan_center(
     dev_center: &mut f64,
     state: &mut RadioState,
@@ -192,9 +204,18 @@ pub const SUB_COLOR: Color32 = Color32::from_rgb(185, 130, 255);
 pub struct WfTuning {
     /// Waterfall rows to append this frame (from elapsed wall-clock time).
     pub rows_to_write: u32,
-    /// Scroll rate in rows/second — used both to advance the waterfall and to
-    /// space the 60-second gridlines, so the line tracks the waterfall exactly.
+    /// The operator's scroll rate in rows/second, before [`Self::row_scale`].
+    /// The gridlines are spaced from it, so the time axis and the waterfall
+    /// track each other exactly at any zoom factor.
     pub rows_per_sec: f32,
+    /// History rows per egui point — the display's pixels per point, so a row
+    /// is one device pixel tall rather than two on a HiDPI panel. Both the row
+    /// rate and the rows on screen carry it, which leaves the seconds in view
+    /// and the scroll speed unchanged. Never below 1.
+    pub row_scale: f32,
+    /// Columns the history texture should hold, from the client's own reading
+    /// of this machine and this screen — see `SdroxideApp::panadapter_bins`.
+    pub tex_w: u32,
     /// Wall-clock UTC seconds, for the minute-boundary time labels.
     pub now_unix: f64,
     /// EMA coefficient for the spectrum *line* only (1.0 = no smoothing). The
@@ -209,6 +230,52 @@ pub struct WfTuning {
     /// Which radio's GPU waterfall history this panadapter scrolls. Radios are
     /// keyed apart so two tabs never write into each other's texture.
     pub wf_id: u64,
+}
+
+/// Slide a per-bin state array along with a window that has moved, and say
+/// whether anything was left to slide.
+///
+/// A front end whose centre has moved is not showing a new picture: the span
+/// and the bin count are the same, so the bins are the same width and the move
+/// is a whole number of them. Everything still inside the window keeps its
+/// history, and only the strip that has just scrolled in is taken raw from the
+/// frame — the one place that side of the band exists at all.
+///
+/// This is what a panadapter drag does once the view is the whole span: the
+/// window follows the gesture (issue #133), so the centre changes on *every*
+/// frame for as long as the drag lasts. Treating each of those as a fresh
+/// mapping threw the smoothing and the peak hold away sixty times a second,
+/// and the trace went from smoothed to raw for the length of the drag
+/// (issue #177).
+///
+/// Returns false when the window has moved further than its own width and
+/// there is nothing to keep; the caller then starts again from the frame.
+fn slide_bins(bins: &mut [f32], from_center: f64, f: &SpectrumFrame) -> bool {
+    let n = bins.len();
+    if n == 0 || n != f.bins.len() || f.span_hz <= 0.0 {
+        return false;
+    }
+    let bin_hz = f.span_hz / n as f64;
+    let d = ((f.center_hz - from_center) / bin_hz).round();
+    if d.abs() >= n as f64 {
+        return false;
+    }
+    // Bin `j` on the new axis is where bin `j + d` was on the old one.
+    let d = d as isize;
+    if d > 0 {
+        let d = d as usize;
+        bins.copy_within(d.., 0);
+        for (b, &raw) in bins[n - d..].iter_mut().zip(&f.bins[n - d..]) {
+            *b = raw as f32;
+        }
+    } else if d < 0 {
+        let d = -d as usize;
+        bins.copy_within(..n - d, d);
+        for (b, &raw) in bins[..d].iter_mut().zip(&f.bins[..d]) {
+            *b = raw as f32;
+        }
+    }
+    true
 }
 
 /// Exponentially-smoothed spectrum for the trace line, folded once per new
@@ -234,11 +301,13 @@ impl SpectrumSmooth {
             return; // same frame redrawn
         }
         self.last_seq = Some(f.seq);
-        let mapping_changed = self.bins.len() != f.bins.len()
-            || (self.center - f.center_hz).abs() > f.span_hz * 1e-6
-            || (self.span - f.span_hz).abs() > f.span_hz * 1e-6;
+        let rescaled =
+            self.bins.len() != f.bins.len() || (self.span - f.span_hz).abs() > f.span_hz * 1e-6;
+        let moved = (self.center - f.center_hz).abs() > f.span_hz * 1e-6;
+        // A window that has only moved keeps its average; see [`slide_bins`].
+        let mapping_changed = rescaled || (moved && !slide_bins(&mut self.bins, self.center, f));
+        self.center = f.center_hz;
         if mapping_changed || alpha >= 0.999 {
-            self.center = f.center_hz;
             self.span = f.span_hz;
             self.bins = f.bins.iter().map(|&b| b as f32).collect();
             if mapping_changed {
@@ -804,11 +873,13 @@ impl PeakHold {
             return; // same frame redrawn — nothing new to fold in
         }
         self.last_seq = Some(f.seq);
-        let mapping_changed = self.bins.len() != f.bins.len()
-            || (self.center - f.center_hz).abs() > f.span_hz * 1e-6
-            || (self.span - f.span_hz).abs() > f.span_hz * 1e-6;
+        let rescaled =
+            self.bins.len() != f.bins.len() || (self.span - f.span_hz).abs() > f.span_hz * 1e-6;
+        let moved = (self.center - f.center_hz).abs() > f.span_hz * 1e-6;
+        // The held peaks travel with the window too — see [`slide_bins`].
+        let mapping_changed = rescaled || (moved && !slide_bins(&mut self.bins, self.center, f));
+        self.center = f.center_hz;
         if mapping_changed {
-            self.center = f.center_hz;
             self.span = f.span_hz;
             self.bins = f.bins.iter().map(|&b| b as f32).collect();
             self.generation = self.generation.wrapping_add(1);
@@ -849,15 +920,26 @@ struct TraceKey {
     generation: u32,
     view_lo: u64,
     view_hi: u64,
+    /// The zoom factor the polyline was sampled at: the trace is one vertex per
+    /// device pixel, so moving the window to a screen with a different one has
+    /// to recompute it.
+    ppp: u32,
     rect: [u32; 4],
 }
 
-fn trace_key(f: &SpectrumFrame, generation: u32, view: &ViewState, rect: &Rect) -> TraceKey {
+fn trace_key(
+    f: &SpectrumFrame,
+    generation: u32,
+    view: &ViewState,
+    rect: &Rect,
+    ppp: f32,
+) -> TraceKey {
     TraceKey {
         seq: f.seq,
         generation,
         view_lo: view.view_lo_hz.to_bits(),
         view_hi: view.view_hi_hz.to_bits(),
+        ppp: ppp.to_bits(),
         rect: [
             rect.left().to_bits(),
             rect.top().to_bits(),
@@ -938,6 +1020,11 @@ pub fn show_ext(
     // clickable: the ISM window is where a device is acted on, and a box here is
     // a "this one, there" annotation.
     ism: &[IsmLabel],
+    // Stored memories whose dial lands on the visible span, marked along the
+    // waterfall's oldest edge under the band-plan strip. Like the ISM labels,
+    // an annotation and not a control: the memory list is where a channel is
+    // recalled from.
+    mem: &[crate::widgets::memories::MemMark],
     // Operator's pointer preferences: what the wheel does (plain and with
     // Shift), whether left-drag tunes, and the click-tune rounding.
     wheel: WheelSettings,
@@ -1117,6 +1204,30 @@ pub fn show_ext(
     let stop_click_id = ui.id().with("fling-stop-click");
     let mut stop_click: bool = ui.data(|d| d.get_temp(stop_click_id)).unwrap_or(false);
 
+    // The dial the gesture in progress is turning, as *this screen* has it.
+    //
+    // A tuning drag and the coast after it move the dial by a delta a frame,
+    // and the obvious way to write that — read the dial out of the state, add
+    // the delta, put it back — is a read-modify-write on a number the engine
+    // keeps overwriting from behind. `RadioEvent::State` is the engine's whole
+    // snapshot, and mid-drag it is its answer to a `SetVfo` sent some frames
+    // ago; adding this frame's delta to *that* throws away every delta sent
+    // since. The dial then advances one delta per round trip where the view —
+    // which belongs to this screen and is echoed by nobody — advances one per
+    // frame, so the picture slides out from under the marker at a whole
+    // multiple of the right speed, and the marker splits into as many
+    // interleaved positions as there are frames in the round trip. Two,
+    // usually, which is what it looks like: the waterfall running at double
+    // speed and the marker twitching between two places. Barely visible in the
+    // shack, plain over a network — the browser client is where it was found.
+    //
+    // So the gesture keeps its own dial: seeded from the state when it starts,
+    // carried across every frame it lasts, and dropped when it ends — by which
+    // time the engine has had the last word, which is the right place to start
+    // the next one from.
+    let gesture_dial_id = ui.id().with("gesture-dial");
+    let mut gesture_dial: Option<f64> = ui.data(|d| d.get_temp(gesture_dial_id)).unwrap_or(None);
+
     if resp.drag_started_by(egui::PointerButton::Primary) {
         // Decide from the PRESS position, not the current pointer position —
         // by the time the drag threshold trips, the pointer may already have
@@ -1292,7 +1403,8 @@ pub fn show_ext(
         // The sub follows the pointer rather than the grab-the-content sense a
         // pan has — the operator has hold of the receiver itself.
         let dhz = resp.drag_delta().x as f64 * view.span() / rect.width() as f64;
-        let hz = (state.sub_rx_hz + dhz).clamp(dev_lo, dev_hi);
+        let hz = gesture_step(gesture_dial, state.sub_rx_hz, dhz).clamp(dev_lo, dev_hi);
+        gesture_dial = Some(hz);
         state.sub_rx_hz = hz; // optimistic echo, as for the filter grips
         cmds.push(Command::SetSubRxFreq(hz));
     } else if sec_pan {
@@ -1319,7 +1431,8 @@ pub fn show_ext(
             // moved first leaves the dial exactly where it was inside it and
             // the engine's own span guard has nothing to do.
             pan_center(&mut dev_center, state, over, pan, cmds);
-            let hz = (state.active_freq_hz() + dhz).max(0.0);
+            let hz = gesture_step(gesture_dial, state.active_freq_hz(), dhz).max(0.0);
+            gesture_dial = Some(hz);
             match state.active_vfo {
                 Vfo::A => state.vfo_a_hz = hz, // optimistic echo
                 Vfo::B => state.vfo_b_hz = hz,
@@ -1533,10 +1646,17 @@ pub fn show_ext(
                 // The sub follows the pointer, so it coasts the same way it was
                 // dragged; the device passband is the end stop its DDC cannot
                 // reach past, and hitting it parks the dial.
-                let hz = (state.sub_rx_hz + dhz).clamp(dev_lo, dev_hi);
-                if hz == state.sub_rx_hz {
+                // `was` is the same number `gesture_step` builds on, kept so
+                // the end stop is read off the coast's own dial: clamping to a
+                // value it already had is what "ran into the edge" means, and
+                // testing that against the engine's echo instead would park the
+                // coast every time a snapshot arrived a little behind it.
+                let was = gesture_dial.unwrap_or(state.sub_rx_hz);
+                let hz = gesture_step(gesture_dial, state.sub_rx_hz, dhz).clamp(dev_lo, dev_hi);
+                if hz == was {
                     fling = None;
                 } else {
+                    gesture_dial = Some(hz);
                     state.sub_rx_hz = hz; // optimistic echo, as during the drag
                     cmds.push(Command::SetSubRxFreq(hz));
                 }
@@ -1546,7 +1666,8 @@ pub fn show_ext(
                 // the window follows once the view has run out of room.
                 let over = pan_view(view, -dhz, dev_center, dev_span);
                 pan_center(&mut dev_center, state, over, pan, cmds);
-                let hz = (state.active_freq_hz() - dhz).max(0.0);
+                let hz = gesture_step(gesture_dial, state.active_freq_hz(), -dhz).max(0.0);
+                gesture_dial = Some(hz);
                 match state.active_vfo {
                     Vfo::A => state.vfo_a_hz = hz,
                     Vfo::B => state.vfo_b_hz = hz,
@@ -1566,9 +1687,16 @@ pub fn show_ext(
     if ui.input(|i| i.pointer.any_released()) {
         stop_click = false;
     }
+    // Nothing is turning the dial any more, so the next gesture seeds itself
+    // from the state — which by then is where the radio actually ended up, and
+    // not this screen's guess at it.
+    if fling.is_none() && !resp.dragged_by(egui::PointerButton::Primary) {
+        gesture_dial = None;
+    }
     ui.data_mut(|d| {
         d.insert_temp(fling_id, fling);
         d.insert_temp(stop_click_id, stop_click);
+        d.insert_temp(gesture_dial_id, gesture_dial);
     });
     let view_log_id = ui.id().with("view-log");
 
@@ -1628,10 +1756,10 @@ pub fn show_ext(
         draw_grid(&painter, view, &spec_rect);
         if view.peak_hold {
             peaks.update(f);
-            let key = trace_key(f, peaks.generation, view, &spec_rect);
-            let pts = trace
-                .hold
-                .points_for(key, || compute_trace(view, f, Some(&peaks.bins), &spec_rect));
+            let key = trace_key(f, peaks.generation, view, &spec_rect, wf.row_scale);
+            let pts = trace.hold.points_for(key, || {
+                compute_trace(view, f, Some(&peaks.bins), &spec_rect, wf.row_scale)
+            });
             painter.add(Shape::line(
                 pts,
                 Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 90, 170)),
@@ -1642,9 +1770,10 @@ pub fn show_ext(
         // Live trace: UI-smoothed (per the spectrum-speed setting) so the line's
         // reaction speed is independent of the un-averaged waterfall detail.
         smooth.update(f, wf.spectrum_alpha);
-        let key = trace_key(f, smooth.generation, view, &spec_rect);
-        let pts =
-            trace.live.points_for(key, || compute_trace(view, f, Some(&smooth.bins), &spec_rect));
+        let key = trace_key(f, smooth.generation, view, &spec_rect, wf.row_scale);
+        let pts = trace.live.points_for(key, || {
+            compute_trace(view, f, Some(&smooth.bins), &spec_rect, wf.row_scale)
+        });
         painter.add(Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(120, 220, 255))));
     }
     draw_scale(&painter, view, &scale_rect);
@@ -1678,16 +1807,24 @@ pub fn show_ext(
             frame: Some(Arc::clone(f)),
             u_lo,
             u_hi,
-            rows_visible: wf_rect.height(),
+            // Rows, not points: one history row per device pixel. Clamped to
+            // the ring, or the shader's own `min(1.0)` would quietly draw the
+            // same history over a taller widget and the timestamps would slide
+            // off the rows they belong to.
+            rows_visible: (wf_rect.height() * wf.row_scale).min(crate::waterfall_gpu::TEX_H as f32),
             lut: wf.palette,
             rows_to_write: wf.rows_to_write,
             flip: view.waterfall_flip,
             wf_id: wf.wf_id,
+            tex_w: wf.tex_w,
         },
     ));
 
-    // Bandplan strip along the bottom of the waterfall (over the GPU layer).
-    crate::widgets::bandplan::overlay(&painter, view, &wf_rect, panel_below);
+    // Bandplan strip along the bottom of the waterfall (over the GPU layer),
+    // with the stored memories marked on the same edge, stacked inwards from
+    // however deep the strip ended up.
+    let strip_h = crate::widgets::bandplan::overlay(&painter, view, &wf_rect, panel_below);
+    crate::widgets::memories::overlay(&painter, view, &wf_rect, mem, strip_h, panel_below);
 
     // --- VFO markers + passband shading -----------------------------------
     let in_view = |hz: f64| (view.view_lo_hz..=view.view_hi_hz).contains(&hz);
@@ -2124,14 +2261,21 @@ pub fn show_ext(
     // something was heard.
     let rows_per_sec = wf.rows_per_sec as f64;
     if rows_per_sec > 0.01 && wf_rect.height() > 4.0 {
-        let visible_secs = wf_rect.height() as f64 / rows_per_sec;
+        // Seconds on screen from the rows actually on screen, not from the
+        // widget's height: the two agree until the ring runs out, and where it
+        // does the labels have to follow the rows rather than the pixels or
+        // they would name times the waterfall is no longer showing.
+        let rows_visible =
+            ((wf_rect.height() * wf.row_scale) as f64).min(f64::from(crate::waterfall_gpu::TEX_H));
+        let visible_secs = rows_visible / (rows_per_sec * wf.row_scale as f64);
+        let pts_per_sec = wf_rect.height() as f64 / visible_secs.max(1e-6);
         let step = time_grid_step_s(visible_secs);
         let now = wf.now_unix;
         let oldest = now - visible_secs;
         let grid = Color32::from_rgba_unmultiplied(200, 205, 215, 60);
         let mut t = (oldest / step).ceil() * step; // first boundary ≥ oldest
         while t <= now {
-            let age_px = ((now - t) * rows_per_sec) as f32;
+            let age_px = ((now - t) * pts_per_sec) as f32;
             let y = if view.waterfall_flip {
                 wf_rect.bottom() - age_px
             } else {
@@ -2503,21 +2647,29 @@ fn click_tune_label(
 /// Per-pixel polyline of the frame's bins (or of `values` when given, e.g.
 /// the peak-hold bins) mapped through the current viewport. This is the
 /// expensive path the [`TraceCache`] avoids on unchanged repaints.
+///
+/// One vertex per *device* pixel, not per egui point. On a HiDPI panel the two
+/// differ by the zoom factor, and a polyline sampled in points is drawn with
+/// every segment spanning two pixels — the trace's own share of the coarse
+/// picture of issue #172, and the reason it stair-stepped next to a waterfall
+/// that had just been widened.
 fn compute_trace(
     view: &ViewState,
     f: &SpectrumFrame,
     values: Option<&[f32]>,
     rect: &Rect,
+    ppp: f32,
 ) -> Vec<Pos2> {
     let n = values.map(|v| v.len()).unwrap_or(f.bins.len());
     if n == 0 {
         return Vec::new();
     }
     let base = f.center_hz - f.span_hz / 2.0;
-    let w = rect.width().max(1.0) as usize;
+    let ppp = ppp.clamp(1.0, 8.0);
+    let w = ((rect.width() * ppp).max(1.0)) as usize;
     let mut points = Vec::with_capacity(w);
     for px in 0..w {
-        let x = rect.left() + px as f32;
+        let x = rect.left() + px as f32 / ppp;
         let hz = view.x_to_freq(x, rect);
         let bin_f = (hz - base) / f.span_hz * n as f64;
         let v = if (0.0..n as f64).contains(&bin_f) {
@@ -2622,6 +2774,77 @@ pub(crate) fn freq_gridlines(lo_hz: f64, hi_hz: f64) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame of `bins` bins over 800 Hz centred on `center`: one bin per
+    /// 100 Hz, so the arithmetic in these tests is readable.
+    fn frame_at(center: f64, bins: Vec<u8>) -> SpectrumFrame {
+        SpectrumFrame {
+            seq: 0,
+            center_hz: center,
+            span_hz: 100.0 * bins.len() as f64,
+            db_floor: -120.0,
+            db_ceil: -20.0,
+            bins,
+            rows: Vec::new(),
+            rows_clocked: false,
+        }
+    }
+
+    /// The window moves up two bins: the trace's own history moves down two,
+    /// and the two bins of band that have just come into view are taken from
+    /// the frame because that is the only place they exist.
+    #[test]
+    fn a_smoothed_trace_travels_with_the_window() {
+        let mut bins = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let f = frame_at(1200.0, vec![91, 92, 93, 94, 95, 96, 97, 98]);
+        assert!(slide_bins(&mut bins, 1000.0, &f));
+        assert_eq!(bins, [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 97.0, 98.0]);
+    }
+
+    /// And the same the other way down the band.
+    #[test]
+    fn a_trace_travels_the_other_way_too() {
+        let mut bins = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let f = frame_at(900.0, vec![91, 92, 93, 94, 95, 96, 97, 98]);
+        assert!(slide_bins(&mut bins, 1000.0, &f));
+        assert_eq!(bins, [91.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    /// A window that has moved clear of where it was has nothing left to
+    /// carry, and the caller starts again from the frame.
+    #[test]
+    fn a_window_moved_clear_of_itself_keeps_nothing() {
+        let mut bins = [1.0, 2.0, 3.0, 4.0];
+        let f = frame_at(2000.0, vec![9, 9, 9, 9]);
+        assert!(!slide_bins(&mut bins, 1000.0, &f));
+    }
+
+    /// What the drag looked like before this: the average was thrown away on
+    /// every frame the window moved, which is every frame of the drag, so the
+    /// trace ran raw for as long as the operator held the mouse down. One
+    /// step of the fold has to carry the history across the move.
+    #[test]
+    fn the_average_survives_a_window_that_moves_every_frame() {
+        let mut smooth = SpectrumSmooth::default();
+        // Settle on a steady band well away from the noisy bin 4.
+        for seq in 0..40u32 {
+            let mut f = frame_at(1000.0, vec![100; 8]);
+            f.seq = seq;
+            smooth.update(&f, 0.2);
+        }
+        // Now move the window one bin per frame while bin 4 of each frame is
+        // wildly off. Smoothed, its excursion has to stay small.
+        let mut worst: f32 = 0.0;
+        for (i, seq) in (40..60u32).enumerate() {
+            let mut bins = vec![100u8; 8];
+            bins[4] = 250;
+            let mut f = frame_at(1000.0 + 100.0 * i as f64, bins);
+            f.seq = seq;
+            smooth.update(&f, 0.2);
+            worst = worst.max(smooth.bins[4]);
+        }
+        assert!(worst < 160.0, "the average was restarted mid-drag: bin reached {worst}");
+    }
 
     /// Zoom the view about its own centre, the way a wheel notch over the
     /// middle of the panadapter does.
@@ -2925,5 +3148,62 @@ mod tests {
         let (t, px) = coast(FLING_MIN_LAUNCH);
         assert!(t < 0.35, "the shortest coast that can launch is {t}s — too long to feel bounded");
         assert!(px < 30.0, "suppressing it costs {px} points of travel");
+    }
+
+    /// One frame of a drag, against an engine whose state snapshot arrives
+    /// `lag` frames after the `SetVfo` it answers. Returns every dial the drag
+    /// asked for, in order.
+    fn drag(lag: usize, frames: usize, dhz: f64, carry: bool) -> Vec<f64> {
+        let mut sent: Vec<f64> = Vec::new();
+        let mut carried: Option<f64> = None;
+        for f in 0..frames {
+            // What the engine has said by now: the command from `lag` frames
+            // ago, or the dial the drag started on.
+            let echoed = f.checked_sub(lag).map_or(0.0, |i| sent[i]);
+            let hz = gesture_step(carried.filter(|_| carry), echoed, dhz);
+            carried = Some(hz);
+            sent.push(hz);
+        }
+        sent
+    }
+
+    /// A drag turns the dial by one delta a frame and has to go on doing that
+    /// however far behind the engine's echo of it is. The view beside it is
+    /// this screen's own and always does, so any shortfall here is the picture
+    /// sliding out from under the marker.
+    #[test]
+    fn a_drag_turns_the_dial_once_a_frame_however_late_the_echo_is() {
+        const FRAMES: usize = 12;
+        const D: f64 = 100.0;
+        for lag in 1..=3 {
+            let sent = drag(lag, FRAMES, D, true);
+            assert_eq!(
+                *sent.last().unwrap(),
+                FRAMES as f64 * D,
+                "a {lag}-frame echo held the dial back"
+            );
+            // Evenly, too: a dial that arrived by fits and starts would twitch
+            // under the pointer even where it ended up in the right place.
+            for pair in sent.windows(2) {
+                assert_eq!(pair[1] - pair[0], D, "the dial moved unevenly at lag {lag}");
+            }
+        }
+    }
+
+    /// What that replaced, so this says what it is guarding. Rebuilding the
+    /// dial from the engine's snapshot every frame advances it one delta per
+    /// *round trip*: at the two-frame lag of an ordinary network client the
+    /// waterfall runs at twice the speed of its own marker, and the marker
+    /// splits into two interleaved positions — a drift and a twitch.
+    #[test]
+    fn a_dial_rebuilt_from_a_late_echo_runs_slow_and_doubles() {
+        const FRAMES: usize = 12;
+        const D: f64 = 100.0;
+        let sent = drag(2, FRAMES, D, false);
+        assert_eq!(*sent.last().unwrap(), FRAMES as f64 * D / 2.0, "not half speed after all");
+        // Two positions: the frames pair up, each pair asking for the same dial.
+        for pair in sent.chunks(2) {
+            assert_eq!(pair[0], pair[1]);
+        }
     }
 }

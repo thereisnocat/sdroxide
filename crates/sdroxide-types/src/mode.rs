@@ -248,6 +248,22 @@ impl Mode {
         matches!(self, Mode::Rifp | Mode::Packet | Mode::Aprs)
     }
 
+    /// True for the modes that go out on a *frequency-modulated* carrier.
+    ///
+    /// Asked when the answer changes what a level means rather than where the
+    /// dial sits, which is why it is not [`Mode::is_carrier_centered`] even
+    /// though the data modes in it are the same three: audio into an FM
+    /// transmitter is deviation, and audio into a sideband one is drive into
+    /// the modulator. The two want different numbers and neither is a sensible
+    /// default for the other — see [`crate::DigiConfig::tx_audio_level_fm`],
+    /// which this picks between.
+    ///
+    /// HF packet is deliberately not here: 300 baud is audio on a sideband like
+    /// any other keyboard mode.
+    pub fn is_fm_carrier(self) -> bool {
+        matches!(self, Mode::Nfm | Mode::Wfm | Mode::Rifp | Mode::Packet | Mode::Aprs)
+    }
+
     /// True for the continuous keyboard text modes (PSK31 / RTTY / Olivia / Thor
     /// / FSQ), as opposed to the slotted FT8/FT4 modes. Drives which decode
     /// engine + panel is used.

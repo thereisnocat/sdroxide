@@ -200,3 +200,181 @@ fn no_exception_escapes_the_c_boundary() {
         );
     }
 }
+
+/// One audio super frame, straight into the parser named by `kind`.
+///
+/// Returns the number of audio frames it yielded, -2 if the parser rejected the
+/// super frame, or -1 if the call threw.
+fn parse_superframe(kind: i32, part_a: usize, part_b: usize, bytes: &[u8]) -> i32 {
+    // SAFETY: the hook exists to be called, and `bytes`/`len` describe a live
+    // slice that the shim only reads for the duration of the call.
+    unsafe {
+        crate::sys::sdrx_drm_test_parse_superframe(
+            kind,
+            part_a as i32,
+            part_b as i32,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+        )
+    }
+}
+
+/// Point the parser named by `kind` at a stream of `part_a + part_b` byte frames.
+fn init_superframe(kind: i32, part_a: usize, part_b: usize) {
+    // SAFETY: a null `bytes` is the documented "initialise only" form.
+    let rc = unsafe {
+        crate::sys::sdrx_drm_test_parse_superframe(
+            kind,
+            part_a as i32,
+            part_b as i32,
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0, "kind {kind} would not initialise");
+}
+
+/// A corrupt audio super frame may not take the process down.
+///
+/// The header a DRM audio super frame starts with is four bits of frame border
+/// count and four of bit reservoir level, followed by a CRC the parser
+/// deliberately ignores — it would rather trust a damaged count than lose the
+/// super frame. Everything after that is arithmetic on unsigned lengths the
+/// broadcast supplied, so a single flipped bit used to walk a `deque` past its
+/// end (a null block pointer, reported from a station on 13730 kHz) or index an
+/// empty frame vector.
+///
+/// Noise is the honest input here: a DRM signal fading out delivers exactly
+/// this, and the MSC has no CRC standing between it and these parsers.
+///
+/// A failure is not a failed assertion. The test binary dies.
+#[test]
+fn a_corrupt_audio_superframe_cannot_crash_the_parser() {
+    let kinds = [
+        crate::sys::SDRX_DRM_SF_XHE_AAC,
+        crate::sys::SDRX_DRM_SF_AAC_12KHZ,
+        crate::sys::SDRX_DRM_SF_AAC_24KHZ,
+        crate::sys::SDRX_DRM_SF_AAC_MODE_E,
+    ];
+    // Real super frames run from a few dozen bytes for a 4 kbps voice service
+    // to a couple of thousand for 20 kHz DRM+; the degenerate sizes matter
+    // because that is where the length arithmetic wraps.
+    let sizes = [1usize, 2, 3, 4, 31, 32, 33, 100, 300, 301, 1000, 2000];
+
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut byte = || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (state >> 40) as u8
+    };
+
+    for kind in kinds {
+        for size in sizes {
+            for part_a in [0, size / 3, size] {
+                init_superframe(kind as i32, part_a, size - part_a);
+                // Long enough that the payload a parser carries between super
+                // frames gets a chance to grow, which is what the border
+                // arithmetic is measured against.
+                for _ in 0..200 {
+                    let frame: Vec<u8> = (0..size).map(|_| byte()).collect();
+                    let frames = parse_superframe(kind as i32, part_a, size - part_a, &frame);
+                    // Rejection (-2) is the expected answer to noise. The
+                    // assertion is that nothing threw, and - the point of the
+                    // test - that the process is still here to assert it.
+                    assert_ne!(
+                        frames,
+                        -1,
+                        "kind {kind} size {size} part A {part_a} threw: {:?}",
+                        crate::last_error()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The three xHE-AAC super frames that used to segfault, kept by name.
+///
+/// Each is a minimal header that a parser trusting its own arithmetic follows
+/// off the end of something. They are cheap to check and they say what broke,
+/// which the noise sweep above cannot.
+#[test]
+fn the_xhe_aac_superframes_that_used_to_segfault() {
+    const XHE: i32 = crate::sys::SDRX_DRM_SF_XHE_AAC as i32;
+    let size = 300usize;
+
+    // A directory pointing 4093 bytes into a 300 byte super frame: the frame
+    // size that comes out is larger than the payload the parser is holding, and
+    // the copy loop used to keep popping an empty deque.
+    let mut far = vec![0x5au8; size];
+    far[0] = 0x10; // frame border count 1, bit reservoir level 0
+    far[size - 2] = 0xff; // frame border index 0xffd ...
+    far[size - 1] = 0xd1; // ... and the count repeated as 1
+    init_superframe(XHE, 0, size);
+    assert_eq!(parse_superframe(XHE, 0, size, &far), -2, "far border");
+
+    // No frame borders at all — legal, and the spec says so explicitly — but
+    // the copy loop ran anyway and indexed an empty frame vector.
+    let mut none = vec![0x5au8; size];
+    none[0] = 0x00;
+    init_superframe(XHE, 0, size);
+    assert_eq!(parse_superframe(XHE, 0, size, &none), 0, "no frame borders");
+
+    // Fifteen frame borders need 30 bytes of directory, which does not fit in a
+    // ten byte super frame: the offset of the directory used to wrap.
+    let mut tiny = vec![0x5au8; 10];
+    tiny[0] = 0xf0;
+    init_superframe(XHE, 0, 10);
+    assert_eq!(parse_superframe(XHE, 0, 10, &tiny), -2, "directory too large");
+}
+
+/// A well-formed super frame still parses, on both codecs.
+///
+/// The counterweight to the checks above: every one of them rejects a super
+/// frame, and a rejection too eager would take a working broadcast off the air
+/// far more thoroughly than the crash did. Both frames here are built by hand
+/// from the layout in ETSI ES 201 980 - the xHE-AAC Header and Directory of
+/// clause 5.3.1.3, the AAC frame border table of clause 5.3.1.1.
+#[test]
+fn a_well_formed_superframe_parses() {
+    const XHE: i32 = crate::sys::SDRX_DRM_SF_XHE_AAC as i32;
+    const AAC: i32 = crate::sys::SDRX_DRM_SF_AAC_12KHZ as i32;
+    let size = 300usize;
+
+    // xHE-AAC: two frame borders, 2 bytes of Header, 294 bytes of Payload and a
+    // 4 byte Directory. The Directory is read last border first, and each entry
+    // is a 12 bit index into the super frame followed by the border count
+    // repeated. Borders at 102 and 202 cut the payload into two 100 byte frames
+    // and leave 94 bytes running on into the next super frame.
+    let mut good = vec![0x5au8; size];
+    good[0] = 0x20; // frame border count 2, bit reservoir level 0
+    good[size - 4] = 0x0c; // index 202 = 0x0ca ...
+    good[size - 3] = 0xa2; // ... then the count, 2
+    good[size - 2] = 0x06; // index 102 = 0x066 ...
+    good[size - 1] = 0x62; // ... then the count, 2
+    init_superframe(XHE, 0, size);
+    assert_eq!(parse_superframe(XHE, 0, size, &good), 2, "two frame borders");
+
+    // And the 94 bytes left over are carried: the next super frame declares one
+    // border at 102, which with the carry lands 194 bytes into the payload.
+    let mut next = vec![0x5au8; size];
+    next[0] = 0x10; // frame border count 1
+    next[size - 2] = 0x06; // index 102 ...
+    next[size - 1] = 0x61; // ... then the count, 1
+    assert_eq!(parse_superframe(XHE, 0, size, &next), 1, "carried payload");
+
+    // AAC at 12 kHz in modes A-D: 5 audio frames, so 4 frame borders in 6 bytes
+    // of header, then one CRC byte per frame and 289 bytes of audio. The
+    // borders are cumulative byte offsets - 50, 100, 150, 200 - packed as 12 bit
+    // fields, which puts four frames of 50 bytes ahead of a last one of 89.
+    let mut aac = vec![0x5au8; size];
+    aac[..6].copy_from_slice(&[0x03, 0x20, 0x64, 0x09, 0x60, 0xc8]);
+    init_superframe(AAC, 0, size);
+    assert_eq!(parse_superframe(AAC, 0, size, &aac), 5, "five AAC frames");
+
+    // The same frame under unequal protection, which is what the two length
+    // checks added to the AAC parser actually bound. Part A holds the 6 byte
+    // header, one CRC byte per frame and a 10 byte share of each frame:
+    // 6 + 5 + 50 = 61, leaving 239 bytes of Part B.
+    init_superframe(AAC, 61, size - 61);
+    assert_eq!(parse_superframe(AAC, 61, size - 61, &aac), 5, "five UEP AAC frames");
+}

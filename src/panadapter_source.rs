@@ -208,6 +208,10 @@ impl PanadapterSource {
             // false here however the transceiver answers: the window belongs to
             // the receiver and the dial moves inside it.
             center_is_dial: false,
+            // The receiver's, like the filter: if the radio painting the
+            // picture is combining two aerials, this radio is listening to
+            // what came out of that.
+            diversity: rx.diversity,
         }
     }
 

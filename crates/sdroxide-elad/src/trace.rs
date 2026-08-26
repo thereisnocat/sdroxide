@@ -129,10 +129,11 @@ impl Trace {
     /// The rate the stream was measured at against the rate it is being read
     /// as.
     ///
-    /// The single most useful line in the file for this backend, because the
-    /// DDC's decimation cannot be commanded by anything this driver knows how
-    /// to send: the configured rate is a *guess* at what the device was left
-    /// in, and this is the only evidence of whether the guess was right.
+    /// The single most useful line in the file for this backend. On a sampler
+    /// it says whether the FPGA image [`crate::fpga`] loaded is the one that
+    /// went in; on the transceiver, whose decimation nothing here can command,
+    /// the configured rate is a *guess* at what the radio was left in and this
+    /// is the only evidence of whether the guess was right.
     pub fn measured_rate(&self, configured_hz: f64, measured_hz: f64) {
         let err =
             if configured_hz > 0.0 { (measured_hz / configured_hz - 1.0) * 100.0 } else { 0.0 };
@@ -163,6 +164,9 @@ impl Trace {
             }
             None => out.push_str("(the device was never identified)\n"),
         }
+        out.push_str("\n--- fpga loader ---\n");
+        out.push_str(&crate::fpga::status_line());
+        out.push('\n');
         out.push_str("\n--- session ---\n");
         for line in &g.lines {
             out.push_str(line);

@@ -92,8 +92,22 @@ fn run(cmds: &[Command], timeout: Duration) -> bool {
                 }
             }
         }
-        if h.spectrum_out.update() && !h.spectrum_out.output_buffer().bins.is_empty() {
-            saw_frame = true;
+        if h.spectrum_out.update() {
+            let f = h.spectrum_out.output_buffer();
+            if !f.bins.is_empty() {
+                saw_frame = true;
+            }
+            // Keying up stops the waterfall clocking its own rows, and the
+            // client falls back to scrolling the spectrum on its wall clock.
+            // Whatever was batched before the over must not ride out beside
+            // that instruction: the client would draw it *and* scroll, and the
+            // renderer's fallback reads none of it — it indexes rows it was
+            // told are not there.
+            assert!(
+                f.rows_clocked || f.rows.is_empty(),
+                "a frame that does not clock rows carried {} of them",
+                f.row_count()
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }

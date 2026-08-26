@@ -16,18 +16,54 @@
 //! every other connection to that same station, so the operator signs in once
 //! and the rest of the tabs let themselves in. Ticking "remember" is the
 //! separate, longer-lived decision to keep it on this device between runs.
+//!
+//! Those automatic sign-ins go in one at a time ([`SIGNING_IN`]), because that
+//! is the only rate a station will judge them at: it compares one answer at a
+//! time and tells everybody else to come back. A station of four radios whose
+//! four tabs all answered on the same frame would have three of them turned
+//! away — and a tab that is not the one on screen never draws a card, so there
+//! is nobody there to try again. The gate, and treating that "come back" as
+//! the non-verdict it is ([`sdroxide_types::is_auth_busy`]), are what keep the
+//! rest of the station's tabs from arriving at a challenge they cannot answer.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
 
 use eframe::egui::{self, RichText};
-use sdroxide_types::{AuthPhase, RemoteAccess};
+use sdroxide_types::{AuthPhase, RemoteAccess, is_auth_busy};
 
 /// Sign-ins accepted this run, by station. Memory only, and never written
 /// anywhere: what survives a restart is the "remember" store at the bottom of
 /// this file, which is the operator's decision and not ours.
 static SESSION_LOGINS: LazyLock<Mutex<BTreeMap<String, RemoteAccess>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Stations with an automatic sign-in with the server right now, and the
+/// wall-clock second it went out at — the turn-taking gate described in the
+/// module docs.
+///
+/// One entry at a time per station, so this screen never asks a station to
+/// judge two answers at once. The timestamp is what stops a claim outliving
+/// the connection that made it: a tab whose socket died mid-attempt is never
+/// answered, so its claim is treated as abandoned after [`GATE_HOLD_S`] rather
+/// than holding the rest of the station's tabs out for the rest of the run.
+static SIGNING_IN: LazyLock<Mutex<BTreeMap<String, f64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// How long a claim on [`SIGNING_IN`] stands before the next tab takes its
+/// turn anyway. Generously longer than a round trip and than the three-second
+/// lockout a wrong answer costs, since the only thing on the other side of it
+/// is a tab waiting a moment longer than it had to.
+const GATE_HOLD_S: f64 = 15.0;
+
+/// How many answers one connection offers without being asked before it gives
+/// up and puts the card in front of the operator.
+///
+/// Only ever spent on answers that were never judged — a station that says
+/// "come back" — so this is a backstop against a station that says nothing
+/// else, not a retry budget for wrong passwords: those are spent on the first
+/// try and never offered again.
+const MAX_AUTO_ATTEMPTS: u8 = 8;
 
 /// Which station an address belongs to: everything up to the endpoint, so the
 /// several radios of one station (`/ws`, `/ws/1`, …) and its solar feed
@@ -57,11 +93,31 @@ pub struct LoginForm {
     /// Whether a stored sign-in has already been offered on this connection.
     /// Once only, so a stored password the server no longer accepts asks the
     /// operator instead of being posted back for ever.
+    ///
+    /// "This connection", not "this tab": a controller that reconnects keeps
+    /// the form it had, so both this and the flag below are re-armed the moment
+    /// a fresh challenge arrives ([`LoginForm::new_session`]). Without that a
+    /// tab that had reconnected once could never let itself in again — and a
+    /// tab nobody is looking at has no other way in.
     offered_stored: bool,
     /// Likewise for the sign-in another tab of this station made — offered
     /// once per connection, so a station that turns it down (the operator's
     /// access was withdrawn mid-session) asks this tab rather than looping.
     offered_session: bool,
+    /// How many automatic answers this connection has spent, against
+    /// [`MAX_AUTO_ATTEMPTS`]. Counted because the two flags above are put back
+    /// whenever an answer comes back unjudged, and something has to stop that
+    /// going round for ever.
+    auto_attempts: u8,
+    /// This form's claim on its station's [`SIGNING_IN`] gate, as the second
+    /// it was made at, so it can give it up again when the server answers —
+    /// and give up only its *own*, never the claim a later tab took over after
+    /// this one was abandoned.
+    holds_gate: Option<f64>,
+    /// Whether the last look for an automatic answer was stopped by another
+    /// tab of this station having the turn, rather than by there being nothing
+    /// to offer — see [`LoginForm::waiting_for_turn`].
+    waiting: bool,
     /// Which station this form belongs to, remembered from the last frame it
     /// was told: [`LoginForm::settle`] runs on the frame the answer is
     /// accepted, which is the frame that has to record it.
@@ -70,10 +126,31 @@ pub struct LoginForm {
     /// rejection can throw it away rather than leave a password behind that is
     /// known not to work.
     submitted_stored: bool,
-    /// Whether the challenge was outstanding last frame, so the moment the
-    /// server accepts can be noticed — that is when a sign-in is worth keeping,
-    /// and not before.
+    /// Whether the challenge was outstanding last frame, so a challenge
+    /// arriving where there was none can be recognised as a *new* session on
+    /// the same tab — which, after a reconnect, is the ordinary case.
     was_pending: bool,
+    /// Whether the server was judging an answer of ours last frame, so the
+    /// moment it accepts one can be noticed — that is when a sign-in is worth
+    /// keeping, and not before.
+    ///
+    /// `Checking` rather than merely "pending": a connection that is dropped
+    /// and redialled goes back to [`AuthPhase::Open`] with nothing having been
+    /// accepted, and reading that as an acceptance would file the last thing
+    /// typed — quite possibly the password the station had just refused — as
+    /// this station's known-good sign-in, and write it to disk.
+    was_checking: bool,
+    /// Whether this sign-in is the operator's own answer to the card, rather
+    /// than one the tab gave for itself.
+    ///
+    /// What it guards is the "remember" tick below, which is only an
+    /// instruction when somebody was actually shown it: a tab that let itself
+    /// in on another tab's sign-in never drew a card, so its `remember` is
+    /// `false` because nobody was asked — not because anybody unticked
+    /// anything. Acting on that is how a station of several radios erased the
+    /// operator's remembered sign-in on every run, the second tab quietly
+    /// forgetting what the first had just been let in with.
+    answered_by_hand: bool,
     /// Whether the fields have been given the keyboard yet.
     focused: bool,
     /// The backdrop's state and the frame time it started at, on the screens
@@ -91,11 +168,36 @@ impl LoginForm {
         if !station.is_empty() {
             self.station = station.to_string();
         }
+        // The claim on the station's gate is held for exactly as long as an
+        // answer is with the server, which is what `Checking` means. Anything
+        // else — a verdict, an accepted sign-in, a socket that went away — is
+        // the next tab's turn.
+        if self.holds_gate.is_some() && !matches!(phase, AuthPhase::Checking) {
+            self.release_gate();
+        }
+        // A station that was too busy to compare our answer did not refuse it:
+        // it is as good as it was, and this connection has to be free to offer
+        // it again. Nothing else here would — a tab that is not on screen never
+        // draws a card, so "ask the operator" is not an answer for it.
+        if let AuthPhase::Prompt(Some(why)) = phase
+            && is_auth_busy(why)
+        {
+            self.offered_stored = false;
+            self.offered_session = false;
+            self.submitted_stored = false;
+        }
         if phase.is_pending() {
+            // A challenge where a moment ago there was none: a new session on
+            // the same tab, which after a reconnect is the ordinary case.
+            if !self.was_pending {
+                self.new_session();
+            }
             self.was_pending = true;
+            self.was_checking = matches!(phase, AuthPhase::Checking);
             return;
         }
-        if !std::mem::take(&mut self.was_pending) {
+        self.was_pending = false;
+        if !std::mem::take(&mut self.was_checking) {
             return;
         }
         // Accepted. Every other tab of this station may use this answer for as
@@ -112,12 +214,59 @@ impl LoginForm {
                 username: self.username.clone(),
                 password: self.password.clone(),
             });
-        } else {
-            // Unticking it is an instruction, not an omission.
+        } else if self.answered_by_hand {
+            // Unticking it is an instruction, not an omission — but only from
+            // somebody who was shown the box. See [`Self::answered_by_hand`].
             forget();
         }
         self.password.clear();
         self.focused = false;
+    }
+
+    /// Put the once-per-connection state back, because there is a new
+    /// connection: the controller reconnects in place and keeps this form.
+    ///
+    /// What is deliberately *not* reset is the station key and the "remember"
+    /// tick, which belong to the operator rather than to the socket.
+    fn new_session(&mut self) {
+        self.offered_stored = false;
+        self.offered_session = false;
+        self.submitted_stored = false;
+        self.answered_by_hand = false;
+        self.auto_attempts = 0;
+        self.waiting = false;
+        self.focused = false;
+    }
+
+    /// Take this station's turn at signing in, if it is going.
+    fn claim_gate(&mut self, now: f64) -> bool {
+        if self.holds_gate.is_some() || self.station.is_empty() {
+            return true;
+        }
+        let mut gate = SIGNING_IN.lock().unwrap_or_else(|e| e.into_inner());
+        // Somebody else's attempt, and recent enough to still be alive. `now`
+        // is a wall clock, so a step backwards is treated as a live claim
+        // rather than as an ancient one.
+        if let Some(&at) = gate.get(&self.station)
+            && now >= at
+            && now - at < GATE_HOLD_S
+        {
+            return false;
+        }
+        gate.insert(self.station.clone(), now);
+        self.holds_gate = Some(now);
+        true
+    }
+
+    /// Give the turn back — but only if it is still ours. A claim this form
+    /// abandoned may since have been taken over by another tab, and pulling
+    /// that one out would let a third go at the same time.
+    fn release_gate(&mut self) {
+        let Some(mine) = self.holds_gate.take() else { return };
+        let mut gate = SIGNING_IN.lock().unwrap_or_else(|e| e.into_inner());
+        if gate.get(&self.station) == Some(&mine) {
+            gate.remove(&self.station);
+        }
     }
 
     /// The turning globe behind the card.
@@ -162,19 +311,52 @@ impl LoginForm {
 
     /// An answer this connection can give without asking anybody: the sign-in
     /// another tab of this station has already had accepted, or the one kept
-    /// on this device. `None` means the operator has to be asked.
+    /// on this device. `None` means either that the operator has to be asked,
+    /// or that another tab of this station is mid-attempt and it is not this
+    /// one's turn yet — [`LoginForm::waiting_for_turn`] tells the two apart.
     ///
     /// Public because a tab that is not on screen never draws the sign-in and
     /// still has to be able to let itself in — see `SdroxideApp::poll_auth`.
     pub fn answer_without_asking(&mut self, phase: &AuthPhase) -> Option<RemoteAccess> {
-        self.session_answer(phase).or_else(|| self.stored_answer(phase))
+        self.waiting = false;
+        if !answerable(phase) || self.auto_attempts >= MAX_AUTO_ATTEMPTS {
+            return None;
+        }
+        if !self.claim_gate(crate::time::now_unix_f64()) {
+            // Another tab of this station is mid-attempt. Whether there was
+            // anything to offer is not asked until the turn is ours, so this
+            // only says "come back", which is what the flag is for.
+            self.waiting = true;
+            return None;
+        }
+        let answer = self.session_answer(phase).or_else(|| self.stored_answer(phase));
+        match answer {
+            // Spent, and the turn is used: `settle` gives the gate back when
+            // the server answers.
+            Some(_) => self.auto_attempts += 1,
+            // Nothing to offer, so nothing is waiting on the station — hand
+            // the turn straight back rather than making the next tab sit out
+            // the whole hold.
+            None => self.release_gate(),
+        }
+        answer
+    }
+
+    /// Whether the last [`LoginForm::answer_without_asking`] was turned back
+    /// only because another tab of the same station had the turn.
+    ///
+    /// The shell reads it to keep asking for frames: a tab that is not on
+    /// screen has no other reason to be redrawn, and its turn comes round on
+    /// somebody else's socket.
+    pub fn waiting_for_turn(&self) -> bool {
+        self.waiting
     }
 
     /// The answer another tab of this station has already had accepted, if
     /// there is one. Offered once per connection, and ahead of the stored
     /// sign-in: it is the one this station is known to be taking *now*.
     fn session_answer(&mut self, phase: &AuthPhase) -> Option<RemoteAccess> {
-        if !matches!(phase, AuthPhase::Prompt(None)) || self.offered_session {
+        if !answerable(phase) || self.offered_session {
             return None;
         }
         let known =
@@ -190,7 +372,7 @@ impl LoginForm {
     /// What was stored, offered once against the first challenge of a
     /// connection.
     fn stored_answer(&mut self, phase: &AuthPhase) -> Option<RemoteAccess> {
-        if !matches!(phase, AuthPhase::Prompt(None)) || self.offered_stored {
+        if !answerable(phase) || self.offered_stored {
             return None;
         }
         self.offered_stored = true;
@@ -200,6 +382,22 @@ impl LoginForm {
         self.remember = true;
         self.submitted_stored = true;
         Some(stored)
+    }
+}
+
+/// Whether the server is waiting for an answer that may be given without
+/// troubling the operator.
+///
+/// A fresh challenge, plainly — and also one whose last answer came back
+/// unjudged, because the station was busy comparing somebody else's. That is
+/// not a refusal (see [`sdroxide_types::AUTH_BUSY`]), so the same answer is
+/// still the right one to give; anything else the station says is a verdict on
+/// the answer, and a verdict is the operator's to deal with.
+fn answerable(phase: &AuthPhase) -> bool {
+    match phase {
+        AuthPhase::Prompt(None) => true,
+        AuthPhase::Prompt(Some(why)) => is_auth_busy(why),
+        AuthPhase::Open | AuthPhase::Checking => false,
     }
 }
 
@@ -223,13 +421,24 @@ pub fn screen(
         AuthPhase::Prompt(why) => why.as_deref(),
         _ => None,
     };
-    if refused.is_some() && std::mem::take(&mut form.submitted_stored) {
+    // A station too busy to compare it has not turned it down: it said nothing
+    // about the password at all, and throwing away a working sign-in on the
+    // strength of that is how a station of several radios loses the one the
+    // operator ticked "remember" for.
+    let turned_down = refused.is_some_and(|why| !is_auth_busy(why));
+    if turned_down && std::mem::take(&mut form.submitted_stored) {
         // The stored sign-in was turned down, so it is no use to anybody —
         // least of all next time, when it would be offered again and fail
         // again before the operator was ever asked.
         forget();
     }
-    let checking = matches!(phase, AuthPhase::Checking);
+    // Waiting for another tab of this station to finish its attempt is a wait,
+    // not a question: this connection has an answer and is going to give it as
+    // soon as the turn comes round, so the card says so rather than putting an
+    // empty box and a red line in front of an operator with nothing to do.
+    let waiting = form.waiting_for_turn();
+    let refused = refused.filter(|why| !(waiting && is_auth_busy(why)));
+    let checking = matches!(phase, AuthPhase::Checking) || waiting;
     let tier = crate::layout::tier(ui.ctx());
     let touch = tier.touch();
 
@@ -275,6 +484,7 @@ pub fn screen(
         return None;
     }
     form.submitted_stored = false;
+    form.answered_by_hand = true;
     Some(RemoteAccess { username: form.username.clone(), password: form.password.clone() })
 }
 
@@ -487,6 +697,7 @@ mod tests {
             ..LoginForm::default()
         };
         first.settle(&AuthPhase::Prompt(None), station);
+        first.settle(&AuthPhase::Checking, station);
         first.settle(&AuthPhase::Open, station);
 
         // The second radio's tab, challenged afterwards, answers by itself.
@@ -532,6 +743,7 @@ mod tests {
     fn the_password_does_not_linger_after_a_successful_sign_in() {
         let mut form = LoginForm { password: "hunter2".into(), ..LoginForm::default() };
         form.settle(&AuthPhase::Prompt(None), "ws://lingering.test:4950");
+        form.settle(&AuthPhase::Checking, "ws://lingering.test:4950");
         form.settle(&AuthPhase::Open, "ws://lingering.test:4950");
         assert!(form.password.is_empty());
     }
@@ -548,5 +760,163 @@ mod tests {
         assert!(form.stored_answer(&AuthPhase::Prompt(None)).is_none());
         // Nor does a rejection re-open it.
         assert!(form.stored_answer(&AuthPhase::Prompt(Some("no".into()))).is_none());
+    }
+
+    /// A form that can answer by itself without ever reaching this machine's
+    /// real `remote_login.json`: `offered_stored` is spent up front, so only
+    /// the session answer below is ever in play.
+    fn tab(station: &str) -> LoginForm {
+        LoginForm { station: station.into(), offered_stored: true, ..LoginForm::default() }
+    }
+
+    fn known(station: &str, password: &str) {
+        SESSION_LOGINS.lock().unwrap().insert(
+            station.to_string(),
+            RemoteAccess { username: "oe3jjs".into(), password: password.into() },
+        );
+    }
+
+    /// The one that shut whole stations out (issue #176): a station judges one
+    /// sign-in at a time and tells everybody else to come back, and "come
+    /// back" is not a refusal. A tab that spent its answer on one would sit at
+    /// the challenge for the rest of the run — and a tab that is not the one on
+    /// screen never draws a card, so there is nobody to ask.
+    #[test]
+    fn an_unjudged_answer_is_offered_again() {
+        let station = "ws://busy.test:4950";
+        known(station, "hunter2");
+        let mut form = tab(station);
+
+        form.settle(&AuthPhase::Prompt(None), station);
+        assert!(form.answer_without_asking(&AuthPhase::Prompt(None)).is_some());
+        form.settle(&AuthPhase::Checking, station);
+
+        // "Another sign-in is being checked" — nothing was compared.
+        let busy = AuthPhase::Prompt(Some(sdroxide_types::AUTH_BUSY.into()));
+        form.settle(&busy, station);
+        let again = form.answer_without_asking(&busy).expect("the answer was never judged");
+        assert_eq!(again.password, "hunter2");
+    }
+
+    /// ...but a station that actually turned the answer down is answered by
+    /// the operator, not by posting the same password back for ever.
+    #[test]
+    fn a_refusal_is_final() {
+        let station = "ws://refused.test:4950";
+        known(station, "hunter2");
+        let mut form = tab(station);
+
+        form.settle(&AuthPhase::Prompt(None), station);
+        assert!(form.answer_without_asking(&AuthPhase::Prompt(None)).is_some());
+        form.settle(&AuthPhase::Checking, station);
+
+        let no = AuthPhase::Prompt(Some(sdroxide_types::AUTH_REFUSED.into()));
+        form.settle(&no, station);
+        assert!(form.answer_without_asking(&no).is_none());
+    }
+
+    /// A station that says nothing but "come back" still ends up in front of
+    /// the operator rather than looping for ever.
+    #[test]
+    fn the_automatic_answers_run_out() {
+        let station = "ws://always-busy.test:4950";
+        known(station, "hunter2");
+        let busy = AuthPhase::Prompt(Some(sdroxide_types::AUTH_BUSY.into()));
+        let mut form = tab(station);
+        form.settle(&AuthPhase::Prompt(None), station);
+
+        for _ in 0..MAX_AUTO_ATTEMPTS {
+            assert!(form.answer_without_asking(&busy).is_some());
+            form.settle(&AuthPhase::Checking, station);
+            form.settle(&busy, station);
+        }
+        assert!(form.answer_without_asking(&busy).is_none(), "this could go round for ever");
+    }
+
+    /// A controller reconnects in place and keeps its form, so the
+    /// once-per-connection flags have to come back with the new connection.
+    /// Without this a tab that had dropped once could never let itself in
+    /// again — and a hidden one has no other way in.
+    #[test]
+    fn a_reconnect_re_arms_the_automatic_answer() {
+        let station = "ws://redial.test:4950";
+        known(station, "hunter2");
+        let mut form = tab(station);
+
+        form.settle(&AuthPhase::Prompt(None), station);
+        assert!(form.answer_without_asking(&AuthPhase::Prompt(None)).is_some());
+        form.settle(&AuthPhase::Checking, station);
+        // The link goes: the controller resets to `Open` and redials. Nothing
+        // was accepted, so nothing is filed as this station's known-good
+        // sign-in either.
+        form.settle(&AuthPhase::Open, station);
+        assert!(!form.was_checking);
+        // ...and the fresh challenge is answered without the operator.
+        form.settle(&AuthPhase::Prompt(None), station);
+        assert!(form.answer_without_asking(&AuthPhase::Prompt(None)).is_some());
+    }
+
+    /// One station, one attempt in flight. Four radios' tabs answering on the
+    /// same frame is exactly what a station turns three of away for.
+    #[test]
+    fn one_tab_of_a_station_signs_in_at_a_time() {
+        let station = "ws://turnstile.test:4950";
+        known(station, "hunter2");
+        let (mut a, mut b) = (tab(station), tab(station));
+        a.settle(&AuthPhase::Prompt(None), station);
+        b.settle(&AuthPhase::Prompt(None), station);
+
+        assert!(a.answer_without_asking(&AuthPhase::Prompt(None)).is_some());
+        assert!(b.answer_without_asking(&AuthPhase::Prompt(None)).is_none(), "both went at once");
+        assert!(b.waiting_for_turn(), "the second tab has to be looked at again");
+
+        // The first one's attempt is answered, and the turn passes.
+        a.settle(&AuthPhase::Checking, station);
+        a.settle(&AuthPhase::Open, station);
+        assert!(b.answer_without_asking(&AuthPhase::Prompt(None)).is_some());
+        assert!(!b.waiting_for_turn());
+        b.settle(&AuthPhase::Checking, station);
+        b.settle(&AuthPhase::Open, station);
+        assert!(SIGNING_IN.lock().unwrap().get(station).is_none(), "the turn was never given back");
+    }
+
+    /// The other half of issue #176: a tab that let itself in on another tab's
+    /// sign-in was never shown the "remember" box, so its unticked state is
+    /// nobody's instruction — and acting on it erased the sign-in the operator
+    /// had ticked it for, every run, as soon as the station's second radio
+    /// connected.
+    #[test]
+    fn a_tab_that_was_never_asked_does_not_forget_the_stored_sign_in() {
+        let station = "ws://remembering.test:4950";
+        known(station, "hunter2");
+        let mut form = tab(station);
+        form.settle(&AuthPhase::Prompt(None), station);
+        assert!(form.answer_without_asking(&AuthPhase::Prompt(None)).is_some());
+        form.settle(&AuthPhase::Checking, station);
+        form.settle(&AuthPhase::Open, station);
+        assert!(
+            !form.answered_by_hand,
+            "nobody was shown the card, so nothing here speaks for the operator"
+        );
+        assert!(!form.remember);
+    }
+
+    /// A claim on the gate cannot outlive the connection that made it: a tab
+    /// whose socket died mid-attempt is never answered, and the rest of the
+    /// station must not be held out behind it.
+    #[test]
+    fn an_abandoned_turn_is_taken_back() {
+        let station = "ws://abandoned.test:4950";
+        let mut stuck = tab(station);
+        assert!(stuck.claim_gate(1000.0));
+        let mut next = tab(station);
+        assert!(!next.claim_gate(1000.0 + GATE_HOLD_S / 2.0));
+        assert!(next.claim_gate(1000.0 + GATE_HOLD_S + 1.0));
+        // The abandoned tab coming back to life must not pull the claim out
+        // from under the tab that took over.
+        stuck.release_gate();
+        assert!(!tab(station).claim_gate(1000.0 + GATE_HOLD_S + 2.0));
+        next.release_gate();
+        assert!(SIGNING_IN.lock().unwrap().get(station).is_none());
     }
 }

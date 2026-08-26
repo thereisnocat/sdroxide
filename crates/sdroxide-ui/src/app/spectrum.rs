@@ -10,9 +10,26 @@ use eframe::egui::Color32;
 use sdroxide_types::{SkimmerKind, SkimmerSpot, SpectrumConfig, Spot, SpotKind};
 
 use crate::time::{now_unix, now_unix_f64};
+use crate::waterfall_gpu;
 use crate::widgets::spectrum_view;
 
 use crate::app::SdroxideApp;
+
+/// What this machine will actually draw, so the SPEC popup's detail row can
+/// show the operator what `Auto` decided and grey what the renderer cannot
+/// hold. Built by [`SdroxideApp::detail_report`].
+///
+/// Worked out here rather than in `sdroxide-types`, where
+/// [`sdroxide_types::UiSettings`] lives: that crate must never learn about
+/// wgpu.
+pub(in crate::app) struct DetailReport {
+    /// Columns in force right now, whatever the setting says.
+    pub chosen: u32,
+    /// The widest the operator may pick on this renderer.
+    pub ceiling: u32,
+    /// One sentence naming what bound it, for the hover on a greyed chip.
+    pub reason: String,
+}
 
 /// Viewport/FFT config updates are sent once the view has been stable this
 /// long (seconds of egui time — `std::time::Instant` panics on wasm).
@@ -147,16 +164,21 @@ pub(in crate::app) struct AutoFit {
     pending: bool,
 }
 
-/// What an automatic fit is a fit *of*: the visible window, the resolution it
-/// is drawn at, the width the front end delivers, and the band the dial sits
-/// in. The band is carried separately because a wideband front end can be
+/// What an automatic fit is a fit *of*: the visible window, the two numbers the
+/// resolution is made of — the transform size and the columns it is pooled into
+/// — the width the front end delivers, and the band the dial sits in.
+///
+/// The column count belongs here for the same reason the FFT size does: pooling
+/// into more columns takes the maximum of fewer bins apiece, so every level in
+/// the picture moves and the contrast the last fit chose is no longer the right
+/// one. The band is carried separately because a wideband front end can be
 /// retuned clear across a band edge without the visible span moving.
 ///
 /// Deliberately *not* the tuned frequency: on a front end whose centre follows
 /// the dial, every nudge of the knob would then be a refit, and tuning across a
 /// band would keep re-contrasting the waterfall underneath the operator. What
 /// such a retune really changes is the levels, and drift already answers that.
-type FitKey = (f64, f64, u32, f64, sdroxide_types::Band);
+type FitKey = (f64, f64, u32, u32, f64, sdroxide_types::Band);
 
 /// Whether a new automatic fit may start: the interval since the last one began
 /// has elapsed, and the view has held still long enough that the frames in hand
@@ -220,6 +242,84 @@ impl SdroxideApp {
     /// slack around the visible span so panning inside it needs no
     /// reconfiguration (which would clear the waterfall history); the FFT
     /// grows with zoom for real resolution.
+    /// The panadapter width this client wants: the operator's setting, or what
+    /// `Auto` makes of this machine and this screen.
+    ///
+    /// Two things have to agree on this number — the config sent to the engine
+    /// ([`Self::desired_spectrum_cfg`]) and the history texture the waterfall
+    /// draws into (`WfTuning::tex_w`, filled in [`Self::wf_tick`]) — and they
+    /// agree by both calling here. Cheap enough per frame: a handful of
+    /// comparisons over numbers gathered once when the window opened.
+    ///
+    /// A manual choice is still held to what the renderer can hold, so a
+    /// `config.toml` carried from a desktop to a Raspberry Pi does not ask the
+    /// Pi for a texture it cannot make. The stored preference is left alone —
+    /// carrying it back gets the detail back.
+    /// Record how wide the panadapter is about to be drawn, in device pixels.
+    ///
+    /// Taken from the `Ui` rather than from the window, so a split view gives
+    /// each pane its own answer — two radios side by side are each half the
+    /// screen and should each ask for what they can show. Multiplied by the
+    /// zoom factor because egui measures in points and a texture is measured in
+    /// pixels: a 4K laptop at 2× scaling reports about 1900 points for a
+    /// 3840-pixel panadapter, and believing it would leave the operator with
+    /// exactly the picture issue #172 is about.
+    pub(in crate::app) fn note_panadapter_width(&mut self, ui: &eframe::egui::Ui) {
+        let px = (ui.available_width() * ui.ctx().pixels_per_point()).max(0.0) as u32;
+        self.panadapter_px = self.panadapter_px.max(px);
+    }
+
+    pub(in crate::app) fn panadapter_bins(&self) -> u32 {
+        self.bins_for_detail(self.ui_settings.spectrum_detail)
+    }
+
+    /// [`Self::panadapter_bins`] for a setting that is not (yet) the one in
+    /// force — what the settings window reads back while the operator is still
+    /// choosing.
+    pub(in crate::app) fn bins_for_detail(&self, detail: sdroxide_types::SpectrumDetail) -> u32 {
+        let Some(class) = self.display_class else {
+            return waterfall_gpu::DEFAULT_TEX_W;
+        };
+        match detail.columns() {
+            Some(want) => {
+                want.clamp(waterfall_gpu::DEFAULT_TEX_W, waterfall_gpu::manual_ceiling(class))
+            }
+            None => waterfall_gpu::auto_display_bins(class, self.panadapter_px),
+        }
+    }
+
+    /// What the detail row of the SPEC popup shows beside its chips: the width
+    /// in force, the widest that may be picked, and one sentence naming
+    /// whatever stopped it going higher.
+    ///
+    /// The sentence is the point. A greyed chip with no explanation is a bug
+    /// report; a greyed chip that says *why* is an answer.
+    pub(in crate::app) fn detail_report(
+        &self,
+        detail: sdroxide_types::SpectrumDetail,
+    ) -> DetailReport {
+        let ceiling =
+            self.display_class.map_or(waterfall_gpu::DEFAULT_TEX_W, waterfall_gpu::manual_ceiling);
+        let reason = match self.display_class {
+            None => "This window has no GPU renderer, so the waterfall stays at its                      standard width."
+                .to_string(),
+            Some(c) if c.device_type == crate::egui_wgpu::wgpu::DeviceType::Cpu => {
+                "This machine is drawing without a GPU — every column of the waterfall                  is the processor's work, and it is already sharing that with the radio."
+                    .to_string()
+            }
+            Some(c) if c.backend == crate::egui_wgpu::wgpu::Backend::Gl => {
+                "This window renders through OpenGL, which is sdroxide's compatibility                  path — a Raspberry Pi, an older graphics chip, or a browser without                  WebGPU. A wider waterfall is not worth the frame rate there."
+                    .to_string()
+            }
+            Some(c) if c.max_texture_dim < waterfall_gpu::MAX_TEX_W => format!(
+                "This renderer will not hold a texture wider than {} pixels.",
+                c.max_texture_dim
+            ),
+            Some(_) => "Wider than this renderer can draw.".to_string(),
+        };
+        DetailReport { chosen: self.bins_for_detail(detail), ceiling, reason }
+    }
+
     pub(in crate::app) fn desired_spectrum_cfg(&self) -> SpectrumConfig {
         let full_span = self.state.sample_rate;
         let (viewport, zoom) = if !self.view.is_unset() && full_span > 0.0 {
@@ -251,11 +351,25 @@ impl SdroxideApp {
         // asking for, and the seconds it costs are then a price they chose.
         let base = base_fft_for_rate(self.view.fft_size, full_span);
         let mut fft = base;
-        while (fft as f64) < base as f64 * zoom.min(8.0) && fft < 32_768 {
+        while (fft as f64) < base as f64 * zoom.min(8.0) && fft < MAX_FFT {
             fft *= 2;
         }
         SpectrumConfig {
             fft_size: fft,
+            // The same number the waterfall texture is built at — see
+            // `panadapter_bins`. The engine holds it to its own ceiling and to
+            // what its FFT can actually fill, so the frame that comes back may
+            // be narrower; the texture upload resamples where it is.
+            display_bins: self.panadapter_bins(),
+            // The waterfall's own clock. Not `fps`: the engine appends lines to
+            // a texture, which is cheap, where a frame is a repaint, which is
+            // not — see `SpectrumConfig::rows_per_sec`. Scaled by the display's
+            // zoom factor for the same reason the rows on screen are, so a line
+            // is one device pixel tall on a HiDPI panel too.
+            rows_per_sec: (self.ui_settings.waterfall_rows_per_sec() * self.wf_row_scale)
+                .round()
+                .clamp(1.0, f32::from(sdroxide_types::MAX_ROWS_PER_SEC))
+                as u16,
             db_floor: self.view.db_floor,
             db_ceil: self.view.db_ceil,
             viewport,
@@ -276,9 +390,24 @@ impl SdroxideApp {
     /// once the stream has stalled (a radio switched off, a device gone quiet),
     /// so the last frame is not duplicated down the screen as time that never
     /// happened. The callers judge staleness; this only stops the rows.
-    pub(in crate::app) fn wf_tick(&mut self, live: bool) -> spectrum_view::WfTuning {
+    ///
+    /// `row_scale` is the display's pixels per egui point. The waterfall stores
+    /// one history row per point by default, which on a HiDPI panel means every
+    /// row is drawn two pixels tall — the vertical half of the coarse picture
+    /// issue #172 is about. Scaling *both* the row rate and the rows on screen
+    /// by it puts one row on one pixel and changes nothing else: the seconds in
+    /// view, the scroll speed and the gridline spacing are all ratios of the
+    /// two and come out identical. What it costs is scrollback, since the ring
+    /// is a fixed number of rows — 18 s instead of 36 at the medium rate on a
+    /// 2× display.
+    pub(in crate::app) fn wf_tick(
+        &mut self,
+        live: bool,
+        row_scale: f32,
+    ) -> spectrum_view::WfTuning {
         let now = now_unix_f64();
-        let rows_per_sec = self.ui_settings.waterfall_rows_per_sec();
+        self.wf_row_scale = row_scale.max(1.0);
+        let rows_per_sec = self.ui_settings.waterfall_rows_per_sec() * self.wf_row_scale;
         // Clamp dt so a hitch/tab-away can't dump a huge run of rows at once.
         let dt =
             if self.wf_last_now > 0.0 { (now - self.wf_last_now).clamp(0.0, 0.3) } else { 0.0 };
@@ -312,7 +441,11 @@ impl SdroxideApp {
         });
         spectrum_view::WfTuning {
             rows_to_write,
-            rows_per_sec,
+            // The operator's own rate, unscaled: the gridlines are spaced in
+            // points and derive the rest from `row_scale` themselves.
+            rows_per_sec: self.ui_settings.waterfall_rows_per_sec(),
+            row_scale: row_scale.max(1.0),
+            tex_w: self.panadapter_bins(),
             now_unix: self.wf_now_pin,
             spectrum_alpha,
             palette: s.waterfall_palette,
@@ -327,6 +460,8 @@ impl SdroxideApp {
         let Some(sent) = self.sent_cfg else { return false };
         let ideal = self.desired_spectrum_cfg();
         if sent.fft_size != ideal.fft_size
+            || sent.display_bins != ideal.display_bins
+            || sent.rows_per_sec != ideal.rows_per_sec
             || sent.db_floor != ideal.db_floor
             || sent.db_ceil != ideal.db_ceil
             || sent.fps != ideal.fps
@@ -446,6 +581,36 @@ impl SdroxideApp {
             .collect()
     }
 
+    /// The stored memories to mark along the bottom of the waterfall.
+    ///
+    /// Only the ones on the visible span are formatted. A station list runs to
+    /// hundreds of channels and this is rebuilt every frame, so the span the
+    /// last frame was drawn with does the filtering — a pan moves the picture
+    /// and its marks together on the frame after, which is one frame and
+    /// invisible.
+    pub(in crate::app) fn memory_overlay(&self) -> Vec<crate::widgets::memories::MemMark> {
+        let (lo, hi) = (self.view.view_lo_hz, self.view.view_hi_hz);
+        self.memories
+            .iter()
+            .filter(|m| (lo..=hi).contains(&m.freq_hz))
+            .map(|m| {
+                // A memory whose folder has gone from under it reads as
+                // unfiled, exactly as the memory window lists it.
+                let folder = m
+                    .folder
+                    .and_then(|id| self.mem_folders.iter().find(|f| f.id == id))
+                    .map(|f| f.name.as_str());
+                crate::widgets::memories::MemMark {
+                    freq_hz: m.freq_hz,
+                    text: match folder {
+                        Some(f) => format!("Mem: {f} / {}", m.name),
+                        None => format!("Mem: {}", m.name),
+                    },
+                }
+            })
+            .collect()
+    }
+
     pub(in crate::app) fn net_overlay(&self, now_utc: i64) -> (Vec<Spot>, Vec<f32>) {
         let max_age = self.net_cfg_edit.spot_max_age_secs.max(60) as i64;
         let mut spots = Vec::new();
@@ -542,6 +707,7 @@ impl SdroxideApp {
             self.view.view_lo_hz,
             self.view.view_hi_hz,
             self.view.fft_size,
+            self.panadapter_bins(),
             self.state.sample_rate,
             sdroxide_types::Band::containing(self.state.active_freq_hz()),
         );
@@ -655,6 +821,22 @@ impl SdroxideApp {
 /// device-wide lane above ten new pictures a second on any front end.
 const MAX_FFT_WINDOW_S: f64 = 0.1;
 
+/// The largest device-wide transform the chips offer.
+///
+/// Not a throughput ceiling: an FFT's cost per *sample* grows only as the log
+/// of its size, because the hop grows with it — 131072 on a 2 Msps front end
+/// runs a quarter the transforms of 32768 at rather less than four times the
+/// work each, so the totals are within a fifth of one another. What bounds it
+/// is time. One transform covers `fft / rate` seconds, and that is both the
+/// panadapter's update period and its smear: 131072 at 2 Msps is 65 ms and
+/// 15 Hz a bin, and the same size on a 48 kHz audio lane would be 2.7 seconds.
+///
+/// [`MAX_FFT_WINDOW_S`] already holds the *base* to a tenth of a second on any
+/// front end, so a narrow lane never reaches here at all. This is the ceiling
+/// for the zoom multiplier stacked on top, where the seconds are a price the
+/// operator chose by zooming in.
+const MAX_FFT: u32 = 131_072;
+
 /// The operator's FFT size, reduced to what `rate_hz` can deliver inside
 /// [`MAX_FFT_WINDOW_S`] — the largest power of two that fits, never below the
 /// 1024 floor the chip row starts at, and unchanged when the rate is unknown.
@@ -753,10 +935,16 @@ mod tests {
     /// The measured fault: an IC-705 over its LAN port on the 12 kHz IF runs
     /// the engine at 24 kHz, where the 32768 chip covers 1.365 s of signal and
     /// hands the waterfall 1.46 new pictures a second. Capped to 2048 it covers
-    /// 85 ms — and loses no drawable bin, because a frame carries 2048 of them.
+    /// 85 ms — and loses nothing a narrow lane could have drawn anyway: 2048
+    /// bins over 24 kHz is already 12 Hz apiece.
+    ///
+    /// The two largest chips make this cap matter more, not less. They are for
+    /// front ends that stream megahertz; on a lane like this one they would be
+    /// seconds of smear apiece, and the rate is what refuses them.
     #[test]
     fn a_narrow_lane_cannot_afford_the_widest_chip() {
         assert_eq!(base_fft_for_rate(32_768, 24_000.0), 2048);
+        assert_eq!(base_fft_for_rate(super::MAX_FFT, 24_000.0), 2048);
         assert!(2048.0 / 24_000.0 <= super::MAX_FFT_WINDOW_S);
         // The CAT/Audio path, at twice the rate, affords twice the window.
         assert_eq!(base_fft_for_rate(32_768, 48_000.0), 4096);
@@ -767,8 +955,24 @@ mod tests {
         // 2 Msps affords 131072, so every chip on the row passes through.
         assert_eq!(base_fft_for_rate(32_768, 2_000_000.0), 32_768);
         assert_eq!(base_fft_for_rate(4096, 2_000_000.0), 4096);
+        assert_eq!(base_fft_for_rate(super::MAX_FFT, 2_000_000.0), super::MAX_FFT);
         // And a rate we do not know yet changes nothing.
         assert_eq!(base_fft_for_rate(32_768, 0.0), 32_768);
+    }
+
+    /// Every chip on the row is a power of two the rate cap can actually
+    /// deliver somewhere, and none of them is past the ceiling the zoom
+    /// multiplier stops at.
+    #[test]
+    fn every_offered_fft_size_is_reachable() {
+        for n in [2048u32, 4096, 8192, 16_384, 32_768, 65_536, 131_072] {
+            assert!(n.is_power_of_two());
+            assert!(n <= super::MAX_FFT, "{n} is past the ceiling");
+            // The rate at which one transform is exactly the longest window
+            // allowed; anything faster affords the chip whole.
+            let rate = f64::from(n) / super::MAX_FFT_WINDOW_S;
+            assert_eq!(base_fft_for_rate(n, rate), n, "{n} at {rate} Hz");
+        }
     }
 
     #[test]

@@ -385,6 +385,31 @@ pub(in crate::app) fn enum_combo<T: PartialEq + Copy>(
     });
 }
 
+/// The device list an interface draws itself from, where asking for it is
+/// free: a USB enumeration that opens nothing, a sound-card list, or the
+/// SDRplay service's own device table.
+///
+/// `None` for the interfaces with no list (an address is typed, not picked)
+/// and for the three whose enumeration is *not* free — SoapySDR loads every
+/// installed module, LimeSuite opens each board to read its identity, and the
+/// HPSDR / FlexRadio / Pluto scans take seconds on the network. Those stay on
+/// the buttons the operator presses deliberately.
+fn free_device_probe(backend: sdroxide_types::Backend) -> Option<sdroxide_types::DeviceProbe> {
+    use sdroxide_types::{Backend as B, DeviceProbe as P};
+    Some(match backend {
+        B::Cat => P::RadioAudio,
+        B::RtlSdr => P::RtlSdr,
+        B::Rx888 => P::Rx888,
+        B::AirspyHf => P::AirspyHf,
+        B::Airspy => P::Airspy,
+        B::HydraSdr => P::HydraSdr,
+        B::HackRf => P::HackRf,
+        B::SdrPlay => P::SdrPlay,
+        B::Elad => P::Elad,
+        _ => return None,
+    })
+}
+
 impl SdroxideApp {
     /// Ask the machine the radio is attached to a question about its devices.
     ///
@@ -480,6 +505,10 @@ impl SdroxideApp {
             // last scrolled to — the offset is one shared egui memory for all
             // the tabs, and it outlives the process.
             self.settings_scroll_top = true;
+            // ...and asks again for the device list of whatever interface it
+            // opens on: a dongle can be unplugged between one open and the
+            // next.
+            self.iface_probed = None;
             return;
         } else if !self.audio_devices_queried {
             self.audio_devices = self.ctrl.audio_devices();
@@ -510,48 +539,25 @@ impl SdroxideApp {
             {
                 self.ask_device(ctx, sdroxide_types::DeviceProbe::Soapy);
             }
-            // The sound cards the rig itself is wired to, which are the CAT
-            // interface's *device* — on any other backend the audio is in-band
-            // and there is nothing here to choose.
-            if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Cat) {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::RadioAudio);
-            }
             if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Lime) {
                 self.ask_device(ctx, sdroxide_types::DeviceProbe::Lime);
             }
-            // The RSP tab draws itself from the model in this list — which
-            // antenna ports exist, whether there is an HDR path, how far the
-            // LNA goes. Asking the service is one round trip and opens no
-            // device, so it happens on open: without it the tab falls back to
-            // the RSP1B feature set, and an RSPdx owner is left with no
-            // antenna selector until they think to press Rescan.
-            if self
-                .radio_cfg
-                .as_ref()
-                .is_some_and(|c| c.backend == sdroxide_types::Backend::SdrPlay)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::SdrPlay);
-            }
-            // Cheap and opens nothing, same as the RTL-SDR list — and without
-            // it a HackRF owner arriving on this tab sees an empty device combo
-            // until they think to press Rescan.
-            if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::HackRf)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::HackRf);
-            }
-            if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Airspy)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::Airspy);
-            }
-            if self
-                .radio_cfg
-                .as_ref()
-                .is_some_and(|c| c.backend == sdroxide_types::Backend::HydraSdr)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::HydraSdr);
+            // Whichever interface is configured, its device list — the sound
+            // cards a CAT rig is wired to, the dongles on the bus, the RSPs the
+            // service reports. Every one of these is cheap and opens nothing,
+            // and each tab draws itself from its own list: which antenna ports
+            // exist, whether there is an HDR path, how far the LNA goes. Asked
+            // here so the tab is furnished when it is first looked at, and
+            // remembered so switching *to* another interface asks for that
+            // one's (see below) — a list that never arrived is a tab that
+            // silently falls back to a different model's feature set, which is
+            // issue #165.
+            let applied = self.radio_cfg.as_ref().map(|c| c.backend);
+            self.iface_probed = applied;
+            if let Some(p) = applied.and_then(free_device_probe) {
+                self.ask_device(ctx, p);
             }
             if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Elad) {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::Elad);
                 // An FDM-DUO's control link is a serial port like any other
                 // rig's, and its transmit audio is a sound card, so this tab
                 // needs both lists the CAT tab needs. The ports are asked for
@@ -1132,15 +1138,27 @@ impl SdroxideApp {
         if pluto_copy_report {
             self.ask_device(ctx, P::Report(R::Pluto));
         }
-        // Switching *to* the CAT interface inside the open dialog: its sound
-        // cards were not among the questions asked when it opened, and the two
-        // pickers are the whole of choosing that interface's device.
-        if radio_edit.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Cat)
-            && self.radio_audio_devices.is_none()
+        // Switching to another interface inside the open dialog: its device
+        // list was not among the questions asked when the dialog opened, and
+        // that list is what its tab draws itself from. Once per switch, not
+        // once per frame — and only the free enumerations, never the ones that
+        // open devices to identify them (SoapySDR, LimeSuite) or scan a
+        // network, which stay on their Rescan buttons.
+        let editing = radio_edit.as_ref().map(|c| c.backend);
+        if editing.is_some()
+            && editing != self.iface_probed
             && self.probes_answered
             && self.probe_waiting == 0
         {
-            self.ask_device(ctx, P::RadioAudio);
+            self.iface_probed = editing;
+            if let Some(p) = editing.and_then(free_device_probe) {
+                self.ask_device(ctx, p);
+            }
+            // The FDM-DUO's second list, for the same reason as on the
+            // dialog-open path above: its transmit audio is a sound card.
+            if editing == Some(sdroxide_types::Backend::Elad) {
+                self.ask_device(ctx, P::RadioAudio);
+            }
         }
         if apply_iface {
             // The fields that wait for this moment, so the radio is never
@@ -3161,9 +3179,9 @@ impl SdroxideApp {
                         RichText::new(if chip.enabled { "ON" } else { "OFF" }).size(11.0),
                     )
                     .on_hover_text(if chip.enabled {
-                        "Switch this radio off: its interface is closed, its settings are kept"
+                        crate::chrome::POWER_OFF_TIP
                     } else {
-                        "Switch this radio on"
+                        crate::chrome::POWER_ON_TIP
                     })
                     .clicked()
                 {

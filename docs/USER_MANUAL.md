@@ -257,6 +257,15 @@ sub-segments, and the shortwave broadcast blocks that overlap an amateur band in
 one region and not another (3.900–4.000 and 7.200–7.300 are broadcasting in
 Regions 1 and 3 and amateur in Region 2).
 
+**Memory marks.** Every stored memory whose frequency falls on the visible span
+is labelled just inside the band-plan strip, reading `Mem: folder / name` — or
+`Mem: name` for one that is not filed in a folder — on a thin green line drawn
+at the frequency itself. Channels close together stagger into stacked rows
+rather than overprinting; a name too long for its label is cut short with an
+ellipsis, and anything that would need a fifth row is left out. The marks are an
+annotation, not a control: [§2.12](#212-memory-channels) is where a channel is
+stored and recalled.
+
 ### 2.4 Bands and modes
 
 Click the **Band / Mode** button (which reads, for example, `20M · USB`) to open a
@@ -433,7 +442,7 @@ mode. What is in the box never changes; only where the two rows are cut does.
   and data modes, whose signals *are* tones.)
 - **NR** — noise reduction on the audio, with four selectable engines. The button
   always reads just `NR` and lights when noise reduction is in circuit — that is
-  all it tells you, and it never changes width under the chips beside it. Click
+  all it tells you, and it never changes width under the buttons beside it. Click
   it for a picker with an **Engine** row and a **Strength** row, which is where
   you both read back what is running and change it, so any setting is two clicks
   away; hovering the button names it too. A keyboard or MIDI binding cycles the
@@ -455,7 +464,7 @@ mode. What is in the box never changes; only where the two rows are cut does.
     and a *whitened* noise floor: rather than carving the residue into birdies it
     flattens what is left into even hiss. Good on steady static where the neural
     engines sound processed.
-  - **NR** — the built-in **spectral** noise reduction, whose engine chip keeps
+  - **NR** — the built-in **spectral** noise reduction, whose engine button keeps
     the bare name the button has always worn: it suppresses the stationary noise
     floor while letting the changing, speech-like parts through. Fast and
     predictable on steady static and hiss.
@@ -528,13 +537,17 @@ mode. What is in the box never changes; only where the two rows are cut does.
   out when a lorry goes past. A station sending no group 2A sends no radio text —
   the group list will tell you that, where the blank field cannot.
 
-  Two things are deliberately not shown. **Traffic message channel** data is
-  decoded by nobody here: the messages are numeric references into a licensed
+  Text is read through the standard's own character table, so accented letters —
+  `ä`, `ö`, `å`, `ß` and the rest of the European set — arrive as themselves.
+  That table is close to ASCII but not equal to it: a `¤` where you expected a
+  dollar is the station sending plain ASCII into a slot the standard gives to the
+  international currency sign. Codes with no printable character at all still
+  come out as `·`.
+
+  One thing is deliberately not shown: **traffic message channel** data is
+  decoded by nobody here. The messages are numeric references into a licensed
   location database, and without it "event 108 at location 12345" is all there is
-  to say. And accented characters come out as `·`. The standard has its own
-  character table above plain ASCII, which this build does not reproduce, and a
-  wrong letter in a station's name is indistinguishable from a bad decode in a
-  way that a dot is not.
+  to say.
 - **DRM** (DRM only) — how the **Digital Radio Mondiale** decoder is getting on.
   The button lights only when audio is actually being decoded, not merely when a
   carrier is present, so it answers "is this station coming through?" at a
@@ -596,22 +609,37 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
 
 **Display module:**
 
-- **FIT** — keep the waterfall floor and ceiling set for the best contrast.
-  Lit, the levels are refitted by themselves: when you change band, once a pan
-  or zoom has settled, and whenever what the band is doing has drifted far
-  enough that the waterfall has gone flat or blown out. An automatic refit is
-  eased in over about five seconds, aimed at a rolling average of the levels, so
-  a station coming up for a moment doesn't move the contrast — and no more than
-  one refit is started every five seconds. Switching FIT **on** fits at once,
-  which is also how to ask for a one-off fit: click it off and on again.
-  Switching it off leaves the levels wherever you set them (the floor and
-  ceiling in the FFT popup are yours to keep only while FIT is off).
-- **PEAK** — show a decaying peak-hold trace over the spectrum.
-- **SPEC** — opens the **Layers** popup, which switches the two halves of the
-  panadapter on and off independently: **SPECTRUM** (the spectrum line) and
-  **WATERFALL** (the scrolling display below it). All four displays are
-  available — spectrum only, waterfall only, both, or neither — and the chip is
-  lit while both layers are shown.
+- **☀ 3D** — open the [solar system 3D view](#7-solar-system-3d-view): a second
+  window in the native app, a second browser tab in the web client.
+- **SPEC** — opens the **panadapter popup**, which holds everything the
+  panadapter is drawn by, in two boxes: one for the **spectrum** line across
+  the top, one for the **waterfall** under it. The button is lit while both
+  layers are shown.
+
+  In the **Spectrum** box:
+
+  - **SHOW SPECTRUM** — draw the spectrum line, or leave the height to the
+    waterfall.
+  - **PEAK HOLD** — trace the highest level each column has reached over the
+    live line, decaying back down.
+  - **reaction** — how quickly the line follows the band: **Slow**, **Medium**
+    or **Fast**. Slower averages more frames into each other, which steadies
+    the line and holds a weak carrier still long enough to read. The waterfall
+    is not touched by it — those rows get every frame either way.
+  - **detail** — how many columns the panadapter *and its waterfall* are drawn
+    with; the width in force is named beside the chips. See
+    [Panadapter detail](#panadapter-detail) below.
+
+  In the **Waterfall** box:
+
+  - **SHOW WATERFALL** — draw the scrolling waterfall, or leave the height to
+    the spectrum line.
+  - **scroll** — how fast it scrolls. See
+    [Waterfall scroll speed](#waterfall-scroll-speed) below.
+
+  The two SHOW switches are independent, so all four displays are available —
+  spectrum only, waterfall only, both, or neither.
+
   - With one of them off the other takes the full height, with the frequency
     scale still along its edge; dragging that scale brings the hidden layer
     back at the split you drag to. Skimmer and spot boxes move onto the
@@ -619,7 +647,11 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
   - With **both** off there is no panadapter at all. In a mode with an
     operating panel under it — the digital modes, and CW — the panel takes the
     whole height; in the other modes the area is simply left empty. The SPEC
-    chip is the way back.
+    button is the way back.
+
+  Detail and the two speeds are this screen's own preference rather than the
+  radio's: a remote client picks its own, and neither the station nor another
+  client is touched. They are remembered between sessions.
 - **WIDE** — show or hide the **full-band strip**: a shallow second waterfall
   above the panadapter covering everything the receiver can see at once, with a
   blue outline around the slice the panadapter is receiving and an amber line on
@@ -634,19 +666,38 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
   all the hardware delivers — and the setting is remembered between sessions.
   The strip is not shown in the digital modes, whose layout gives the height to
   the operating panel instead.
+- **FIT** — keep the waterfall floor and ceiling set for the best contrast.
+  Lit, the levels are refitted by themselves: when you change band, once a pan
+  or zoom has settled, and whenever what the band is doing has drifted far
+  enough that the waterfall has gone flat or blown out. An automatic refit is
+  eased in over about five seconds, aimed at a rolling average of the levels, so
+  a station coming up for a moment doesn't move the contrast — and no more than
+  one refit is started every five seconds. Switching FIT **on** fits at once,
+  which is also how to ask for a one-off fit: click it off and on again.
+  Switching it off leaves the levels wherever you set them (the floor and
+  ceiling in the FFT popup are yours to keep only while FIT is off).
 - **SKIM** — opens the skimmer popup (per-skimmer on/off and squelch); lit while
   any skimmer runs. See [Skimmers](#4-skimmers).
 - **SCAN** — opens the scanner window; lit while a scan is running, green while
   it has stopped on a signal. See [Scanning](#213-scanning).
-- **☀ 3D** — open the [solar system 3D view](#7-solar-system-3d-view): a second
-  window in the native app, a second browser tab in the web client.
 
 **FFT module:**
 
 - **floor** / **ceil** — the waterfall's dB range.
-- **FFT** size — `2048`, `4096`, `8192`, `16384`, or `32768`. This is the FFT
-  over the *whole* of what the radio streams, and the panadapter grows it with
-  the zoom until it runs out. Past that, zooming in gets a window of its own:
+- **FFT** size — `2048`, `4096`, `8192`, `16384`, `32768`, `65536` or `131072`.
+  This is the FFT over the *whole* of what the radio streams, and the panadapter
+  grows it with the zoom until it runs out.
+
+  A word on what the larger sizes buy. The transform is pooled down to the
+  panadapter's own columns — 2048 of them by default, more on a screen that can
+  show more ([Panadapter detail](#panadapter-detail), on the SPEC popup) — so up to that
+  width a bigger FFT is more columns, and past it, it is *sharper* ones: each
+  column becomes the strongest of more bins, so a weak carrier stands further
+  out of the noise instead of being averaged into it. That is why the largest
+  sizes are worth having on a wide front end and do nothing at all on a narrow
+  one, where the size is capped by the rate regardless (a transform may not
+  cover more than a tenth of a second of signal, which on an Icom's 24 kHz I.F.
+  is 2048 whatever is lit). Past that, zooming in gets a window of its own:
   the visible span is mixed down and decimated to its own width before it is
   analysed, so the detail you see follows the window you are looking at rather
   than how wide the front end happens to be. It matters most on a receiver that
@@ -681,6 +732,63 @@ dragging the frequency-scale strip between them, and hide either or both of
 them altogether from the **SPEC** popup in the Display module.
 
 ![Waterfall colour schemes](images/05-colormaps.png)
+
+#### Panadapter detail
+
+How many columns the panadapter and its waterfall are drawn with, on the
+**detail** row of the SPEC popup. **AUTO** is the default and is what nearly
+everyone should leave it on: it reads this machine's graphics — the largest
+texture it will hold, whether it is drawing on a real GPU or in software, which
+renderer is in use, whether the radio is across a network — together with how
+wide the panadapter actually is *in pixels*, and picks the most the machine can
+carry. The number it settled on is shown beside the chips.
+
+The steps are **2048**, **4096** and **8192** columns. 2048 is what every
+sdroxide before this one drew, and about what a 1080p panadapter can show; 4096
+is one column per pixel of a 4K panel, which is the point of the setting; 8192
+is two per pixel, which keeps a carrier sharp while the view is panned off the
+pixel grid. A step this machine cannot hold is shown greyed, with the reason on
+hover — a Raspberry Pi, an older graphics chip, a browser without WebGPU and a
+machine drawing without a GPU at all are all held to 2048, because a wider
+waterfall there costs the frame rate and buys a picture the renderer cannot draw
+anyway.
+
+AUTO stops at 4096 even on a very large screen; 8192 is there to be chosen.
+AUTO also stays at 2048 when the radio is on the other end of a network,
+because every column is a byte in every frame — 4096 columns at 60 fps is
+about a quarter of a megabyte a second — and there is no way to measure the
+link from this end. On a LAN, set it by hand.
+
+Detail costs memory on the graphics card: 8 MB per radio tab at 2048, 16 at
+4096, 32 at 8192. Changing it restarts the waterfall's history from black,
+once.
+
+#### Waterfall scroll speed
+
+How fast the waterfall scrolls, in lines a second, on the **scroll** row of the
+SPEC popup: **Slow** (5), **Medium** (28), **Fast** (56), **Faster** (112) or
+**Fastest** (224). Faster trades screen time for vertical resolution, which is
+what you want when a CW or FT8 trace is smearing into the line above it; Slow
+keeps several minutes of band on screen at once.
+
+The two fastest settings are past the rate any screen redraws at, and that is
+deliberate: the radio clocks the waterfall's lines itself rather than one per
+redraw, so 224 a second is 224 *different* lines rather than 56 of them drawn
+four times. Each line is also the **strongest** thing its slice of time
+contained rather than a snapshot at the end of it, so a CW dot or the edge of
+a burst that is shorter than the gap between two lines still gets drawn
+instead of falling between them.
+
+What limits it is the receiver, not the screen. A line can never show more
+than one transform of the FFT, and a front end produces `sample rate ÷ half
+the FFT size` of those a second — an RX-888 at 8 MHz through a 32768-point
+window makes about 500, so it can feed any of these settings, while a 24 kHz
+I.F. through the same window makes under one and repeats lines at every
+setting. Two costs worth knowing: the waterfall keeps a fixed number of
+lines, so history shortens as the rate rises (73 seconds at Medium, 9 at
+Fastest), and to a *remote* client every line is a byte per column on the
+link.
+
 
 ### 2.9 The S-meter
 
@@ -719,7 +827,7 @@ watching for is the needle falling while drive stays put.
 Where there is no power meter but there is an **SWR** bridge, the lower row is
 SWR instead, on a logarithmic scale with 1:1 at the left stop, 3:1 at mid-scale
 and everything past 3:1 in red. Either way the SWR keeps its place as a number
-in the header chip. Rigs with neither show the drive row alone, grown to fill
+in the header button. Rigs with neither show the drive row alone, grown to fill
 the space.
 
 Where the reading comes from depends on the interface. An SDR delivers IQ and
@@ -944,6 +1052,10 @@ level. Folders collapse and expand with the arrow at the left of their header,
 and a memory scan works through every memory regardless of the folder it
 sits in.
 
+Every memory on the visible span is also marked along the bottom of the
+waterfall, as `Mem: folder / name` — see
+[2.3 Tuning](#23-tuning).
+
 ![The memory channels window](images/06-memories.png)
 
 ---
@@ -993,10 +1105,10 @@ that the radio is not fighting you for the VFO.
 
 **SKIP works in a range scan too**, and it is remembered. There is no stored
 channel to mark, so the frequency itself goes on a skip list shown under the
-range — a row of chips, one per channel, with **CLEAR** to empty it. The list
+range — a row of buttons, one per channel, with **CLEAR** to empty it. The list
 is saved with the rest of the settings, so a data channel, a pager or a birdie
 dismissed once stays dismissed for the rest of the evening and for every later
-run over the same range, instead of costing a stop every pass. Click a chip to
+run over the same range, instead of costing a stop every pass. Click a button to
 put its channel back into the scan.
 
 The list belongs to **the range it was taken in**: change the From, the to or
@@ -1041,6 +1153,14 @@ is audible.
   *below* the signal, so with a 700 Hz pitch it reads 700 Hz low. The logbook's
   **+ NEW ENTRY** ([3.2.6](#326-logging-and-the-logbook)) fills itself in from
   the same figure, not from the dial.
+- **On a transceiver that keys its own transmitter, that same figure is what
+  the radio's VFO reads.** It has to be: the rig makes the carrier itself, on
+  its VFO, so leaving the VFO on sdroxide's zero-beat would answer every station
+  a sidetone low. sdroxide puts the VFO on the contact and tunes the pitch out
+  on its own side, so the two readouts differ by exactly your pitch and both are
+  right. Radios that shift their own I.F. in CW instead — a K3 on
+  `CONFIG:CW WGHT: VFO OFS`, a QMX sending I/Q — have already done that
+  themselves and are left alone.
 
 **What the header tells you.** A CW decoder cannot fail quietly the way a
 framed digital mode does — fed noise, a naive one produces confident nonsense —
@@ -1336,6 +1456,20 @@ stays exactly where it is. The tab stays too, with its name greyed, and its
 whole Settings → Radio page is still there to be read and edited. Press the
 switch again and the radio opens where it left off.
 
+It is *sdroxide's* switch rather than the radio's, and the difference matters
+on a station with more than one rig on it. What it lets go of is this end of
+the connection — the USB device, the serial CAT port, the LAN session — so
+sdroxide is demonstrably no longer holding that radio: the dongle can be
+unplugged, the port is free for another program, and the rig's network session
+is hung up. A transceiver with a power switch of its own is not touched by it
+and stays on, receiving into its own speaker; sdroxide has no way to press that
+switch and, having pressed it, no way to press it back. What is guaranteed is
+the transmit side: a radio that is off has no transmitter as far as sdroxide is
+concerned, so nothing — not PTT, not TUNE, not a digital-mode sequence, not a
+program on its built-in server — can key it until it is switched back on. That
+is on top of the station-wide interlock below, which applies to every radio
+that *is* switched on.
+
 The same switch is in the roster at the top of **Settings → Radio**, which is
 where the choice is easiest to see across all the radios at once — and on the
 main window itself, as the **⏻ power button** above the A/B selector in the
@@ -1519,7 +1653,7 @@ tones actually asks for.
   length is next to it (100–2000 ms; 500 is a good default). It is also an
   action — **1750 Hz tone burst** — so it can go on a key, a mouse button, a
   MIDI pad or a footswitch ([6.4](#64-controls-keyboard-mouse-and-midi)).
-- **Receive tone squelch** — the same control as the tone chip in the receiver
+- **Receive tone squelch** — the same control as the tone button in the receiver
   module ([2.7](#27-receiver-controls)), with a **MATCH TX** shortcut that arms
   on receive whatever this station transmits.
 
@@ -1720,7 +1854,7 @@ them apart:
   nothing to keep apart, so both what you receive and what you send are written
   to both channels and the file plays centred instead of out of one ear.
 
-**MONO**, the chip that follows REC, writes a single channel instead, with receive and
+**MONO**, the button that follows REC, writes a single channel instead, with receive and
 transmit taking turns on it: a smaller file, and the honest format for a
 recording that is going to be played back in mono anyway.
 
@@ -1917,14 +2051,14 @@ The panel has two halves:
   that carry no locator, and the flags are built into the program — nothing is
   fetched from the internet to draw them. CQ calls are highlighted. Decoded
   stations are also marked as boxes on the waterfall.
-  The **Sort** chips order the stations within each turn: **SNR** (strongest
+  The **Sort** buttons order the stations within each turn: **SNR** (strongest
   first), **Dist** (farthest first) or **Country** (A to Z by DXCC entity, which
-  puts every station from the same country together). Pressing the active chip
-  again reverses it — the arrow on the chip says which way it is running — and
+  puts every station from the same country together). Pressing the active button
+  again reverses it — the arrow on the button says which way it is running — and
   **None** returns to the order the decoder found them in. Turns stay in their
   own blocks whichever sort is chosen; only the rows inside a turn move.
   **Single list** dissolves the turn blocks: every decode goes into one list,
-  newest turn first, and the Sort chips then order the whole list at once — the
+  newest turn first, and the Sort buttons then order the whole list at once — the
   band's strongest signals or farthest DX in one sweep, whichever turn carried
   them. The odd/even headers go with the blocks, so each row carries its slot
   time instead, coloured by the slot's parity (cyan for even, gold for odd) —
@@ -2211,6 +2345,17 @@ manual entries. You can:
   Field lengths are read as the byte counts ADIF specifies, but exporters that
   count characters instead (QRZ's logbook among them) are handled too, so
   accented names and QTHs survive the import intact.
+
+  A file need not be Unicode. Plenty of Windows loggers write their national
+  code page instead, and a Cyrillic or accented name in one used to stop the
+  whole file — every callsign in it — from importing. Such a file is now read
+  anyway: a byte-order mark or valid UTF-8 is taken at its word, and anything
+  else is read as Windows-1251 or Windows-1252 depending on which the text looks
+  like. That last step is a guess, and the network log line at the end of the
+  import names the code page it went with, so a name that comes out as nonsense
+  tells you which one to say when you report it. Everything the log is really
+  keyed on — callsign, date, band, mode, frequency — is plain ASCII in all of
+  them and imports correctly either way. Exports are always UTF-8.
 - **ADIF** — export the whole log to `sdroxide-log.adi` (also the file you sign
   with TQSL for LoTW).
 - **TXT** — export the whole log to `sdroxide-log.txt`.
@@ -3058,7 +3203,7 @@ region's:
 
 Set your region under **Settings → General**. If the dial is already on any
 region's APRS channel — you tuned Japan's 144.640 by hand — it is left alone,
-and so is any move you make once you are in the mode. The **⇵ FREQ** chip beside
+and so is any move you make once you are in the mode. The **⇵ FREQ** button beside
 the frequency lists the other regions' channels.
 
 Unlike the slotted modes, the waterfall is **not** narrowed to the channel. APRS
@@ -3184,14 +3329,32 @@ on your channel is sending a format this build does not read.
   network buffers more on top of that. Too little and the far end never locks —
   the transmission is on the air and nothing decodes it. Shared with the packet
   mode, since it is a property of the radio rather than of the protocol.
-- **TX audio** — how loud the burst is handed to a radio that modulates it
-  itself, and **on FM that is the deviation**. An FM transmitter turns audio
-  level into frequency swing and has no ALC to catch it: 1200 baud packet wants
-  about 3 kHz where voice wants 5, so full scale into a data input set for voice
-  over-deviates. An over that over-deviates sounds completely normal to anyone
-  listening and decodes for nobody, so this is the first thing to try when your
-  frames are clean and still nothing acknowledges them. Full scale by default;
-  the radio's own input level is the other half of it.
+- **TX audio** — how loud the over is handed to a radio that modulates it
+  itself: a CAT rig on its sound card, a FLEX, an Icom on its network port. A
+  radio sdroxide modulates itself always gets full scale, because there the
+  modulator and Drive own the level instead.
+
+  There are **two of these levels and the row shows the one your current mode
+  uses**, because the number does two unrelated jobs:
+
+  - **On FM — VHF packet, APRS, RIFP — it is the deviation.** An FM transmitter
+    turns audio level into frequency swing and has no ALC to catch it: 1200 baud
+    packet wants about 3 kHz where voice wants 5, so full scale into a data input
+    set for voice over-deviates. An over that over-deviates sounds completely
+    normal to anyone listening and decodes for nobody, so this is the first thing
+    to try when your frames are clean and still nothing acknowledges them.
+  - **On sideband — FT8, RTTY, PSK, HF packet, everything else — it is drive
+    into the modulator.** Bring it down until the rig's ALC is barely moving and
+    set the power at the radio: ALC riding on a constant-envelope digital mode is
+    what splatters. On these radios Drive reaches the rig's *power* register
+    rather than its audio, so this is the level.
+
+  Both are full scale by default, and the radio's own input level is the other
+  half of either. They are separate so that a deviation set for packet does not
+  quietly take 8 dB off your FT8 — which is what one shared number used to do,
+  invisibly, because it could only be reached from the APRS panel. A
+  configuration written before the split keeps its level on both sides until you
+  change one.
 - **Keep stations** — how long a station stays on the map after it was last
   heard, and what the map's fade is measured against.
 
@@ -3269,6 +3432,16 @@ hundredths of an inch the protocol carries.
 The skimmers decode many signals at once across a wide (~192 kHz) window and
 label each one on the waterfall. There are three: **CW**, **PSK31**, and
 **RTTY**.
+
+**Where they listen.** The window follows the waterfall: it is placed on the part
+of the band you are looking at, and only signals actually on screen are tracked
+and decoded. On a narrow receiver that is the whole span and there is nothing to
+choose, but a wide front end — an RX-888 handing over megahertz at a time —
+delivers far more band than a skimmer's window covers, and the window goes where
+you are rather than sitting in the middle of the span. Pan across the band and it
+follows, once the pan has left the window it was on; zoom out past 192 kHz and it
+keeps your dial covered, so the part of a band-wide view that gets skimmed is the
+part you are tuned into.
 
 ![The skimmer labelling signals on the waterfall](images/10-skimmer.png)
 
@@ -3493,7 +3666,7 @@ de-obfuscation from prose and apply it to a single unverifiable capture — whic
 would produce device addresses that look authoritative and might be nonsense —
 the frame is listed with its bytes and no interpretation.
 
-**Unidentified bursts** — the `UNKNOWN` chip. Off by default. With it on, every
+**Unidentified bursts** — the `UNKNOWN` button. Off by default. With it on, every
 burst that gates but matches no decoder is listed anyway, **classified** and
 described by what could be measured about it:
 
@@ -4775,7 +4948,7 @@ only.
   never wider than that filter however far you zoom out — which is exactly the
   "the spectrum barely covers one broadcast station" complaint. With the scope
   on, the main panadapter becomes the radio's sweep, centred on the dial and as
-  wide as **Scope span**, and the full-band strip (the **WIDE** chip) carries
+  wide as **Scope span**, and the full-band strip (the **WIDE** button) carries
   it too. The digital modes switch back to the audio band, which is where FT8
   and the keyboard modes place their signals.
 
@@ -5315,9 +5488,21 @@ Receive only — there is no transmit path in this hardware.
   - an **RTL-SDR Blog V4** upconverts in hardware, so HF simply works and the
     dial reads correctly with no offset to apply anywhere;
   - other dongles reach HF only by **direct sampling** the ADC's Q branch, which
-    is what a V3's HF port is wired to. *Automatic* switches at 28.8 MHz (with
-    hysteresis, so a dial parked near the boundary does not flap); *Direct
-    sampling (Q branch)* forces it; *Off* disables HF entirely.
+    is what a V3's HF port is wired to. *Automatic* switches at the tuner's own
+    24 MHz floor (with hysteresis above it, so a dial parked near the boundary
+    does not flap); *Direct sampling (Q branch)* forces it; *Off* disables HF
+    entirely.
+
+  Direct sampling reaches every HF band, including **17 m and 15 m** — the two
+  that sit above the ADC's 14.4 MHz Nyquist limit and below the tuner's floor,
+  with nowhere else to go. They arrive in the ADC's second Nyquist zone, the
+  right way up, and you tune them at their real frequency like anything else.
+  What you should expect is that whatever is at `28.8 MHz - dial` comes with
+  them: there is no filter in front of the ADC, so 17 m carries 10.7 MHz and
+  15 m carries 7.726 MHz folded on top. Both are quiet enough that FT8 decodes;
+  an HF preselector in front of the dongle removes them entirely. 12 m and 10 m
+  are above 24 MHz, so *Automatic* gives them to the tuner and the question does
+  not arise.
 
   Switching between the tuner and direct sampling re-initialises the tuner and
   briefly interrupts the stream.
@@ -5745,9 +5930,10 @@ service, or the device.
   and the RSPduo's tuner 1 (50 Ω / Hi-Z). Applied live; the Hi-Z inputs have
   a shorter LNA ladder, which the clamping above absorbs.
 - **Tuner** (RSPduo) — which of the two tuners to run, chosen when the device
-  opens. With **Run both tuners** on (below) this names the tuner your *main*
-  aerial is on, and the other one carries the second. Master/slave operation —
-  sharing the receiver with another application — is not supported.
+  opens. With **Run both tuners** on (below) this names the tuner *this radio*
+  listens on: the other one carries the second aerial, or belongs to the second
+  radio. Master/slave operation — sharing the receiver with another
+  application — is not supported.
 - **HDR mode** (RSPdx / RSPdx R2) — the high-dynamic-range path below 2 MHz.
 - **Bias tee** — about 4.7 V DC up the coax for an active antenna (every model
   except the original RSP1).
@@ -5761,7 +5947,7 @@ in the log: raise the LNA state, lower the IF gain, or turn the AGC on. If the
 RSP is unplugged — or the service restarted under sdroxide — it notices within
 a few seconds and reconnects by itself when the device returns.
 
-##### The RSPduo's second tuner: diversity and QRM suppression
+##### The RSPduo's second tuner
 
 > **Help wanted — this has not been verified against an RSPduo.** Dual-tuner
 > operation here is written from SDRplay's API rather than measured on the
@@ -5770,11 +5956,23 @@ a few seconds and reconnects by itself when the device returns.
 > numbers or by arrival order, and how deep a null the filter is reaching.
 
 An RSPduo is two complete tuners on one board, clocked from one reference. Run
-both — **Run both tuners** on the Radio tab — and they hear the same span at
-the same instant, with a relative phase set by the aerials and the feedlines
-rather than by chance. That is what makes it possible to combine them, and it
-is the same arrangement (and the same adaptive filter) as the LimeSDR's second
-receive chain in [§6.2.17](#6217-limesdr-family--limerfe-limesuite).
+both — **Run both tuners** on the Radio tab — and there are two things worth
+doing with the other one. **Used for** picks:
+
+- **A second aerial (diversity / QRM suppression)** — the two are *combined*.
+  Because they are clocked together they hear their spans at the same instant,
+  with a relative phase set by the aerials and the feedlines rather than by
+  chance, and that is what makes combining them possible. Same arrangement, and
+  the same adaptive filter, as the LimeSDR's second receive chain in
+  [§6.2.17](#6217-limesdr-family--limerfe-limesuite).
+- **A second radio, on its own frequency** — the two are left *apart*. The
+  tuners tune separately, so one RSPduo can be an HF radio in one tab and a VHF
+  radio in another; see *Both tuners as two radios* below.
+
+Either takes effect on **Apply**: which mode the board runs in is chosen when
+it is opened.
+
+##### Diversity and QRM suppression
 
 **What to do with it** picks between the two jobs:
 
@@ -5814,9 +6012,18 @@ The rest of the controls:
   **Hold**. A filter left adapting will re-aim itself at whatever becomes
   loudest, which on a quiet band is the station you are listening to.
 
-Everything except **Run both tuners** itself applies as you change it —
-finding a null is done by adjusting and listening. Turning the mode on or off
-reopens the device, because the API fixes it when the RSPduo is selected.
+Everything except **Run both tuners** and **Used for** applies as you change it
+— finding a null is done by adjusting and listening. Those two reopen the
+device, because the API fixes the mode when the RSPduo is selected.
+
+**The three you use while listening are on the main window.** With a filter
+running, the strip grows a **DIV** box (a **DIV** menu on a narrow window):
+the mode — **CANCEL** or **COMBINE**, click to swap — **HOLD**, **RESTART**,
+and the adaptation rail. That is the whole workflow with the waterfall in front
+of you: adaptation to the right, watch the noise drop away, **HOLD**. What stays
+in the settings dialog is what you set once — the filter length, and the second
+aerial's own gains. The box appears only while a filter is actually running,
+so it is also the confirmation that one is.
 
 **What running both tuners costs.** The API puts the ADC at a fixed 6 MHz and
 hands back 2 Msps from a low IF, so **2 Msps is the widest span** with both
@@ -5838,6 +6045,43 @@ If the second tuner stops delivering, the first one carries on alone and the
 log says so: the receiver keeps working and the filter stops, rather than the
 other way round. Asking for both tuners on any other RSP — a setting left
 behind by an RSPduo — is reported on screen and ignored.
+
+##### Both tuners as two radios
+
+Set **Used for** to *A second radio, on its own frequency* and the pair is not
+combined at all: each tuner is a receiver of its own, tuned where you like.
+One RSPduo then serves two radio tabs — HF in one and VHF in the other — from
+one board and one connection to the API service.
+
+Both radios have to be set up for it, because whichever one opens the board is
+what puts it into dual-tuner mode:
+
+1. On the first radio: pick the RSPduo, tick **Run both tuners**, set **Used
+   for** to *A second radio*, and set **This radio's tuner** to the one its
+   aerial is on. **Apply**.
+2. Add a second radio (**Settings → Radio → +**,
+   [§2.17](#217-running-more-than-one-radio)), give it the **same receiver**
+   (the same serial), the **other** tuner, and the same two settings.
+   **Apply**.
+
+Either order works, and either radio may be started first; the second one to
+open finds the board already running and takes the tuner that is free. Closing
+one leaves the other streaming, and the board is only handed back to the
+service when the last radio lets go.
+
+What the two share, because the hardware does:
+
+- **The sample rate.** One ADC clock and one decimator setting serve both, so
+  whichever radio opened the board sets the rate and the other adopts it —
+  its own rate setting is remembered but not used while it is the second one
+  in. The dual-tuner ceiling of 2 Msps applies as always.
+- **The reference trim** (*Frequency correction*), which is the board's.
+- **The notch filters and bias tee** are *not* shared: those are per tuner, and
+  each radio drives its own.
+
+Neither radio transmits — no RSP does — and a tuner belongs to one radio at a
+time: a second radio pointed at a tuner that is already running, or at the
+second tuner of a board being used for diversity, is told so and does not open.
 
 #### 6.2.9 Airspy HF+ (USB)
 
@@ -5933,18 +6177,20 @@ software speaks. No licence for RS-BA1 is needed, and no computer at the radio
 end: sdroxide talks to the transceiver directly.
 
 It covers every Icom with a network port — the **IC-7300MK2**, **IC-705**,
-**IC-9700**, **IC-7610**, **IC-905** and **IC-R8600** — because the protocol is
-the same on all of them and the radio reports its own CI-V address when the
-session opens. There is nothing to choose from a model list.
+**IC-7760**, **IC-9700**, **IC-7610**, **IC-905** and **IC-R8600** — because the
+protocol is the same on all of them and the radio reports its own CI-V address
+when the session opens. There is nothing to choose from a model list. On the
+two-box **IC-7760** it is the **[LAN] port on the RF deck** that speaks this
+protocol, not the one on the controller.
 
 One connection carries three things:
 
 - **Control** — the whole CI-V command set, tunnelled over the network. Dial,
   mode, PTT, the S-meter, SWR and the radio's own CW keyer.
 - **Audio**, both ways, at up to 48 kHz.
-- **The radio's spectrum scope** — its own 475-point sweep, up to ±500 kHz wide.
-  On the AF path this is the *main* panadapter; on the 12 kHz IF it is the
-  full-band waterfall above it.
+- **The radio's spectrum scope** — its own sweep, 475 points on most models and
+  689 on an IC-7760, up to ±500 kHz wide. On the AF path this is the *main*
+  panadapter; on the 12 kHz IF it is the full-band waterfall above it.
 
 ##### On the radio, first
 
@@ -5954,11 +6200,23 @@ Three settings, all under **MENU » SET**:
 2. **Network > Network User1 (or User2)** — set a **network user name** and
    **password**, and enter the same pair in sdroxide.
 3. **Connectors > MOD Input > DATA OFF MOD** and **DATA MOD** — **LAN** (on an
-   IC-705, **WLAN**), or transmit audio is not heard. sdroxide writes this for
-   you on a model whose menu numbering it knows — currently the **IC-7300MK2**
-   and the **IC-705** — and on any other it says so in the status line and
-   leaves the menu alone. Not on a receiver: an **IC-R8600** has no modulation
-   input to set, so neither the write nor the warning appears.
+   IC-705, **WLAN**), or transmit audio is not heard. An **IC-7760** has three
+   data slots rather than one, **DATA1 MOD** through **DATA3 MOD**, and all of
+   them want LAN. sdroxide writes this for you on a model whose menu numbering
+   it knows — currently the **IC-7300MK2**, the **IC-705** and the **IC-7760** —
+   and on any other it says so in the status line and leaves the menu alone. Not
+   on a receiver: an **IC-R8600** has no modulation input to set, so neither the
+   write nor the warning appears.
+
+   The numbering is what sdroxide has to know, and it is not the menu path: it
+   is a flat index the manufacturer renumbers between models, with the radio's
+   calibration marker a few places away from the modulation block. That is why
+   an unrecognised model is asked to set the item by hand rather than guessed
+   at. A radio whose CI-V address you have changed in **Connectors > CI-V** is
+   still recognised: the name it reports is matched too, and either piece of
+   evidence on its own is enough. Only when the two name *different* Icoms —
+   a network radio name typed over the model's — does sdroxide fall back to the
+   address alone.
 
 A receiver in the **IC-R** line gets no PTT, drive, tune or SWR controls at all,
 whatever its capability block says — at least one of them advertises a transmit
@@ -5969,35 +6227,50 @@ announce itself on the network, so there is no Discover button.
 
 ##### How wide the waterfall gets
 
-**No Icom outputs I/Q, over any interface** — not over USB, not over the network.
-That sets a hard ceiling on what any program, sdroxide or RS-BA1 alike, can show:
+**No Icom outputs I/Q over the network.** One outputs it at all: the IC-7760's
+RF deck has a USB 3.0 socket that streams 1.92 Msps I/Q, but only through a
+manufacturer-supplied FTDI driver on Windows, and nothing of it reaches the
+[LAN] port beside it. So over the network the ceiling is the same on every model,
+for sdroxide and RS-BA1 alike:
 
 - On **AF** the radio has already demodulated, so the audio stream is not a
   picture of the band at all — it is a picture of what came through the rig's
   filter, one-sided and never wider than that filter. The **panadapter is
   therefore the radio's own scope**: centred on the dial, as wide as **Scope
   span**, and the same view SDR-Control and RS-BA1 give. It is a picture the
-  radio draws and sends as 475 finished magnitude bins, so clicking it tunes but
-  nothing can be demodulated, notched or skimmed *inside* it without moving the
-  dial.
+  radio draws and sends as finished magnitude bins — 475 of them, or 689 on an
+  IC-7760 — so clicking it tunes but nothing can be demodulated, notched or
+  skimmed *inside* it without moving the dial.
 - On the **12 kHz IF** the panadapter is real spectrum — about **±12 kHz** around
   the dial at 48000 Hz — which can be demodulated, notched, decoded and skimmed.
   The scope then lives in the strip above it instead.
+- **Zoom in past the rig's filter and the audio takes over.** The scope is 475
+  points across whatever **Scope span** is set to — 1053 Hz per point at ±250 kHz,
+  105 Hz at ±25 kHz, and about a third finer than that on an IC-7760's 689 —
+  and it arrives about four times a second whatever the span,
+  so past a point zooming magnifies rather than resolves and a signal stays one
+  block wide. Once the visible window fits inside the rig's passband the
+  panadapter is drawn from the demodulated audio instead: 48 kHz through the
+  panadapter's own transform is a few hertz per bin, arriving twenty times a
+  second, and the waterfall gets a proper row for every one of them. Zooming back
+  out hands the picture to the scope again — the frequency axis stays the scope's
+  either way, so nothing jumps.
 - The **digital modes** always get the audio band, on either path. FT8 and the
   keyboard modes place stations by their offset inside the rig's passband, and a
   band-wide sweep at a few hundred Hz per bin cannot show one, so the panadapter
   switches back to the audio spectrum for as long as such a mode is selected.
 - The **full-band waterfall** — the strip above the panadapter, switched on with
-  the **WIDE** chip in the Display module — carries the scope on both paths, up
+  the **WIDE** button in the Display module — carries the scope on both paths, up
   to **1 MHz** across. On AF that is worth leaving on once you zoom the
   panadapter into part of the sweep, since the strip keeps the whole of it.
 
-Because the scope is uncalibrated — Icom publishes a 0..160 amplitude scale with
-no dB per step — its levels are ranged automatically rather than from the
+Because the scope is uncalibrated — Icom publishes a 0..160 amplitude scale
+(0..200 on an IC-7760) with no dB per step — its levels are ranged
+automatically rather than from the
 **FIT** / floor-and-ceiling controls, which govern the audio-band panadapter and
 every other front end as before.
 
-The strip appears on its own once the first sweep arrives, and the **WIDE** chip
+The strip appears on its own once the first sweep arrives, and the **WIDE** button
 appears with it. If neither ever shows up, the radio is not sending its scope:
 **Copy diagnostic report** and look at the `scope sweeps` counter — zero against
 a healthy `CI-V frames in` count means the `27 10`/`27 11` writes did not take.
@@ -6095,7 +6368,10 @@ sdroxide follows it back after about a second.
 - **Test connection** — connect, report what the radio said it is, and
   disconnect.
 - **Copy diagnostic report** — the last session's handshake and CI-V trace, as
-  text.
+  text. It is *this* radio's session: with two Icoms on the LAN, each tab's
+  button answers about the address that tab is configured for, and a radio
+  nothing has connected to yet says so rather than handing over the other
+  one's conversation.
 
 
 #### 6.2.11 RTL-SDR over rtl_tcp (network dongles)
@@ -6151,8 +6427,9 @@ because it is the same radio; only these differ:
   other R828D, so sdroxide cannot tell them apart over the wire. *Automatic*
   therefore leaves an R828D alone — right for a V4, which upconverts inside the
   server's own tuning call — and switches anything else to direct sampling below
-  28.8 MHz. If your remote dongle is a *plain* R828D that hears nothing on HF,
-  choose **Direct sampling (Q branch)** explicitly; that is always obeyed.
+  24 MHz. If your remote dongle is a *plain* R828D that hears nothing on HF,
+  choose **Direct sampling (Q branch)** explicitly; that is always obeyed. The
+  second-Nyquist note above applies at the far end just the same.
 - **Bias tee** — feeds the coax at the far end, which may be out of sight and up
   a mast. sdroxide turns it off when the connection closes cleanly, and warns
   while it is on. Older servers do not implement the command at all; because the
@@ -6745,15 +7022,37 @@ in. There is no serial number in the list: ELAD keeps the serial in the device's
 EEPROM rather than in its USB descriptor, so reading one would mean claiming
 every ELAD on the bus — including one that is streaming.
 
-**Sample rate — read carefully, because this one is not a command.** The
-down-converter delivers 192, 384, 768, 1536, 3072 or 6144 kHz, and **nothing
-sdroxide can send selects between them**. ELAD's own GNU Radio module does not
-set it either, and the FDM-DUO has no front-panel menu for it, which together
-say the decimation is programmed by ELAD's Windows software through a request
-that has never been published.
+**An FDM-S1 or FDM-S2 will not send a single sample until its FPGA is loaded.**
+The two halves of a sampler come up very differently. The USB bridge runs from an
+EEPROM, so the moment you plug one in it enumerates, reports its serial and its
+hardware version, and acknowledges the start of the stream — everything looks
+perfect. The FPGA behind it is loaded from the host and comes up **empty**, so
+there is no down-converter in there to start and the spectrum sits on "waiting
+for spectrum…" for ever, with nothing wrong anywhere to point at.
 
-So the device arrives at whatever rate it powered up in — 192 kHz on a fresh
-FDM-DUO — or whatever FDM-SW2 last left it in, and this setting says which one
+ELAD ship the loader separately, and it has to run after every power-up.
+Download `elad-firmware` from ELAD's Linux area (eladit.com → Download →
+SDR/Linux), copy it to `/usr/local/bin/elad-firmware` and make it executable:
+
+```sh
+sudo install -m 755 elad-firmware-2.0-intel /usr/local/bin/elad-firmware
+```
+
+sdroxide then runs it for you every time it opens the receiver, loading the
+image for the sample rate you picked. It takes about six seconds, once per
+session. If you keep the loader somewhere else, point `SDROXIDE_ELAD_FIRMWARE`
+at it. If sdroxide cannot find it at all, it says so on screen rather than
+retrying in silence.
+
+**Sample rate.** The down-converter delivers 192, 384, 768, 1536, 3072 or
+6144 kHz, and the six rates are six different FPGA images — which is why nothing
+in ELAD's vendor protocol selects between them, and why their own GNU Radio
+module takes the rate as a parameter without ever sending it. On an FDM-S1 or
+FDM-S2 this setting therefore *is* a command: it chooses the image loaded above.
+
+**On an FDM-DUO it is not.** The radio boots its own FPGA and has no front-panel
+menu for the rate, so it arrives at whatever it powered up in — 192 kHz on a
+fresh one — or whatever FDM-SW2 last left it in, and this setting says which one
 that is. Set it wrong and you still get samples: the panadapter is simply the
 wrong width, with every frequency inside it scaled to match. sdroxide measures
 the real throughput a couple of seconds after the stream starts and tells you on
@@ -6834,7 +7133,9 @@ This front end hands over a whole down-converter window, but that window is
 centred on the transceiver's own VFO: the receiver being streamed is the one the
 radio tunes for itself, so moving the VFO moves the window with it, hertz for
 hertz. There is no arrangement in which the radio's display and sdroxide's
-readout are different numbers and both are true.
+readout are different numbers and both are true — except in CW, where they are
+*supposed* to differ by your sidetone pitch, and the paragraph on CW below says
+why.
 
 So with the CAT port set, the two agree in both directions. Tuning here — the
 digits, the mouse wheel, a click on the waterfall, a memory, a band button —
@@ -6868,6 +7169,18 @@ having no VFO at all.
 that accepts text — its `SW` command plays one of the ten messages stored *in
 the radio* — so the CW panel cannot key it over CAT. Menu 37 `CW IN` set to
 `Key+DTR` is the other route, using the CAT cable's DTR line as a straight key.
+
+Which is why, in CW and only in CW, **the radio's VFO sits a sidetone pitch
+above sdroxide's readout**. The down-converter comes out on the VFO whatever
+mode the radio is in, so the station you are copying at 700 Hz is 700 Hz above
+the number in the big readout — and the VFO is what the radio keys its own
+transmitter on. sdroxide therefore leaves the VFO on the station and tunes its
+own receiver the 700 Hz down, so the radio's display reads the frequency you are
+working (the same figure the CW panel shows beside the pitch, and the one to
+log) while sdroxide's readout stays the zero-beat it has always been. Nothing on
+the waterfall moves. Without it the paddle answered every station a whole
+sidetone low and nobody came back
+([issue #170](https://github.com/dividebysandwich/sdroxide/issues/170)).
 
 > **Not verified against hardware.** The whole of this backend — the USB
 > protocol, the tuning arithmetic, the calibration map and the CAT dialect — is
@@ -7383,12 +7696,10 @@ spoken announcements below them under `[speech]`:
   on modest graphics: the radio itself is unaffected (the engine still processes
   every sample and audio never stutters), you simply see fewer spectrum frames,
   and the waterfall repeats rows to keep its scroll speed.
-- **Waterfall scroll speed** — how fast the waterfall scrolls: **Slow** (5
-  rows/s), **Medium** (28) or **Fast** (56). Fast trades screen time for
-  vertical resolution, which is what you want when a CW or FT8 trace is smearing
-  into the row above it; Slow keeps several minutes of band on screen at once.
-- **Spectrum update speed** — how quickly the spectrum trace reacts; slower is
-  more averaged and smoother.
+- **Panadapter detail**, the spectrum's **reaction** and the waterfall's
+  **scroll** speed are not here: they moved to the **SPEC** popup in the Display
+  module, beside the picture they change — see
+  [§2.8](#28-the-display-and-fft-controls).
 - **Waterfall palette** — the waterfall colour scheme (see
   [2.8](#28-the-display-and-fft-controls) and the [appendix](#waterfall-colour-schemes)).
 - **Spectrum background** — a vertical gradient behind the spectrum line, filled
@@ -9254,7 +9565,7 @@ row of menu buttons:
 | **VFO** | A↔B, A→B, SPLIT, SUB, and the RIT/XIT offsets |
 | **SUB** | The second receiver's frequency, mode, filter and level (only while it is running) |
 | **TX** | TUNE, the voice keyer, and the drive, tune and mic levels |
-| **DISP** | FIT, PEAK, WIDE, the spectrum/waterfall layers, the skimmers, and the spectrum floor/ceiling and FFT size |
+| **DISP** | ☀ 3D, WIDE, FIT, the panadapter boxes (the spectrum and waterfall switches, peak hold, their speeds and the detail), the skimmers, and the spectrum floor/ceiling and FFT size |
 | **SYS** | LOG, SPOTS, AWARDS, BANDS, MEM, SETTINGS, HELP |
 
 A menu stays open until you tap outside it or tap its button again — the top-bar
@@ -9718,6 +10029,18 @@ only reliable source is what the gateway's owner publishes. Get it wrong in the
 it wrong in the 9600 direction and you hear nothing at all, which is why the
 session transcript records the speed each call went out at.
 
+### Packet length and window
+
+**Packet length** is the most a single frame carries, and **window** is how many
+frames go out before waiting for an acknowledgement. Shorter frames survive a
+marginal path — only the frame that was hit has to be sent again — and cost more
+overhead per byte; a bigger window fills a good path and is more to resend on a
+bad one. 128 and 4 are reasonable everywhere; 64 on an HF path that is fading,
+256 where the path is solid.
+
+Both apply to Winlink over the radio as well as to the terminal: they are the
+link's settings, not the panel's.
+
 ### Speeds
 
 | | Where | Notes |
@@ -9742,9 +10065,83 @@ sequence.
 count is that page's own tally, and one left over from a cleared page describes
 traffic that is no longer on it. A connected station stays connected.
 
-**LINK** shows the connected session, when there is one. There is no text entry:
-packet here is not a keyboard mode. The traffic is somebody else's, a beacon on
-a timer, or a Winlink session driving the link from the MAIL window.
+Clicking the callsigns on a monitor line puts that station in the terminal's
+connect bar, path and all. That is how you find out who is reachable: by
+watching the channel, not by typing callsigns from memory.
+
+**TERMINAL** is the connected session — see below.
+
+### Connecting to a node or a BBS
+
+Type a callsign in the terminal's connect bar and press **CONNECT**. What comes
+back appears in the pane above the input line; what you type goes out a line at
+a time. A node or a BBS answers with its own command prompt, and from there you
+are talking to its software, not to sdroxide — `H` for help and `B` to leave are
+a good guess almost everywhere.
+
+**Via** is the digipeater path, nearest hop first, separated by commas:
+`OE3XLR-1,OE3XMS-1`. Leave it empty for a station you can hear directly. Most
+BBSes are a hop or two away through a node, so this is usually the difference
+between a call that works and one that never gets an answer — and a call through
+the wrong path fails exactly like a station that is not there. Setting a
+**Default via** in the packet settings fills the box in for you, because the
+path to your local node is the same every time and retyping it is how a hop gets
+left off.
+
+The status row is the session in five numbers. **CALLING** means the connect is
+out and unanswered; **CONNECTED** means the link is up. `n unacked` is frames
+sent that the far end has not confirmed, and `retry n` is how many times we have
+asked again — a retry count climbing while the unacknowledged count stays put is
+what a fading path looks like from this side, and it is the warning before the
+link gives up. When it does give up, the transcript says so in those words,
+which is deliberately different from what it says when the far end hangs up:
+"the link gave up" and "disconnected" send you looking in completely different
+places.
+
+**Up** and **Down** on the input line walk back through what you have already
+sent. At 300 baud, retyping is where the typos come from.
+
+Lines end with a carriage return, which is what every BBS and node command line
+expects. Text that is not Unicode is read as Windows-1252 and sent as it — most
+of this network predates UTF-8, and a two-byte sequence arrives at a BBS as two
+characters of nonsense where one byte would have been the right letter.
+
+**Extended (mod-128)** asks for a window bigger than seven frames. It is off,
+and worth leaving off unless you know the far end wants it: many nodes refuse
+the request with a DM, which looks exactly like a station that would not talk to
+you.
+
+### Answering calls
+
+Switch on **Answer calls** and a station that connects to you arrives in the
+same terminal pane; **Connect text** is what they are greeted with. You are then
+in a conversation with whoever called — there is no mailbox here, so say so in
+the connect text if nobody is watching the screen.
+
+A station whose link is already busy refuses calls with a DM rather than
+accepting them, which tells the caller to try later. That is the same rule as
+everything else in this section: there is one radio, one channel and one link.
+
+### One link at a time
+
+The MAIL window and this pane are two ways to use one radio. Whichever asks
+first gets it, and the other is told so — a Winlink session started while you
+are connected is refused with the reason, and a CONNECT pressed during a Winlink
+session gets a line in the transcript saying the MAIL window has the link.
+
+**Disconnect before changing mode.** A mode change ends the session
+immediately, and the DISC cannot get out: the modem needs seconds of audio that
+the mode change takes away. The far end is left waiting out its own timers.
+
+### When a call is not answered
+
+At 300 baud a full frame takes seconds to reach the other end, so the link's
+timers are worked out from the speed, the packet length and the number of hops
+rather than being fixed. If a call to a station you can plainly hear is never
+answered, the usual causes are, in order: the wrong digipeater path; the station
+not answering calls at all; a **Packet length** the far end will not accept —
+drop it to 128, or 64 on a marginal path; and **Extended** switched on against
+a node that refuses it.
 
 ### Serving the modem to other software
 
@@ -9752,6 +10149,10 @@ Switch on **KISS server** in the packet setup dialog and sdroxide offers its
 modem as a KISS TNC on a socket (8001 by default), the same way it already
 serves TCI and rigctld. Pat, an APRS client, or the Linux AX.25 stack can then
 use the radio without knowing sdroxide exists.
+
+The KISS server and the terminal are two hosts on one radio and neither knows
+about the other: a KISS client can put frames on the air under your callsign
+while you are in a session, and nothing will stop it. Use one at a time.
 
 A host's TXDELAY and persistence commands are logged and ignored — those are
 your settings, and a client overriding them invisibly would be a mystery to
@@ -10336,7 +10737,7 @@ All in [§6.2.2](#622-cat-radios-serial-control--usb-audio):
 - Two Icoms are two of the same USB codec under one name — the device list
   tags the second (`[#a3f1]`-style) so they can be told apart.
 
-### 15.4 Icom over LAN (IC-705, IC-7300MK2, IC-7610, IC-9700, IC-905)
+### 15.4 Icom over LAN (IC-705, IC-7300MK2, IC-7610, IC-7760, IC-9700, IC-905)
 
 All in [§6.2.10](#6210-icom-lan-network-radios):
 
@@ -10344,11 +10745,11 @@ All in [§6.2.10](#6210-icom-lan-network-radios):
   = ON, a **Network User1/User2** name and password (the same pair goes in
   sdroxide), and **Connectors > MOD Input**: `DATA OFF MOD` and `DATA MOD` =
   `LAN` (`WLAN` on an IC-705). sdroxide writes the third one for you only on
-  the IC-7300MK2 and IC-705; on other models it says so and leaves the menu
-  alone.
+  the IC-7300MK2, IC-705 and IC-7760; on other models it says so and leaves the
+  menu alone.
 - No discovery — read the IP off the radio's **Network** screen. Port 50001
   unless changed there.
-- **No Icom outputs I/Q on any interface.** The full-band view is the radio's
+- **No Icom outputs I/Q over the network.** The full-band view is the radio's
   own scope; the panadapter on AF is the demodulated audio, on the 12 kHz IF
   (which needs the **48000 Hz** audio rate) about ±12 kHz around the dial.
 - **CW keying** `Sound card (MCW)` keeps the radio in plain USB, the same
@@ -10434,10 +10835,17 @@ All in [§6.2.16](#6216-elad-fdm-duo--fdm-s-usb):
   drives all three. With only the CAT cable connected, the CAT-family route in
   [§6.2.2](#622-cat-radios-serial-control--usb-audio) works instead, without
   the wideband panadapter.
-- **The sample rate cannot be commanded.** The device sits at whatever it
-  powered up in (192 kHz on a fresh DUO) or whatever FDM-SW2 last left it in;
-  set sdroxide to match, and let its measured-throughput notice name the rate
-  if unsure. 6144 kHz halves the sample width — a wrong guess there is noise.
+- **An FDM-S1 or FDM-S2 that opens perfectly and shows nothing** has an
+  unloaded FPGA. Everything reports "ok" because the USB bridge runs from an
+  EEPROM; the down-converter behind it does not exist until an image is loaded.
+  Put ELAD's `elad-firmware` in `/usr/local/bin` and sdroxide loads it at every
+  open — which is also how the sample rate is chosen on those two models,
+  because each rate is a different image.
+- **On an FDM-DUO the sample rate cannot be commanded.** The radio sits at
+  whatever it powered up in (192 kHz on a fresh one) or whatever FDM-SW2 last
+  left it in; set sdroxide to match, and let its measured-throughput notice name
+  the rate if unsure. 6144 kHz halves the sample width — a wrong guess there is
+  noise.
 - **Baud** matches menu 70 `CAT BAUD` (ships at 38400); **Transmit input**
   asserts menu 32 `TX IN` — `USB audio` is what makes transmit work, and a
   radio left on Microphone transmits the room with nothing on screen to say
@@ -10549,7 +10957,9 @@ All in [§6.2.6](#626-smartsdr-flexradio-network-radios):
 - **HF:** a Blog V4 upconverts in hardware — HF just works, no offset
   anywhere (and don't put one in Converter: below 28.8 MHz the dongle would
   shift it a second time). Any other dongle reaches HF by direct-sampling
-  the Q branch — a V3's HF port — with `Automatic` switching at 28.8 MHz.
+  the Q branch — a V3's HF port — with `Automatic` switching at the tuner's
+  24 MHz floor. 17 m and 15 m come in on the ADC's second Nyquist zone, so
+  they work, with `28.8 MHz - dial` folded on top of them.
 - **You do not have to guess ppm:** `RUST_LOG=sdroxide_rtlsdr=debug` prints a
   measured figure after ~20 s. Over `rtl_tcp` that measurement is
   meaningless — calibrate on USB once and carry the number across.
@@ -10572,11 +10982,15 @@ All in [§6.2.8](#628-sdrplay-rsp-usb):
   (20 dB is maximum gain, 59 minimum) and **LNA state 0 is maximum** — the
   default of 4 exists because full front-end gain on a real antenna overloads
   the ADC.
-- An **RSPduo** runs one tuner at a time, chosen at open — or **both**, for
-  diversity and QRM suppression, which fixes the ADC clock and caps the span at
-  2 Msps (not yet verified against the hardware). Master/slave mode, sharing
-  the receiver with another application, is not supported. **HDR mode** below
-  2 MHz is the RSPdx / RSPdx R2 path.
+- An **RSPduo** runs one tuner at a time, chosen at open — or **both**, either
+  combined (diversity and QRM suppression, whose controls are the **DIV** box
+  on the main strip) or as two radios on their own frequencies, HF in one tab
+  and VHF in another. Both arrangements fix the ADC clock and cap the span at
+  2 Msps, and neither is yet verified against the hardware. Two radios on one
+  board both need **Run both tuners** set, because whichever opens it first is
+  what puts it in that mode. Master/slave mode, sharing the receiver with
+  another application, is not supported. **HDR mode** below 2 MHz is the
+  RSPdx / RSPdx R2 path.
 - Above 6.048 Msps the ADC trades bit depth for speed — worth knowing before
   picking 10 Msps for weak-signal work.
 

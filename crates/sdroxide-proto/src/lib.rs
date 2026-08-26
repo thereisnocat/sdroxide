@@ -587,7 +587,7 @@ use sdroxide_types::{
 /// **87** — an RSPduo can run *both* of its tuners and combine them, the same
 /// way a LimeSDR's second chain is combined at v82 (issue #153).
 /// [`sdroxide_types::SdrPlayConfig`] gained a `diversity` block —
-/// [`sdroxide_types::SdrPlayDiversity`] — carrying whether the second tuner
+/// [`sdroxide_types::SdrPlayDuo`] — carrying whether the second tuner
 /// runs at all, its own two gains, and the adaptive filter's mode, length,
 /// rate and hold.
 ///
@@ -618,20 +618,121 @@ use sdroxide_types::{
 /// decode it into and desynchronises on everything after it, rather than
 /// failing on the field itself.
 ///
-/// **90** — the RSPduo's diversity filter (v87) gains two more ways to find
-/// its combining weight, alongside the original adaptive one (issue #153).
-/// [`sdroxide_types::SdrPlayDiversity`] gained `technique`
-/// ([`sdroxide_types::DiversityTechnique`]: `Adaptive`, `Decorrelate`, or
-/// `WidebandDecorrelate`) and `gate_db`, both appended at the tail of the
-/// struct for the same reason `enabled`'s siblings originally landed in
-/// declaration order — a field-order slip in a positional wire format
-/// reconfigures the wrong setting rather than failing outright.
+/// **90** — an RSPduo's two tuners can be two *radios* rather than two aerials
+/// combined, and the diversity filter's controls have moved to the main strip
+/// (issue #165). [`sdroxide_types::SdrPlayDuo`] gained `role`
+/// ([`sdroxide_types::SdrPlayDuoRole`]): whether the second tuner is combined
+/// with the first or handed to a radio of its own.
+/// [`sdroxide_types::DeviceCaps`] gained `diversity`, which is what tells the
+/// strip that a filter is running without it having to know which backend has
+/// one.
+///
+/// Fields appended to the radio configuration and to the capabilities. Both
+/// ride the wire — the configuration in a command and an event, the
+/// capabilities in an event of their own — so a v89 peer would read the tail
+/// of any of them as garbage; the handshake's equality test is what stops it
+/// trying.
+///
+/// The block itself is written under a new name with this version — `duo`
+/// rather than `diversity`, since combining is no longer all it does — which
+/// is invisible here: postcard numbers fields by position and never sends a
+/// name. It is `radio.json` that the old name matters to, and a serde alias
+/// keeps those files loading.
+///
+/// **91** — the panadapter's horizontal resolution is the client's to ask for
+/// (issue #172). [`sdroxide_types::SpectrumConfig`] gained `bins`: how many
+/// columns the emitted frames carry, which until now was a constant 2048 on
+/// both sides of the wire and so never needed saying.
+///
+/// It is the *client* that knows the number — its screen's pixel width and its
+/// own renderer's limits — so it has to travel, and it travels in the same
+/// command as the FFT size and the frame rate. Inserted after `fft_size`
+/// rather than appended, because it belongs next to it: postcard numbers
+/// fields by position, so a v90 peer would read `bins` as `fps` and everything
+/// after it as garbage either way. The handshake's equality test is what stops
+/// it trying.
+///
+/// **92** — the waterfall's *time* axis is the client's to ask for too, and the
+/// engine now clocks it. [`sdroxide_types::SpectrumConfig`] gained
+/// `rows_per_sec`, and [`sdroxide_types::SpectrumFrame`] gained `rows`: the
+/// waterfall lines the engine clocked since the last frame, each of them the
+/// per-bin peak over its own slice of time.
+///
+/// Until now a frame *was* a row, so the waterfall could not advance faster
+/// than the screen redrew — a fast scroll simply wrote the same numbers two or
+/// three times and the operator saw lines two or three pixels tall, while a
+/// front end streaming megahertz had hundreds of transforms a second going
+/// spare. The two rates are now separate all the way down the wire.
+///
+/// The frame also gained `rows_clocked`, which is not the same as `rows` being
+/// non-empty and has to be said separately: below the frame rate most frames
+/// carry no rows at all, and a client that read that as "this lane does not
+/// clock rows" would scroll them on its own wall clock *as well* and run the
+/// waterfall at twice the rate of its own time labels. `false` is the shape for
+/// a lane that really cannot clock them — a radio's own sweep, a transmit
+/// monitor — and only then does the client scroll on its own.
+///
+/// All three ride in the frame or the config, both of which cross the wire, and
+/// `rows_per_sec` sits after `display_bins` rather than at the tail, so a v91
+/// peer would desynchronise on any of them. The handshake's equality test is
+/// what stops it trying.
+///
+/// **93** — the digital modes' transmit-audio level split in two.
+/// [`sdroxide_types::DigiConfig`] lost `tx_audio_level` and gained
+/// `tx_audio_level_fm` and `tx_audio_level_ssb`: the one number was doing two
+/// unrelated jobs — deviation into an FM rig, drive into a sideband rig's
+/// modulator — and a level set for 1200 baud packet was quietly taking 8 dB off
+/// FT8 as well, which is issue #131's symptom by another road.
+///
+/// The configuration rides the wire in a command and comes back in an event, so
+/// one field becoming two moves everything after it: postcard numbers fields by
+/// position, and a v92 peer would read the new sideband level as the field that
+/// used to follow and the rest as garbage. The handshake's equality test is what
+/// stops it trying. `digi.json` is migrated rather than versioned — the old key
+/// carries into both new ones on load, so nobody's signal changes level.
+///
+/// **94** — packet radio grew an operator's terminal, so the panel needs to know
+/// more about the link than the callsign at the far end.
+/// [`sdroxide_types::PacketStatus::link`] changes from `Option<String>` to
+/// `Option<PacketLink>`: the state machine's own name for where it is, the peer,
+/// the digipeater path, the sequence width, the frames outstanding, the retry
+/// count against N2, and which of the two things that can drive one link is
+/// driving it — the packet panel or the MAIL window. That last one is the answer
+/// to "why was I refused", which an operator otherwise has to guess at.
+///
+/// `term` and `term_partial` are new beside it: the session's lines, and the
+/// tail of one that has arrived without its terminator. The tail is carried
+/// separately because it is the most important thing on the screen — a BBS
+/// prompt has no carriage return after it, so a terminal that printed only whole
+/// lines would sit showing nothing while the far end waited for an answer to a
+/// question the operator never saw.
+///
+/// [`sdroxide_types::Command`] gains `PacketConnect`, `PacketSend`,
+/// `PacketDisconnect` and `PacketTermClear`, appended for the usual reason, and
+/// [`sdroxide_types::DigiConfig`] gains `packet_connect_text`,
+/// `packet_connect_via` and `packet_ext_seq` beside the packet settings they
+/// belong with rather than at the tail — postcard numbers fields by position and
+/// a v93 peer desynchronises on either placement, so they go where they read.
+/// The handshake's equality test is what stops it trying. `digi.json` needs no
+/// migration: all three carry `#[serde(default)]`, so a config written by v93
+/// loads unchanged.
+///
+/// **95** — the RSPduo's diversity filter (v87, renamed `SdrPlayDuo` at v90)
+/// gains two more ways to find its combining weight, alongside the original
+/// adaptive one (issue #153). [`sdroxide_types::SdrPlayDuo`] gained
+/// `technique` ([`sdroxide_types::DiversityTechnique`]: `Adaptive`,
+/// `Decorrelate`, or `WidebandDecorrelate`) and `gate_db`, both appended at
+/// the struct's current tail — after `frozen`, and so after `role` too,
+/// which v90 had already inserted earlier in the struct — for the same
+/// reason `enabled`'s own siblings originally landed in declaration order: a
+/// field-order slip in a positional wire format reconfigures the wrong
+/// setting rather than failing outright.
 ///
 /// A field appended to the radio configuration, which rides in both a command
-/// and an event, so a v89 peer would read the tail of either as garbage — the
+/// and an event, so a v94 peer would read the tail of either as garbage — the
 /// handshake's equality test is what stops it trying.
 ///
-/// **91** — a Reuter RSR200(B) can be driven over its LAN interface
+/// **96** — a Reuter RSR200(B) can be driven over its LAN interface
 /// (`RSR200_PLAN.md` step 3; issue #153's own hardware-diversity plan next
 /// to it). [`sdroxide_types::Backend`] gained `Rsr200`, appended last for
 /// the same reason every backend before it did; [`sdroxide_types::RadioConfig`]
@@ -640,11 +741,11 @@ use sdroxide_types::{
 /// transport, single channel, 16-bit exist behind this so far.
 ///
 /// The `Backend` append is what forces the bump (postcard numbers variants
-/// by declaration index, so a v90 peer handed `Rsr200` has no variant to
+/// by declaration index, so a v95 peer handed `Rsr200` has no variant to
 /// decode it into); the `RadioConfig` field append is the same positional
 /// trap as every other config field before it.
 ///
-/// **92** — the RSR200 (v91) gains its second transport: USB over FTDI's
+/// **97** — the RSR200 (v96) gains its second transport: USB over FTDI's
 /// D3XX driver, alongside the original LAN one (`RSR200_PLAN.md` step 7).
 /// One config for both, not a second `Backend` — the same physical radio,
 /// the same command protocol either way, differing only in framing, so a
@@ -653,38 +754,38 @@ use sdroxide_types::{
 /// a genuinely different remote server. `Rsr200Config` gained `transport`
 /// ([`sdroxide_types::Rsr200Transport`]: `Lan` or `Usb`) and `usb_serial`,
 /// both appended at the tail for the same positional reason as every field
-/// above them — a v91 peer would read either as garbage past the end of
+/// above them — a v96 peer would read either as garbage past the end of
 /// `attenuator2`, not fail outright.
 ///
-/// **93** — the RSR200 (v91/92) gains Separate mode: both ADCs, combined in
+/// **98** — the RSR200 (v96/97) gains Separate mode: both ADCs, combined in
 /// software by `sdroxide_dsp::Diversity` exactly the way the SDRplay
 /// RSPduo's own second-tuner mode already does (`RSR200_PLAN.md` §3, step
 /// 4 — no changes to `sdroxide-dsp` needed, genuine reuse). `Rsr200Config`
 /// gained `channel_mode` ([`sdroxide_types::Rsr200ChannelMode`]: `Single` or
 /// `Separate`) and `diversity` ([`sdroxide_types::Rsr200Diversity`] —
 /// mode/taps/rate/frozen/technique/gate_db, the same shape as
-/// [`sdroxide_types::SdrPlayDiversity`]'s own filter settings minus its two
+/// [`sdroxide_types::SdrPlayDuo`]'s own filter settings minus its two
 /// SDRplay-specific second-tuner gain fields), both appended at the tail for
 /// the same positional reason as every field above them.
 ///
-/// **94** — the RSR200 (v91–93) gains a 24-bit sample width alongside its
+/// **99** — the RSR200 (v96–98) gains a 24-bit sample width alongside its
 /// original 16-bit one (`RSR200_PLAN.md` step 5). The wire-geometry and
 /// unpacking math for both widths was already built and tested in step 1
 /// (`sdroxide_rsr200::protocol`); this only exposes the choice.
 /// `Rsr200Config` gained `bits24: bool`, appended at the tail for the same
 /// positional reason as every field above it.
 ///
-/// **95** — the RSR200 (v91–94) gains hardware diversity: the radio's own
+/// **100** — the RSR200 (v96–99) gains hardware diversity: the radio's own
 /// combiner, `OpMode::Diversity` on the wire, as opposed to the software
-/// filter v93 already added (`RSR200_PLAN.md` step 6 — the last of the
+/// filter v98 already added (`RSR200_PLAN.md` step 6 — the last of the
 /// plan's eight steps to be built). [`sdroxide_types::Rsr200ChannelMode`]
 /// gained `HardwareDiversity`, appended last for the same reason every enum
-/// append before it was — a v94 peer handed this variant has none to decode
+/// append before it was — a v99 peer handed this variant has none to decode
 /// it into. `Rsr200Config` gained `hw_div_magnitude`/`hw_div_phase_deg`
 /// (`f64`), appended at the tail for the same positional reason as every
 /// field above them.
 ///
-/// **96** — the RSR200 (v91–95) gains its last plan step: Serial mode,
+/// **101** — the RSR200 (v96–100) gains its last plan step: Serial mode,
 /// automatic attenuator control, VHF/preamp antenna-input switching, and
 /// swap-channels (`RSR200_PLAN.md` step 8, the last of the plan's eight
 /// steps). [`sdroxide_types::Rsr200ChannelMode`] gained `Serial`, appended
@@ -707,8 +808,8 @@ use sdroxide_types::{
 /// they're recorded here alongside the version that actually shipped the
 /// fix.
 ///
-/// **97** — both [`sdroxide_types::Rsr200Diversity`] and
-/// [`sdroxide_types::SdrPlayDiversity`] gain `ref_band_enabled` (`bool`),
+/// **102** — both [`sdroxide_types::Rsr200Diversity`] and
+/// [`sdroxide_types::SdrPlayDuo`] gain `ref_band_enabled` (`bool`),
 /// `ref_band_freq_hz`/`ref_band_width_hz` (`f64`), appended at the tail of
 /// each for the same positional reason as every field above them — a
 /// reference-band restriction for `DiversityTechnique::Decorrelate`'s
@@ -724,21 +825,23 @@ use sdroxide_types::{
 /// `a_reference_band_nulls_the_weak_interferer_the_whole_span_solve_misses`
 /// test reproduces the failure and the fix synthetically.
 ///
-/// **98** — both `Rsr200Diversity` and `SdrPlayDiversity` **lose**
-/// `ref_band_freq_hz`, the one v97 added — a genuine field removal, not
+/// **103** — both `Rsr200Diversity` and `SdrPlayDuo` **lose**
+/// `ref_band_freq_hz`, the one v102 added — a genuine field removal, not
 /// just an append, which this crate's own positional-wire discipline
-/// otherwise never does. Safe here specifically because v97 was never
-/// released or pushed anywhere; nothing outside this same night's local,
-/// unpushed commits ever had the field, so there is no compatibility to
-/// preserve. Reference band's centre is no longer a typed-in frequency at
-/// all: it now tracks the operator's VFO live
+/// otherwise never does. Safe here specifically because v102 (and the
+/// bare-technique-rename v95..v101 chain beneath it) was never released or
+/// pushed anywhere as this exact numbering — the whole v95–103 run was
+/// renumbered wholesale, in this same merge, to sit after upstream's own
+/// v90–94, and no compatibility with any of those intermediate numbers ever
+/// existed outside this one local branch. Reference band's centre is no
+/// longer a typed-in frequency at all: it now tracks the operator's VFO live
 /// (`sdroxide_radio::source::IqSource::set_vfo_hz`, polled every tick by
 /// `sdroxide_radio::engine`'s own `poll_ref_band_vfo`), the same way SDR++'s
 /// own equivalent control does. Motivated directly by Ralph's own use of
-/// the v97 field the same night: "I will never want to decorrelate against
-/// a different frequency than the one I'm tuned to. The reference frequency
-/// adds needless friction."
-pub const PROTO_VERSION: u16 = 98;
+/// the reference-frequency field the same night it shipped: "I will never
+/// want to decorrelate against a different frequency than the one I'm tuned
+/// to. The reference frequency adds needless friction."
+pub const PROTO_VERSION: u16 = 103;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1633,8 +1736,9 @@ mod tests {
                 serial: "1809014C9B".into(),
                 sample_rate_hz: 1_000_000.0,
                 duo_tuner: sdroxide_types::SdrPlayDuoTuner::Tuner2,
-                diversity: sdroxide_types::SdrPlayDiversity {
+                duo: sdroxide_types::SdrPlayDuo {
                     enabled: true,
+                    role: sdroxide_types::SdrPlayDuoRole::SecondRadio,
                     mode: sdroxide_types::DiversityMode::Combine,
                     lna_state: 6,
                     if_gr_db: 27,

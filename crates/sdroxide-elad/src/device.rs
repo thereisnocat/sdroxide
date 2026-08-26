@@ -47,7 +47,33 @@ pub struct Device {
 impl Device {
     /// Open the device named by `cfg`, configure it, and leave it streaming.
     pub fn open(cfg: &EladConfig, center_hz: f64, trace: &Trace) -> Result<Device> {
-        let usb = UsbDev::open(&cfg.serial, trace)?;
+        let mut usb = UsbDev::open(&cfg.serial, trace)?;
+
+        // A sampler's down-converter does not exist until its FPGA is loaded,
+        // and nothing below would notice: the bridge answers out of its EEPROM,
+        // so the whole sequence that follows succeeds against an empty FPGA and
+        // the bulk endpoint then stays silent for ever (issue #178). The image
+        // also *is* the sample rate, which is why this is the one place
+        // `sample_rate_hz` is a command rather than a description.
+        //
+        // The device is claimed first and let go again rather than the other way
+        // round: the model decides whether any of this applies, and it is the
+        // product id of the device the configured serial actually picked — not
+        // of whatever else is on the bus.
+        let mut fpga_warning = None;
+        match crate::fpga::wanted(usb.model(), cfg.sample_rate_hz) {
+            crate::fpga::Load::NotNeeded => {}
+            crate::fpga::Load::Unavailable(w) => fpga_warning = Some(w),
+            crate::fpga::Load::Run(run) => {
+                // ELAD's loader claims the interface itself, so ours has to be
+                // gone before it starts.
+                drop(usb);
+                if let Err(w) = run.execute(trace) {
+                    fpga_warning = Some(w);
+                }
+                usb = crate::fpga::reclaim(&cfg.serial, trace)?;
+            }
+        }
         let model = usb.model();
 
         let mut dev = Device {
@@ -67,6 +93,12 @@ impl Device {
 
         dev.identify();
         dev.read_calibration();
+
+        if let Some(w) = fpga_warning {
+            tracing::warn!("{w}");
+            dev.trace.note(&w);
+            dev.warnings.push(w);
+        }
 
         if let Some(w) = dev.usb.link_too_slow_for(dev.rate_hz) {
             tracing::warn!("{w}");

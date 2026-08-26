@@ -46,7 +46,7 @@ mod sstv;
 pub mod theme;
 mod time;
 mod view;
-mod waterfall_gpu;
+pub mod waterfall_gpu;
 mod wefax;
 mod widgets;
 
@@ -77,7 +77,8 @@ pub use eframe::egui_wgpu;
 /// Nothing here needs the baseline. The busiest shader in the tree passes three
 /// varyings, and every texture is already built against `device.limits()` —
 /// `solar3d` and `login_globe` pick the mip level that fits, and the
-/// waterfall's atlas is a fixed 2048². So ask for exactly what the adapter
+/// waterfall's history is sized against `max_texture_dimension_2d` too
+/// ([`waterfall_gpu::auto_display_bins`]). So ask for exactly what the adapter
 /// reports, a request no adapter can refuse, and let the drawing code adapt to
 /// what it gets, which is what it already does.
 ///

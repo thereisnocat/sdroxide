@@ -6,12 +6,23 @@ XHEAACSuperFrame::XHEAACSuperFrame():AudioSuperFrame (),numChannels(0),superFram
 }
 
 void
+XHEAACSuperFrame::reset()
+{
+    /* Frame alignment is lost: the bytes buffered so far belong to audio frames
+       whose borders can no longer be placed, so throw them away and
+       resynchronise on the next super frame. */
+    payload.clear();
+    borders.clear();
+    frameSize.clear();
+    audioFrame.clear();
+}
+
+void
 XHEAACSuperFrame::init(const CAudioParam& audioParam, unsigned frameSize)
 {
-    numChannels = audioParam.AM_MONO?1:2;
+    numChannels = (audioParam.eAudioMode==CAudioParam::AM_MONO)?1:2;
     superFrameSize = frameSize;
-    payload.resize(0);
-    borders.resize(0);
+    reset();
 }
 
 unsigned XHEAACSuperFrame::getSuperFrameDurationMilliseconds()
@@ -71,6 +82,16 @@ bool XHEAACSuperFrame::parse(CVectorEx<_BINARY>& asf)
     }
     // TODO handle reservoir
     unsigned bitResLevel = (bitReservoirLevel+1) * 384 * numChannels;
+    (void)bitResLevel;
+    /* The Header (2 bytes) and the Directory (2 bytes per frame border) both
+       live inside the super frame, so a frame border count that leaves no room
+       for them cannot be right. The header CRC above is deliberately not
+       trusted, which leaves this the only check standing between a corrupt
+       4 bit field and an unsigned subtraction that wraps around. */
+    if(superFrameSize < 2 + 2*frameBorderCount) {
+        reset();
+        return false;
+    }
     unsigned directory_offset = superFrameSize - 2*frameBorderCount;
     size_t start = payload.size();
     //cerr << start << " bytes left from previous superframe" << endl;
@@ -91,64 +112,95 @@ bool XHEAACSuperFrame::parse(CVectorEx<_BINARY>& asf)
             borders[unsigned(i)] = frameBorderIndex;
         }
         if(!ok) {
+            reset();
             return false;
         }
         // set the borders relative to the start including the payload bytes from previous superframes
         switch(borders[0]) {
         case 0xffe: // delayed from previous superframe
             //cerr << "first frame has two bytes in previous superframe" << endl;
-            if(start<2) return false;
+            if(start<2) { reset(); return false; }
             borders[0] = start-2;
             frameSize[0] = borders[0];
             break;
         case 0xfff: // the start of the audio frame at the last byte of the Payload section of the previous audio super frame
             //cerr << "first frame has one byte in previous superframe" << endl;
-            if(start<1) return false;
+            if(start<1) { reset(); return false; }
             borders[0] = start-1;
             frameSize[0] = borders[0];
             break;
         default: // boundary in this superframe
             borders[0] += start;
-            if(borders[0]<2) return false;
+            if(borders[0]<2) { reset(); return false; }
             borders[0] -= 2; // header not in payload
             frameSize[0] = borders[0];
             //cerr << "border 0 is " << borders[0] << " bytes from start of payload" << endl;
             break;
         }
         for(unsigned i=1; i<borders.size(); i++) {
+            /* 0xffe and 0xfff are only ever carried by the first, delayed,
+               border, and every border has to lie inside the payload and after
+               the one before it - otherwise the frame size wraps around. */
+            if(borders[i]>0xffd) {
+                reset();
+                return false;
+            }
             borders[i] += start;
+            if(borders[i]<2) {
+                reset();
+                return false;
+            }
             borders[i] -= 2; // header not in payload
+            if(borders[i]<borders[i-1] || borders[i]>payload.size()) {
+                reset();
+                return false;
+            }
             unsigned bytes = borders[i]-borders[i-1];
             frameSize[i] = bytes;
             //cerr << "border " << i << " is " << borders[i] << " bytes from start of payload" << endl;
         }
     }
-    size_t bytesInFrames = 0; for(size_t i=0; i<frameSize.size(); i++) bytesInFrames+=frameSize[i];
-    size_t next = payload.size()-bytesInFrames;
-    //cerr << "payload is " << payload.size() << " bytes of which " << bytesInFrames << " are for this superframe and " << next << " are for the next superframe" << endl;
+    /* The frames can only be cut out of the bytes actually buffered. A corrupt
+       directory can ask for more than that, and draining the deque past its end
+       with front()/pop_front() is undefined behaviour that reads through a null
+       block pointer on libc++ and libstdc++ alike - the segfault this used to
+       die of on a fading signal. */
+    uint64_t bytesInFrames = 0;
+    for(size_t i=0; i<frameSize.size(); i++) bytesInFrames += frameSize[i];
+    if(bytesInFrames > payload.size()) {
+        reset();
+        return false;
+    }
+    //cerr << "payload is " << payload.size() << " bytes of which " << bytesInFrames << " are for this superframe" << endl;
     // now copy into the audioFrames for simplicty
-    size_t i=0;
     audioFrame.resize(frameBorderCount);
-    audioFrame[i].resize(0);
-    while(true) {
-        audioFrame[i].push_back(payload.front());
-        payload.pop_front();
-        if(audioFrame[i].size()==frameSize[i]) {
-            i++;
-            if(i>=audioFrame.size()) break;
-            audioFrame[i].resize(0);
+    for(unsigned i=0; i<frameBorderCount; i++) {
+        audioFrame[i].clear();
+        audioFrame[i].reserve(frameSize[i]);
+        for(unsigned b=0; b<frameSize[i]; b++) {
+            audioFrame[i].push_back(payload.front());
+            payload.pop_front();
         }
     }
     //cerr << "remaining payload is " << payload.size() << " bytes" << endl;
-    size_t allocated = 2 + 2*frameBorderCount; // bytes of the superframe for the header and directory
-    allocated += bytesInFrames - start; // do count bytes in frames but not the ones from previous superframes
-    allocated += next; // do count bytes for next superframe
-    //cerr << "allocated " << allocated << " bytes out of " << superFrameSize << " in the superframe" << endl;
+    /* What is left over is the head of an audio frame that continues in the
+       next super frame. A stream that never declares a frame border - which is
+       what a run of corrupt headers looks like - would otherwise grow this
+       buffer for as long as the receiver stays tuned. */
+    if(payload.size() > size_t(superFrameSize)*8 + 4096) {
+        reset();
+        return false;
+    }
     return ok;
 }
 
 void
 XHEAACSuperFrame::getFrame(std::vector<uint8_t>& frame, uint8_t& crc, unsigned i)
 {
+    crc = 0; // xHE-AAC audio frames carry no CRC of their own
+    if(i>=audioFrame.size()) {
+        frame.clear();
+        return;
+    }
     frame = audioFrame[i];
 }

@@ -34,6 +34,16 @@ use crate::trace::{self, Trace};
 /// idle loop costs nothing.
 const COMPLETE_TIMEOUT: Duration = Duration::from_millis(5);
 
+/// How long a stream may deliver nothing at all before it is said out loud.
+///
+/// This is the one failure this backend can produce with no error anywhere in
+/// it — an unloaded FPGA answers every command and sends no samples — and until
+/// issue #178 it was completely silent: the source's own watchdog reopened the
+/// device every three seconds, for ever, with nothing in the log between two
+/// cycles. Comfortably inside that three seconds, so the sentence is raised
+/// before the handle carrying it is thrown away.
+const FIRST_SAMPLE_GRACE: Duration = Duration::from_millis(1500);
+
 /// Transfers kept in flight.
 ///
 /// At the default 192 kHz this is 128 ms of hardware-side buffering; at
@@ -172,10 +182,11 @@ fn pump(
     let mut deconstruct = Deconstructor::new(rate);
     deconstruct.set_scale(dev.scale());
 
-    let mut stats = RxStats::new(rate as f64);
+    let mut stats = RxStats::new(rate as f64, dev.model());
     let started = Instant::now();
     let mut samples: Vec<f32> = Vec::with_capacity(TRANSFER_BYTES / 2);
     let mut logged_first = false;
+    let mut said_silent = false;
 
     for _ in 0..IN_FLIGHT {
         ep.submit(ep.allocate(TRANSFER_BYTES));
@@ -280,6 +291,22 @@ fn pump(
             if drained >= IN_FLIGHT {
                 break;
             }
+        }
+
+        // A stream that has never produced a sample. Not a transfer error, not
+        // a stall, not a short read — nothing has come back at all, which is
+        // exactly what an unloaded FPGA looks like from here.
+        if !logged_first && !said_silent && started.elapsed() >= FIRST_SAMPLE_GRACE {
+            said_silent = true;
+            // Whatever this process believed it had loaded into the device is
+            // not true any more — most likely because it has been unplugged and
+            // plugged back in, which empties the FPGA again. Saying so is what
+            // makes the next reopen load it rather than trusting the memory.
+            crate::fpga::forget();
+            let w = crate::fpga::silence_hint(dev.model());
+            tracing::warn!("{w}");
+            trace.note(&w);
+            *late_warning.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
         }
 
         // The rate is a guess until the stream has been running long enough to

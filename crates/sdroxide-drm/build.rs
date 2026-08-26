@@ -356,6 +356,7 @@ fn generate_bindings(manifest: &Path, out: &Path) {
         .header(manifest.join("src/drm_shim.h").to_string_lossy())
         .allowlist_function("sdrx_drm_.*")
         .allowlist_type("sdrx_drm_.*")
+        .allowlist_var("SDRX_DRM_.*")
         .layout_tests(false)
         .derive_debug(false)
         .generate()

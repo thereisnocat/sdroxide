@@ -172,6 +172,23 @@ pub struct DeviceCaps {
     /// Appended last, for the same reason as `shared_lo_rx`.
     #[serde(default)]
     pub center_is_dial: bool,
+    /// A diversity filter is running on this stream: two coherent aerials —
+    /// a LimeSDR's two receive chains, an RSPduo's two tuners — combined into
+    /// the one span this radio shows.
+    ///
+    /// What it is for is the main window: the filter has controls an operator
+    /// works with *while listening* (which way it combines, and holding it the
+    /// moment a null appears), and those belong on the strip rather than three
+    /// clicks into a settings dialog. Every backend that has one drives it
+    /// through the same pseudo-gain element names, so this one flag is all the
+    /// strip needs to know.
+    ///
+    /// Reported by the source, not read from the configuration: a setting the
+    /// hardware refused (no second tuner, a chain another radio has taken)
+    /// must not put controls on screen that do nothing. Appended last, for the
+    /// same reason as `shared_lo_rx`.
+    #[serde(default)]
+    pub diversity: bool,
 }
 
 impl DeviceCaps {

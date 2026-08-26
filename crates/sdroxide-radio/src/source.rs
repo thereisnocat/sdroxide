@@ -341,7 +341,7 @@ pub trait IqSource: Send {
     /// of complex samples for a picture that is a couple of thousand pixels
     /// wide. The source already has the samples and can analyse a small
     /// fraction of them cheaply, so it hands over the result and the engine
-    /// keeps the display policy (pooling to `DISPLAY_BINS`, the dB window).
+    /// keeps the display policy (pooling to `WIDE_BINS`, the dB window).
     ///
     /// Default: nothing to show.
     fn wide_spectrum_db(&mut self, _out: &mut Vec<f32>) -> Option<(f64, f64)> {
@@ -370,6 +370,29 @@ pub trait IqSource: Send {
     ///
     /// Default: false — a front end that tunes independently of any rig.
     fn center_is_dial(&self) -> bool {
+        false
+    }
+
+    /// Where a transceiver's I/Q lands when the radio is in CW: on the
+    /// frequency its VFO displays (true), or a sidetone pitch below it (false).
+    ///
+    /// The question exists because a transceiver in CW displays the carrier it
+    /// *transmits* while listening a sidetone away from it, and radios settle
+    /// that in two different places. Some move their own I.F. by the pitch, so
+    /// a station on the displayed frequency arrives already offset and the
+    /// stream is a pitch below the readout — the K3's `CW WGHT: VFO OFS`, a QMX
+    /// on I/Q. Others hand out the DDC as it is, centred on the VFO, and leave
+    /// the offset to whatever demodulates it; an ELAD FDM-DUO does.
+    ///
+    /// It matters for one thing, and it is not the picture: on the second kind
+    /// the frequency being copied is a pitch *above* the VFO, so a radio keying
+    /// its own transmitter — a paddle in its socket, text handed to its keyer —
+    /// has to be left sitting there and not on our dial, or every over goes out
+    /// a sidetone below the station (issue #170).
+    ///
+    /// Default: false, which is how sdroxide has always treated every rig, so
+    /// only a radio this is *known* about should answer otherwise.
+    fn cw_iq_on_vfo(&self) -> bool {
         false
     }
 
@@ -816,6 +839,12 @@ impl IqSource for ConvertedSource {
         self.inner.center_is_dial()
     }
 
+    /// Nor where the rig puts its own I.F. in CW: that is a property of the
+    /// radio, and a converter ahead of it moves both numbers together.
+    fn cw_iq_on_vfo(&self) -> bool {
+        self.inner.cw_iq_on_vfo()
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -1049,24 +1078,61 @@ pub struct SigGenSource {
     center_hz: f64,
     /// (offset from center in Hz, linear amplitude)
     tones: Vec<(f64, f32)>,
-    phases: Vec<f64>,
+    /// Each tone as a rotating phasor and the per-sample rotation that advances
+    /// it, rather than a phase angle to take a sine and a cosine of.
+    ///
+    /// `(phasor, step)`: one complex multiply a sample instead of a `sin`, a
+    /// `cos` and a `fmod`. That arithmetic was measured at about a fifth of the
+    /// whole process on a five-tone 1.5 Msps generator — 7.7 million of each
+    /// libm call a second — which is a strange thing for a *test* source to
+    /// spend, and it made every profile of the real receive chain read high.
+    rotors: Vec<(Complex32, Complex32)>,
+    /// Samples until the phasors are renormalised. Repeated complex multiplies
+    /// drift off the unit circle, slowly (the error is second-order per step)
+    /// but without bound, so the amplitude has to be pulled back now and then.
+    renorm_in: usize,
     noise_amp: f32,
     rng: u64,
     throttle: Throttle,
 }
 
+/// How often the tone phasors are pulled back onto the unit circle.
+///
+/// A rotation by a complex multiply loses about `eps` of magnitude per step, so
+/// a few thousand steps between corrections keeps every tone inside a hundredth
+/// of a dB of its nominal amplitude while costing one square root per tone per
+/// block rather than per sample.
+const SIGGEN_RENORM_SAMPLES: usize = 4096;
+
 impl SigGenSource {
     pub fn new(sample_rate: f64, center_hz: f64, tones: Vec<(f64, f32)>, noise_amp: f32) -> Self {
-        let phases = vec![0.0; tones.len()];
+        let rotors = Self::rotors(&tones, sample_rate);
         SigGenSource {
             sample_rate,
             center_hz,
             tones,
-            phases,
+            rotors,
+            renorm_in: SIGGEN_RENORM_SAMPLES,
             noise_amp,
             rng: 0x9e3779b97f4a7c15,
             throttle: Throttle::new(sample_rate),
         }
+    }
+
+    /// Each tone's starting phasor (at its amplitude) and per-sample rotation.
+    ///
+    /// The two `sin`/`cos` pairs a tone needs are taken once here, not once per
+    /// sample: `e^{i(φ+δ)} = e^{iφ}·e^{iδ}`, so advancing a tone is a complex
+    /// multiply by a constant.
+    fn rotors(tones: &[(f64, f32)], sample_rate: f64) -> Vec<(Complex32, Complex32)> {
+        use std::f64::consts::TAU;
+        tones
+            .iter()
+            .map(|&(offset, amp)| {
+                let d = TAU * offset / sample_rate;
+                (Complex32::new(amp, 0.0), Complex32::new(d.cos() as f32, d.sin() as f32))
+            })
+            .collect()
     }
 
     /// A default test scene: carriers at various offsets over a noise floor.
@@ -1112,17 +1178,27 @@ impl IqSource for SigGenSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-        use std::f64::consts::TAU;
         for s in buf.iter_mut() {
             let mut acc =
                 Complex32::new(self.noise_amp * self.white(), self.noise_amp * self.white());
-            for (i, &(offset, amp)) in self.tones.iter().enumerate() {
-                let ph = self.phases[i];
-                acc +=
-                    Complex32::new((ph.cos() * amp as f64) as f32, (ph.sin() * amp as f64) as f32);
-                self.phases[i] = (ph + TAU * offset / self.sample_rate) % TAU;
+            for (phasor, step) in self.rotors.iter_mut() {
+                acc += *phasor;
+                *phasor *= *step;
             }
             *s = acc;
+        }
+        // Pull the phasors back onto their circle now and then — see
+        // [`SIGGEN_RENORM_SAMPLES`]. Per block rather than per sample, and only
+        // when one is due, so the cost is a rounding error on the loop above.
+        self.renorm_in = self.renorm_in.saturating_sub(buf.len());
+        if self.renorm_in == 0 {
+            self.renorm_in = SIGGEN_RENORM_SAMPLES;
+            for ((phasor, _), &(_, amp)) in self.rotors.iter_mut().zip(&self.tones) {
+                let mag = phasor.norm();
+                if mag > 1e-6 {
+                    *phasor *= amp / mag;
+                }
+            }
         }
         self.throttle.pace(buf.len());
         Ok(buf.len())
@@ -1225,6 +1301,79 @@ mod tests {
         for rate in [1_000_000.0, 2_000_000.0, 3_840_000.0, 5_000_000.0f64] {
             let offset = lo_offset_for(rate, rate * 0.9);
             assert_eq!(offset, rate * 0.25, "the offset was dropped at {rate} sps");
+        }
+    }
+}
+
+#[cfg(test)]
+mod siggen_tests {
+    use super::*;
+
+    /// The generator's tones stay where they are put, at the amplitude they
+    /// were given, for as long as anyone runs it.
+    ///
+    /// It advances each tone by multiplying a phasor rather than by taking a
+    /// sine of a growing angle, which is an order of magnitude cheaper and
+    /// would be worthless if the amplitude wandered: repeated complex
+    /// multiplies drift off the unit circle without bound. This runs far past
+    /// the renormalisation interval and measures what actually comes out.
+    #[test]
+    fn the_tones_hold_their_amplitude_and_frequency() {
+        let rate = 1_536_000.0;
+        let mut siggen = SigGenSource::new(rate, 14_200_000.0, vec![(100_000.0, 0.30)], 0.0);
+
+        // Long enough to cross the renormalisation boundary many times over.
+        let mut buf = vec![Complex32::default(); 16_384];
+        for _ in 0..40 {
+            siggen.read(&mut buf).unwrap();
+        }
+
+        // Amplitude: a single tone with no noise, so every sample is the
+        // phasor itself.
+        let peak = buf.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
+        let floor = buf.iter().map(|c| c.norm()).fold(f32::MAX, f32::min);
+        assert!(
+            (peak - 0.30).abs() < 0.003 && (floor - 0.30).abs() < 0.003,
+            "amplitude drifted to {floor}..{peak}, expected 0.30"
+        );
+
+        // Frequency: count the phase advance per sample and turn it back into
+        // hertz. A step that had been mis-derived would show up here.
+        let mut adv = 0.0f64;
+        for w in buf.windows(2).take(1000) {
+            let d = (w[1] * w[0].conj()).arg() as f64;
+            adv += d;
+        }
+        let hz = adv / 1000.0 / std::f64::consts::TAU * rate;
+        assert!((hz - 100_000.0).abs() < 50.0, "tone read {hz:.0} Hz, expected 100000");
+    }
+
+    /// Several tones at once still sum to what was asked for, which is what
+    /// every test that uses `demo()` as a stand-in for a radio depends on.
+    #[test]
+    fn every_tone_of_a_scene_is_present() {
+        let rate = 1_536_000.0;
+        let want = vec![(-200_000.0, 0.10), (700.0, 0.05), (300_000.0, 0.30)];
+        let mut siggen = SigGenSource::new(rate, 14_200_000.0, want.clone(), 0.0);
+        let mut buf = vec![Complex32::default(); 8192];
+        for _ in 0..8 {
+            siggen.read(&mut buf).unwrap();
+        }
+
+        // Correlate against each tone's own rotation: a tone that is present at
+        // amplitude a leaves |mean| = a, and the others average away.
+        for &(offset, amp) in &want {
+            let step = std::f64::consts::TAU * offset / rate;
+            let mut acc = Complex32::default();
+            for (i, s) in buf.iter().enumerate() {
+                let ph = -step * i as f64;
+                acc += *s * Complex32::new(ph.cos() as f32, ph.sin() as f32);
+            }
+            let got = acc.norm() / buf.len() as f32;
+            assert!(
+                (got - amp).abs() < amp * 0.05,
+                "tone at {offset} Hz read {got}, expected {amp}"
+            );
         }
     }
 }

@@ -202,6 +202,40 @@ fn the_scope_sweep_arrives_whole_the_way_a_lan_icom_sends_it() {
     assert!(bins.iter().any(|&b| b > 100), "the simulator plants a peak");
 }
 
+/// Issue #183. The IC-7760's CI-V reference gives its LAN sweep as a single
+/// 704-byte division — 689 points on a 0 ~ C8 scale — where the IC-7300
+/// generation sends 475 on 0 ~ A0. The byte count is the manufacturer's own,
+/// so asserting it pins every field ahead of the waveform data as well.
+#[test]
+fn an_ic7760_sends_the_704_byte_sweep_its_reference_guide_documents() {
+    let sim = Sim::start(SimOptions {
+        civ_address: 0xB2,
+        radio_name: "IC-7760".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let dev = connect(&sim, |_| {}).expect("connect");
+    dev.send_civ(vec![0xfe, 0xfe, 0xb2, 0xe0, 0x27, 0x11, 0x01, 0xfd]);
+
+    let mut sweep = None;
+    wait_for("a scope sweep", Duration::from_secs(3), || {
+        while let Ok(f) = dev.civ_frames().try_recv() {
+            if f.get(4) == Some(&0x27) && f.get(5) == Some(&0x00) {
+                sweep = Some(f);
+                return true;
+            }
+        }
+        false
+    });
+    let s = sweep.unwrap();
+    // FE FE E0 B2 27 00 | 704 bytes of payload | FD
+    assert_eq!(s.len(), 6 + 704 + 1);
+    assert_eq!(s[8], 0x01, "of 1 — over LAN the sweep is not fragmented");
+    let bins = &s[21..21 + 689];
+    assert!(bins.iter().all(|&b| b <= 200), "the scale runs 0..200");
+    assert!(bins.iter().any(|&b| b > 160), "and the peak goes above where an IC-705 tops out");
+}
+
 #[test]
 fn the_opening_burst_survives_the_streams_still_coming_up() {
     // `connect` reports the moment the radio names its CI-V port, which is

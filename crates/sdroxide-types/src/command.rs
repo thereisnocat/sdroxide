@@ -708,4 +708,35 @@ pub enum Command {
         to: String,
         text: String,
     },
+
+    /// Packet: call a station in connected mode — a node, a BBS, a peer.
+    ///
+    /// `via` is the operator's string rather than a parsed list, because that
+    /// is what a TNC takes and what a node's own listing prints: callsigns
+    /// separated by commas or spaces, nearest hop first. Parsing it belongs
+    /// where the callsign validation is, engine-side, so a typo comes back as a
+    /// line in the terminal instead of a command that vanishes.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    PacketConnect {
+        call: String,
+        via: String,
+        /// Extended (mod-128) sequence numbers.
+        ext: bool,
+    },
+
+    /// Packet: send one line to the connected station.
+    ///
+    /// A line, not bytes: the terminator is the link's business, because a BBS
+    /// wants a CR and what the operator typed has neither.
+    PacketSend {
+        text: String,
+    },
+
+    /// Packet: hang up. A clean DISC, waited out — not a link dropped on the
+    /// floor for the far end to time out.
+    PacketDisconnect,
+
+    /// Packet: empty the terminal transcript. The link is untouched.
+    PacketTermClear,
 }

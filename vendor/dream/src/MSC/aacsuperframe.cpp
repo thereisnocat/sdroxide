@@ -7,7 +7,9 @@ AACSuperFrame::AACSuperFrame():AudioSuperFrame (),
 
 void AACSuperFrame::init(const CAudioParam &audioParam, ERobMode eRobMode, unsigned int lengthPartA, unsigned int lengthPartB)
 {
-    size_t numFrames;
+    /* A robustness mode / sample rate pair that carries no AAC super frame
+       leaves this at zero rather than at whatever was on the stack. */
+    size_t numFrames = 0;
     switch(eRobMode) {
     case ERobMode::RM_ROBUSTNESS_MODE_A:
     case ERobMode::RM_ROBUSTNESS_MODE_B:
@@ -50,6 +52,9 @@ void AACSuperFrame::init(const CAudioParam &audioParam, ERobMode eRobMode, unsig
 bool AACSuperFrame::header(CVectorEx<_BINARY>& header)
 {
     bool ok = true;
+    if (audioFrame.empty()) {
+        return false;
+    }
     unsigned numBorders = audioFrame.size()-1;
     unsigned headerBits = 12*numBorders;
     if (numBorders == 9) {
@@ -57,6 +62,11 @@ bool AACSuperFrame::header(CVectorEx<_BINARY>& header)
     }
     headerBytes = headerBits / 8;
     unsigned crcBytes = audioFrame.size();
+    /* Both lengths come from the SDC, so a frame too short to hold its own
+       header and CRCs has to be rejected before this subtraction wraps. */
+    if (size_t(lengthPartA) + size_t(lengthPartB) <= size_t(headerBytes) + size_t(crcBytes)) {
+        return false;
+    }
     size_t audioPayloadLength = lengthPartA + lengthPartB - headerBytes - crcBytes; // Table 11 Note 1
     size_t previous_border = 0;
     size_t sumOfFrameLengths = 0;
@@ -90,7 +100,10 @@ bool AACSuperFrame::header(CVectorEx<_BINARY>& header)
 
 bool AACSuperFrame::parse(CVectorEx<_BINARY>& asf)
 {
-    unsigned numFrames = audioFrame.size();
+    unsigned numFrames = unsigned(audioFrame.size());
+    if(numFrames==0) {
+        return false;
+    }
     bool ok = header(asf);
     if(!ok) {
         return false;
@@ -98,7 +111,22 @@ bool AACSuperFrame::parse(CVectorEx<_BINARY>& asf)
     // higher protected part
     unsigned higherProtectedBytes = 0;
     if(lengthPartA>0) {
-        higherProtectedBytes =  (lengthPartA-headerBytes-aacCRC.size())/numFrames;
+        /* Part A holds the header, one CRC per frame and an equal share of each
+           audio frame (Table 11). One too short for even the header and the
+           CRCs is corrupt, and the subtraction below would wrap. */
+        if(size_t(lengthPartA) < size_t(headerBytes) + aacCRC.size()) {
+            return false;
+        }
+        higherProtectedBytes =  (lengthPartA-headerBytes-unsigned(aacCRC.size()))/numFrames;
+    }
+    /* Both loops below index the frames directly, so every frame has to be long
+       enough to hold the higher protected part that goes into it - otherwise
+       the writes run past the end of the frame, or the lower protected length
+       wraps around. */
+    for(size_t f=0; f<numFrames; f++) {
+        if(audioFrame[f].size() < higherProtectedBytes) {
+            return false;
+        }
     }
     for(size_t f=0; f<numFrames; f++) {
         for (size_t b = 0; b < higherProtectedBytes; b++) {

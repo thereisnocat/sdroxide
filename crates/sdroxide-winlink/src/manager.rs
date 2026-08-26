@@ -133,6 +133,13 @@ impl WinlinkManager {
     /// change destroys the controller that owns the far end. Taking it away
     /// mid-session is deliberate: the session then fails with a transcript
     /// rather than blocking for ever on a link that no longer exists.
+    /// The link handle the manager is holding, so the engine can tell a fresh
+    /// port from the one a destroyed controller left behind.
+    #[must_use]
+    pub fn packet_port(&self) -> Option<&sdroxide_ax25::PortHandle> {
+        self.packet_port.as_ref()
+    }
+
     pub fn set_packet_port(&mut self, port: Option<sdroxide_ax25::PortHandle>) {
         self.packet_port = port;
     }

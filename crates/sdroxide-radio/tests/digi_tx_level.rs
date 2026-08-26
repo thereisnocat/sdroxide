@@ -19,9 +19,45 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sdroxide_radio::{Complex32, EngineConfig, IqSource, Result, start_engine};
-use sdroxide_types::{Command, DeviceCaps, Mode, RxId};
+use sdroxide_types::{Command, DeviceCaps, DigiConfig, Mode, RxId};
 
 const DIAL_HZ: f64 = 14_090_000.0;
+
+/// Point the whole process at a config directory of its own, once.
+///
+/// `SDROXIDE_CONFIG_DIR` is process-global, and an engine that comes up without
+/// it reads the *operator's* live configuration — including the transmit-audio
+/// level, which is one of the two numbers this file multiplies together. A
+/// station that had turned its data input down to 40 % for FM packet failed
+/// this test at 0.4 against the tune tone's 1.0, and the failure looked exactly
+/// like the regression it exists to catch. It was measuring the operator's
+/// settings, not the code.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let root =
+            std::env::temp_dir().join(format!("sdroxide-digi-tx-level-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        unsafe { std::env::set_var("SDROXIDE_CONFIG_DIR", &root) };
+    });
+}
+
+/// The station this test transmits from: stock, and explicitly at a full-scale
+/// data input.
+///
+/// Sent rather than left to the defaults because it is the premise of the
+/// comparison and not an incidental setting. The transmit-audio levels are the
+/// operator's own, into a radio that modulates what we send it — deviation on
+/// FM, drive into the modulator on sideband — and a digital over only reaches
+/// the rig at the level a tune does when the one in play is wide open. Turned
+/// down, the over is *supposed* to arrive quieter, which
+/// [`the_sideband_level_is_the_one_a_data_mode_uses`] and
+/// `aprs_tx::the_transmit_audio_level_scales_what_the_radio_is_given` pin from
+/// the other side.
+fn full_scale_station() -> DigiConfig {
+    DigiConfig { tx_audio_level_fm: 1.0, tx_audio_level_ssb: 1.0, ..DigiConfig::default() }
+}
 
 /// The loudest sample the rig's sound card was given, and how many blocks it
 /// took.
@@ -101,13 +137,14 @@ fn caps() -> DeviceCaps {
 /// Gives up once the transmission is plainly under way, since the level is
 /// settled by then and a keyboard mode would otherwise send until stopped.
 fn peak_of(cmds: Vec<Command>) -> f32 {
+    isolate_config();
     let heard = Arc::new(Mutex::new(Heard::default()));
     let src = SoundCardRig { heard: Arc::clone(&heard) };
     let cfg = EngineConfig { tx_ham_only: false, ..Default::default() };
     let mut h = start_engine(Box::new(src), caps(), cfg);
     let thread = h.thread.take();
     std::thread::sleep(Duration::from_millis(200));
-    for c in cmds {
+    for c in std::iter::once(Command::SetDigiConfig(full_scale_station())).chain(cmds) {
         h.cmd_tx.send(c).expect("engine gone");
         std::thread::sleep(Duration::from_millis(60));
     }
@@ -149,6 +186,42 @@ fn a_digital_over_reaches_the_rig_at_the_level_a_tune_does() {
         "a digital over is {over} against the tune tone's {tune} — the rig is being asked for \
          {:.0}% of the power",
         (over / tune).powi(2) * 100.0
+    );
+}
+
+/// RTTY is audio on a sideband, so it takes the sideband level and never the FM
+/// one.
+///
+/// The two were a single number until a station set 40 % for 1200 baud packet
+/// deviation and found it had taken 8 dB off their FT8 as well — issue #131's
+/// symptom by another road, and invisible, because the control was only drawn
+/// in the APRS panel. So the level that applies follows the carrier the mode
+/// goes out on: this is the sideband end of it, and
+/// `aprs_tx::the_transmit_audio_level_scales_what_the_radio_is_given` is the FM
+/// end.
+#[test]
+fn the_sideband_level_is_the_one_a_data_mode_uses() {
+    let rtty_at = |fm: f32, ssb: f32| {
+        peak_of(vec![
+            Command::SetDigiConfig(DigiConfig {
+                tx_audio_level_fm: fm,
+                tx_audio_level_ssb: ssb,
+                ..DigiConfig::default()
+            }),
+            Command::SetMode { rx: RxId::Main, mode: Mode::Rtty },
+            Command::DigiTxActive(true),
+            Command::DigiTxText("cq cq de w1aw w1aw k".into()),
+        ])
+    };
+    // Turning the *FM* level down does nothing to a sideband over...
+    let fm_down = rtty_at(0.4, 1.0);
+    assert!(fm_down > 0.9, "an FM deviation setting reached an SSB over: {fm_down}");
+    // ...and turning the sideband level down scales it, because on sideband
+    // this is the only drive control there is.
+    let ssb_down = rtty_at(1.0, 0.5);
+    assert!(
+        (ssb_down / fm_down - 0.5).abs() < 0.08,
+        "half the sideband level should be half the amplitude: {ssb_down} against {fm_down}"
     );
 }
 
@@ -198,6 +271,7 @@ impl IqSource for IqRadio {
 /// As [`peak_of`], for the modulated-I/Q path: the strongest baseband magnitude
 /// the converter was handed.
 fn iq_peak_of(cmds: Vec<Command>) -> f32 {
+    isolate_config();
     let heard = Arc::new(Mutex::new(Heard::default()));
     let src = IqRadio { heard: Arc::clone(&heard) };
     let cfg = EngineConfig { tx_ham_only: false, ..Default::default() };

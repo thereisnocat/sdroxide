@@ -483,6 +483,12 @@ impl Store {
         Store { scope: (id != 0).then_some(id) }
     }
 
+    /// Which radio this scope belongs to, as the roster numbers it. The station
+    /// scope answers 0, which is the radio it holds the files of.
+    pub fn radio_id(&self) -> u32 {
+        self.scope.unwrap_or(0)
+    }
+
     /// This scope's directory. Not created here; writers create it on demand.
     pub fn dir(&self) -> Result<PathBuf, ConfigError> {
         let root = config_dir()?;
@@ -1091,6 +1097,35 @@ fn load_json<T: serde::de::DeserializeOwned + Default>(file: &str) -> T {
     }
 }
 
+/// [`load_json`] with a chance to rewrite the parsed JSON first, for a file
+/// whose shape has changed since it was written. The migration sees the object
+/// as it is on disk and leaves anything it does not recognise alone; a file
+/// that is already current goes through untouched.
+///
+/// Nothing is written back here: a start that only reads the file leaves it
+/// exactly as it was. The new shape reaches the disk the next time the operator
+/// changes the setting, and the save drops whatever the migration replaced — so
+/// a downgrade after that point comes up on the defaults for those keys rather
+/// than on the operator's old values.
+fn load_json_migrated<T: serde::de::DeserializeOwned + Default>(
+    file: &str,
+    migrate: fn(&mut serde_json::Value),
+) -> T {
+    let Ok(dir) = config_dir() else { return T::default() };
+    let Ok(text) = fs::read_to_string(dir.join(file)) else { return T::default() };
+    let parsed = serde_json::from_str::<serde_json::Value>(&text).and_then(|mut v| {
+        migrate(&mut v);
+        serde_json::from_value(v)
+    });
+    match parsed {
+        Ok(v) => v,
+        Err(e) => {
+            quarantine_unreadable(&dir, file, &e);
+            T::default()
+        }
+    }
+}
+
 fn save_json<T: serde::Serialize>(file: &str, value: &T) -> Result<(), ConfigError> {
     let dir = config_dir()?;
     let text = serde_json::to_string_pretty(value).expect("serialize");
@@ -1135,7 +1170,25 @@ pub fn save_radio_config(cfg: &sdroxide_types::RadioConfig) -> Result<(), Config
 
 /// FT8/FT4 operator config (own call, grid, message templates).
 pub fn load_digi_config() -> sdroxide_types::DigiConfig {
-    load_json("digi.json")
+    load_json_migrated("digi.json", migrate_digi)
+}
+
+/// One `tx_audio_level` became two — `_fm` (deviation) and `_ssb` (drive into
+/// the modulator) — because the single number was doing both jobs at once and
+/// an FM setting was silently taking the level off sideband data as well.
+///
+/// A file written before the split carries its value into **both**, so no
+/// station's signal changes level on an update: an operator who had turned it
+/// down for packet keeps that level everywhere until they deliberately raise
+/// the sideband one, which they can now see. A file written since keeps what
+/// it says — `or_insert` only fills a key that is not there.
+fn migrate_digi(v: &mut serde_json::Value) {
+    let Some(obj) = v.as_object_mut() else { return };
+    let Some(old) = obj.get("tx_audio_level").and_then(serde_json::Value::as_f64) else { return };
+    let old = serde_json::json!(old);
+    for key in ["tx_audio_level_fm", "tx_audio_level_ssb"] {
+        obj.entry(key).or_insert_with(|| old.clone());
+    }
 }
 
 pub fn save_digi_config(cfg: &sdroxide_types::DigiConfig) -> Result<(), ConfigError> {
@@ -2273,6 +2326,46 @@ mod tests {
         assert_eq!(back.ui.theme, sdroxide_types::UiTheme::AmberPhosphor);
         assert_eq!(back.ui.button_style, sdroxide_types::ChromeStyle::Bevel);
         assert_eq!(back.ui.window_style, sdroxide_types::ChromeStyle::Gradient);
+    }
+
+    /// The FT8/FT4 decode list's own view preferences — the sort, its
+    /// direction, the grouping and the two filters — ride in `[ui]` beside the
+    /// theme, so they have to survive the same trip: a chip clicked in the
+    /// panel is written the moment it is pressed and has to come back on the
+    /// next start.
+    #[test]
+    fn the_decode_list_view_survives_a_toml_round_trip() {
+        let mut s = Settings::default();
+        s.ui.decode_sort = sdroxide_types::DecodeSort::Country;
+        s.ui.decode_sort_desc = false;
+        s.ui.decode_single_list = true;
+        s.ui.decode_cq_only = true;
+        s.ui.decode_new_only = true;
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(back.ui.decode_sort, sdroxide_types::DecodeSort::Country);
+        assert!(!back.ui.decode_sort_desc);
+        assert!(back.ui.decode_single_list);
+        assert!(back.ui.decode_cq_only);
+        assert!(back.ui.decode_new_only);
+    }
+
+    /// A config written before these existed — or one with a hand-typed sort
+    /// name that is not a sort — loads with the list unsorted and every other
+    /// preference intact, rather than throwing the whole `[ui]` table away.
+    #[test]
+    fn an_unknown_decode_sort_degrades_to_no_sorting() {
+        let s: Settings = toml::from_str(
+            "[ui]\n\
+             theme = \"AmberPhosphor\"\n\
+             decode_sort = \"Loudest\"\n",
+        )
+        .expect("an unknown sort name must still parse");
+        assert_eq!(s.ui.decode_sort, sdroxide_types::DecodeSort::None);
+        assert_eq!(s.ui.theme, sdroxide_types::UiTheme::AmberPhosphor);
+        let old: Settings = toml::from_str("[ui]\ntheme = \"AmberPhosphor\"\n").unwrap();
+        assert_eq!(old.ui.decode_sort, sdroxide_types::DecodeSort::None);
+        assert!(!old.ui.decode_cq_only, "a config from before these must not filter the list");
     }
 
     /// One test rather than several, because it redirects the config directory

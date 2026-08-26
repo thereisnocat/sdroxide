@@ -29,6 +29,10 @@ pub enum DeviceKey {
     Hpsdr(std::net::Ipv4Addr),
     /// A PlutoSDR, by the address dialed (`host[:port]`).
     Pluto(String),
+    /// An SDRplay RSP, by the serial the API service reports — or the empty
+    /// string for "the first one found", which is the same device to every
+    /// radio that says it.
+    SdrPlay(String),
 }
 
 /// What every entry must answer: whether the connection behind it still

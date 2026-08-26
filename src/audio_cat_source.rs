@@ -51,6 +51,10 @@ pub struct AudioCatSource {
     tx_scratch: Vec<f32>,
 
     cat: sdroxide_cat::CatHandle,
+    /// Top of the `27 00` amplitude scale on the rig the model list names —
+    /// 160 on the IC-7300 generation, 200 on an IC-7760. Taken at open, since
+    /// the model cannot change under a session.
+    scope_full_scale: f32,
     /// Whether the CW panel keys this rig as audio (`CwKeying::Audio`), so the
     /// rig must be held on a sideband instead of being put in CW. See
     /// [`IqSource::cw_audio_keyed`].
@@ -291,6 +295,9 @@ impl AudioCatSource {
         } else {
             status
         };
+        // Read off the model before the configuration is handed to the link,
+        // which takes it by value.
+        let scope_full_scale = f32::from(cfg.icom_model.scope_full_scale());
         let cat = sdroxide_cat::spawn(cfg);
 
         Ok(AudioCatSource {
@@ -307,6 +314,7 @@ impl AudioCatSource {
             tx_resampler,
             tx_scratch: Vec::new(),
             cat,
+            scope_full_scale,
             cw_mcw,
             dial: Dial::at(center),
             dial_reachable,
@@ -667,17 +675,17 @@ impl IqSource for AudioCatSource {
     /// it over the serial link — the same `27 00` sweeps, and the same two
     /// lanes, as the Icom LAN backend: the full-band strip always, and on the
     /// demod-audio path the *main* panadapter too (the engine decides — see
-    /// its `scope_main_window`). Finished magnitude bins on the radio's
-    /// 0..=160 scale, mapped to dB with the same uncalibrated slope the LAN
-    /// backend uses; the engine's auto-levelling makes the picture right even
-    /// where the absolute numbers are not.
+    /// its `scope_main_window`). Finished magnitude bins on the radio's own
+    /// scale, mapped to dB with the same uncalibrated slope the LAN backend
+    /// uses; the engine's auto-levelling makes the picture right even where the
+    /// absolute numbers are not.
     fn wide_spectrum_db(&mut self, out: &mut Vec<f32>) -> Option<(f64, f64)> {
         let sweep = self.cat.take_scope_sweep()?;
         if sweep.bins.is_empty() || sweep.span_hz <= 0.0 {
             return None;
         }
         out.clear();
-        out.extend(sweep.bins.iter().map(|&b| (f32::from(b) - 160.0) * 0.5));
+        out.extend(sweep.bins.iter().map(|&b| (f32::from(b) - self.scope_full_scale) * 0.5));
         Some((sweep.center_hz, sweep.span_hz))
     }
 

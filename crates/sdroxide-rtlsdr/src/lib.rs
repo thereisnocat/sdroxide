@@ -37,7 +37,7 @@ pub mod tcp;
 mod tuner;
 mod usb;
 
-pub use device::Device;
+pub use device::{DIRECT_SAMPLING_TOP_HZ, Device, TUNER_MAX_HZ, TUNER_MIN_HZ};
 pub use error::{Error, Result};
 pub use handle::RtlSdrHandle;
 pub use usb::{Eeprom, list, parse_eeprom};

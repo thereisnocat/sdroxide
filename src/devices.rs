@@ -15,8 +15,14 @@
 
 use sdroxide_types::{DeviceProbe, ProbeAnswer, ProbeTest, ReportKind};
 
-/// Answer one device question about this machine.
-pub fn probe(req: DeviceProbe) -> ProbeAnswer {
+/// Answer one device question about this machine, asked by radio `radio` (its
+/// roster id).
+///
+/// Which radio asked matters to exactly one question — the diagnostic report,
+/// which is about *a* radio rather than about this computer. Everything else
+/// enumerates a bus, a network or a sound stack, and answers the same whoever
+/// is asking.
+pub fn probe(req: DeviceProbe, radio: u32) -> ProbeAnswer {
     match req {
         DeviceProbe::Host => ProbeAnswer::Host { soapy: cfg!(feature = "soapy") },
         DeviceProbe::RadioAudio => ProbeAnswer::RadioAudio {
@@ -38,7 +44,7 @@ pub fn probe(req: DeviceProbe) -> ProbeAnswer {
         DeviceProbe::SmartSdr => ProbeAnswer::SmartSdr(crate::smartsdr_source::discover()),
         DeviceProbe::Pluto => ProbeAnswer::Pluto(sdroxide_pluto::discover_default()),
         DeviceProbe::Test(t) => ProbeAnswer::Test(t.kind(), test(&t)),
-        DeviceProbe::Report(k) => ProbeAnswer::Report(k, report(k)),
+        DeviceProbe::Report(k) => ProbeAnswer::Report(k, report(k, radio)),
     }
 }
 
@@ -103,10 +109,18 @@ fn test(t: &ProbeTest) -> Result<String, String> {
 /// hardware, so a fault can be reported without asking anyone to reproduce it
 /// under a log filter. Where nothing has run yet, the answer says what to press
 /// first rather than coming back empty.
-fn report(kind: ReportKind) -> String {
+///
+/// `radio` is the roster id of the radio whose tab pressed the button, and the
+/// networked backends answer about *that* radio: a station can have two Icoms
+/// on the LAN, and handing the IC-9700's tab the IC-7300's trace is worse than
+/// handing it nothing — it reads as this radio's own conversation. The
+/// bus-attached backends still keep one trace apiece; two of a kind on one
+/// station is a rarity there, and the trace names the serial it opened.
+fn report(kind: ReportKind, radio: u32) -> String {
+    let scoped = || sdroxide_config::Store::radio(radio).load_radio_config();
     match kind {
-        ReportKind::IcomNet => crate::icomnet_source::diagnostics_or_hint(),
-        ReportKind::SmartSdr => crate::smartsdr_source::diagnostics_or_hint(),
+        ReportKind::IcomNet => crate::icomnet_source::diagnostics_or_hint(&scoped().icomnet),
+        ReportKind::SmartSdr => crate::smartsdr_source::diagnostics_or_hint(&scoped().smartsdr),
         ReportKind::Pluto => sdroxide_pluto::diagnostics().unwrap_or_else(|| {
             "No PlutoSDR session has run yet — press Test connection or \
              Apply / reconnect first."

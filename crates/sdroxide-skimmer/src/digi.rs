@@ -51,6 +51,8 @@ const OFF_RATIO: f32 = 4.0;
 const PAIR_FRAC: f32 = 0.15;
 const PEAK_SPACING: usize = 6;
 const TRACK_TOL: i64 = 2;
+/// Guard band around the front end's DC spike, in bins — see
+/// [`DigiSkimmer::set_dc_offset_hz`].
 const DC_GUARD: i64 = 3;
 /// Consecutive frames a peak must persist before it becomes a track — the key
 /// noise rejector for continuous carriers (a noise spike lasts 1–2 frames).
@@ -146,6 +148,9 @@ pub struct DigiSkimmer {
     /// The operator's visible waterfall window in absolute Hz, or `None` for
     /// the whole skim window. See [`DigiSkimmer::set_view`].
     view: Option<(f64, f64)>,
+    /// Where the front end's own DC spike sits in this window, as an offset in
+    /// Hz from its centre. See [`DigiSkimmer::set_dc_offset_hz`].
+    dc_off_hz: f64,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     inbuf: Vec<C32>,
@@ -193,6 +198,7 @@ impl DigiSkimmer {
             skim_rate,
             skim_center_hz,
             view: None,
+            dc_off_hz: 0.0,
             fft,
             window,
             inbuf: Vec::with_capacity(FFT_SIZE * 4),
@@ -241,6 +247,20 @@ impl DigiSkimmer {
         };
         self.tracks.retain(|t| visible(t.bin));
         self.confirm.retain(|&(bin, _)| visible(bin));
+    }
+
+    /// Where the front end's own DC spike falls in this window, as an offset in
+    /// Hz from the window centre; see [`crate::cw::CwSkimmer::set_dc_offset_hz`],
+    /// which this mirrors.
+    pub fn set_dc_offset_hz(&mut self, off_hz: f64) {
+        self.dc_off_hz = off_hz;
+    }
+
+    /// Whether a bin offset from the skim center is on that spike. One outside
+    /// this window never matches.
+    fn at_dc(&self, off: i64) -> bool {
+        let bin = (self.dc_off_hz / (self.skim_rate / FFT_SIZE as f64)).round() as i64;
+        (off - bin).abs() < DC_GUARD
     }
 
     /// Whether an absolute frequency is on screen.
@@ -333,7 +353,7 @@ impl DigiSkimmer {
         cands.clear();
         for k in 0..n {
             let off = self.offset_bin(k);
-            if off.abs() < DC_GUARD {
+            if self.at_dc(off) {
                 continue;
             }
             if self.smooth_power[k] > self.floor[k] * SMOOTH_ON {

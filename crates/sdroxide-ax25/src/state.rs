@@ -95,7 +95,11 @@ impl ReturnEvent {
         match self {
             ReturnEvent::Packet(p) => Some(p.serialize(ext)),
             ReturnEvent::DlError(e) => {
-                eprintln!("TODO: DLERROR: {e}");
+                // Was an `eprintln!`. This runs on the audio thread, once per
+                // link-layer error — and on a fading HF path that is a line of
+                // stderr every few seconds, from the thread that owes the
+                // transmitter a block every 10 ms.
+                debug!("AX.25 link error: {e}");
                 None
             }
             ReturnEvent::Data(d) => {
@@ -436,6 +440,24 @@ pub struct Data {
     /// In a modern spec, able to establish and not would be separate states.
     pub(crate) able_to_establish: bool,
 
+    /// The digipeater path every frame this link sends is addressed through.
+    ///
+    /// Added here: upstream builds direct links only, which is all a Winlink
+    /// client dialling a gateway it can hear needs. A BBS is usually a hop or
+    /// two away through a node, and a link whose frames go out direct is one
+    /// the far end never hears — the caller retries N2 times against a station
+    /// that was never addressed.
+    via: Vec<Addr>,
+
+    /// The operator's window, if they set one.
+    ///
+    /// Kept apart from `k` because `set_version_2`/`set_version_2_2` overwrite
+    /// `k` on every received SABM(E) — including a reset in the middle of a
+    /// session — so a preference applied once at construction would silently
+    /// go back to the specification's default the first time the far end
+    /// re-established the link.
+    k_pref: Option<u8>,
+
     /// An SREJ has been sent to the remote end.
     ///
     /// TODO: this counts outstanding SREJs?
@@ -539,7 +561,12 @@ impl Data {
             t3v: DEFAULT_T3V,
             n2: DEFAULT_N2,
             rc: 0,
-            k: 7,
+            // Four, not upstream's seven. `set_version_2` puts it back to four
+            // on a *received* SABM, so a link we dialled ran a window of seven
+            // and one we answered ran four — the same two stations behaving
+            // differently depending on who called. Four both ways is the
+            // specification's mod-8 figure and the one Linux uses.
+            k: 4,
             modulus: Modulus::Standard,
             peer_receiver_busy: false,
             reject_exception: false,
@@ -552,6 +579,8 @@ impl Data {
             obuf: VecDeque::new(),
             iframe_resend_queue: VecDeque::new(),
             able_to_establish: false,
+            via: Vec::new(),
+            k_pref: None,
             experiments: HashSet::new(),
         }
     }
@@ -601,6 +630,57 @@ impl Data {
     #[must_use]
     pub fn peer(&self) -> Option<&Addr> {
         self.peer.as_ref()
+    }
+
+    /// The digipeater path this link addresses its frames through.
+    ///
+    /// Set before the connect, or — answering a call — set to the reverse of
+    /// the path the SABM arrived on, because a UA sent direct to a station
+    /// reached through a node never gets there.
+    pub fn set_via(&mut self, via: Vec<Addr>) {
+        self.via = via;
+    }
+
+    /// The path in use, in order. Empty for a direct link.
+    #[must_use]
+    pub fn via(&self) -> &[Addr] {
+        &self.via
+    }
+
+    /// Frames outstanding before an acknowledgement is required.
+    ///
+    /// The operator's number is kept as they gave it and clamped at each use,
+    /// not on the way in: mod-8 counts to seven and mod-128 to 127, so a
+    /// preference clamped against whichever modulus happened to be current
+    /// would quietly shrink to seven and stay there when the link later
+    /// negotiated extended sequence numbers. Re-applied on every version
+    /// negotiation — see `k_pref`.
+    pub fn maxframe(&mut self, k: u8) {
+        self.k_pref = Some(k.max(1));
+        let limit = if self.modulus == Modulus::Extended { 127 } else { 7 };
+        self.k = k.clamp(1, limit);
+    }
+
+    /// Retries used against N2 on the frame in flight.
+    ///
+    /// A count climbing against unacknowledged data is what a fading path
+    /// looks like from this side, and it is the only warning before the link
+    /// gives up.
+    #[must_use]
+    pub fn retries(&self) -> u8 {
+        self.rc
+    }
+
+    /// How many I frames are waiting to be acknowledged.
+    #[must_use]
+    pub fn unacked(&self) -> usize {
+        self.iframe_resend_queue.len()
+    }
+
+    /// Bytes handed over that have not been made into frames yet.
+    #[must_use]
+    pub fn pending_out(&self) -> usize {
+        self.obuf.len()
     }
 
     /// Return true if T1 (retry) has expired.
@@ -908,7 +988,10 @@ impl Data {
         // TODO: n1r = 2048
 
         // 1998 Spec bug: Spec says `kr`. Surely it means `k`?
-        self.k = 32;
+        // The operator's window wins where they set one, and is re-applied
+        // here rather than once at construction: this runs again on every
+        // received SABME, and would otherwise undo it mid-session.
+        self.k = self.k_pref.unwrap_or(32).clamp(1, 127);
 
         // TODO: self.t2.set(3000);
         self.n2 = 10;
@@ -922,8 +1005,9 @@ impl Data {
         // TODO: n1r = 2048
 
         // 1998 Spec bug: Spec says `kr`. Surely it means `k`?
-        // 2025 spec says 8.
-        self.k = 4;
+        // 2025 spec says 8. The operator's window wins where they set one; see
+        // `set_version_2_2` for why it is re-applied here.
+        self.k = self.k_pref.unwrap_or(4).clamp(1, 7);
 
         // TODO: self.t2.set(3000);
         self.n2 = 10;
@@ -983,21 +1067,21 @@ pub trait State: Send {
     /// User initiates a new connection.
     #[must_use]
     fn connect(&self, _data: &mut Data, _addr: &Addr, _ext: bool) -> Vec<Action> {
-        eprintln!("TODO: unexpected DLConnect");
+        debug!("TODO: unexpected DLConnect");
         vec![]
     }
 
     /// User initiates disconnection.
     #[must_use]
     fn disconnect(&self, _data: &mut Data) -> Vec<Action> {
-        eprintln!("TODO: unexpected DLDisconnect in state {}", self.name());
+        debug!("TODO: unexpected DLDisconnect in state {}", self.name());
         vec![]
     }
 
     /// User initiates sending data on a connection.
     #[must_use]
     fn data(&self, _data: &mut Data, _payload: &[u8]) -> Vec<Action> {
-        eprintln!("writing data while not connected!");
+        debug!("writing data while not connected!");
         vec![]
     }
 
@@ -1005,7 +1089,7 @@ pub trait State: Send {
     #[must_use]
     fn t1(&self, data: &mut Data) -> Vec<Action> {
         data.t1.stop();
-        eprintln!("TODO: unexpected T1 expire");
+        debug!("TODO: unexpected T1 expire");
         vec![]
     }
 
@@ -1013,42 +1097,42 @@ pub trait State: Send {
     #[must_use]
     fn t3(&self, data: &mut Data) -> Vec<Action> {
         data.t3.stop();
-        eprintln!("TODO: unexpected T3 expire");
+        debug!("TODO: unexpected T3 expire");
         vec![]
     }
 
     /// RR received from peer.
     #[must_use]
     fn rr(&self, _data: &mut Data, _packet: &Rr, _command: bool) -> Vec<Action> {
-        eprintln!("TODO: unexpected RR");
+        debug!("TODO: unexpected RR");
         vec![]
     }
 
     /// REJ received from peer.
     #[must_use]
     fn rej(&self, _data: &mut Data, _packet: &Rej) -> Vec<Action> {
-        eprintln!("TODO: unexpected REJ");
+        debug!("TODO: unexpected REJ");
         vec![]
     }
 
     /// XID received from peer.
     #[must_use]
     fn xid(&self, _data: &mut Data, _packet: &Xid, _cr: bool) -> Vec<Action> {
-        eprintln!("TODO: unexpected XID");
+        debug!("TODO: unexpected XID");
         vec![]
     }
 
     /// TEST received from peer.
     #[must_use]
     fn test(&self, _data: &mut Data, _packet: &Test, _cr: bool) -> Vec<Action> {
-        eprintln!("TODO: unexpected TEST");
+        debug!("TODO: unexpected TEST");
         vec![]
     }
 
     /// SREJ received from peer.
     #[must_use]
     fn srej(&self, _data: &mut Data, _packet: &Srej) -> Vec<Action> {
-        eprintln!("TODO: unexpected SREJ");
+        debug!("TODO: unexpected SREJ");
         vec![]
     }
 
@@ -1057,35 +1141,35 @@ pub trait State: Send {
     /// FRMR is deprecated, so we should probably never see this.
     #[must_use]
     fn frmr(&self, _data: &mut Data) -> Vec<Action> {
-        eprintln!("TODO: unexpected FRMR");
+        debug!("TODO: unexpected FRMR");
         vec![]
     }
 
     /// RNR received from peer.
     #[must_use]
     fn rnr(&self, _data: &mut Data, _packet: &Rnr) -> Vec<Action> {
-        eprintln!("TODO: unexpected RNR");
+        debug!("TODO: unexpected RNR");
         vec![]
     }
 
     /// SABM received from peer.
     #[must_use]
     fn sabm(&self, _data: &mut Data, _src: &Addr, _packet: &Sabm) -> Vec<Action> {
-        eprintln!("TODO: unexpected SABM");
+        debug!("TODO: unexpected SABM");
         vec![]
     }
 
     /// SABME received from peer.
     #[must_use]
     fn sabme(&self, _data: &mut Data, _src: &Addr, _packet: &Sabme) -> Vec<Action> {
-        eprintln!("TODO: unexpected SABME");
+        debug!("TODO: unexpected SABME");
         vec![]
     }
 
     /// IFRAME received from peer.
     #[must_use]
     fn iframe(&self, _data: &mut Data, _packet: &Iframe, _cr: bool) -> Vec<Action> {
-        eprintln!("TODO; unexpected iframe");
+        debug!("TODO; unexpected iframe");
         vec![]
     }
 
@@ -1098,21 +1182,21 @@ pub trait State: Send {
     /// UA received from peer.
     #[must_use]
     fn ua(&self, _data: &mut Data, _packet: &Ua) -> Vec<Action> {
-        eprintln!("TODO; unexpected UA");
+        debug!("TODO; unexpected UA");
         vec![]
     }
 
     /// DM received from peer.
     #[must_use]
     fn dm(&self, _data: &mut Data, _packet: &Dm) -> Vec<Action> {
-        eprintln!("TODO: unexpected DM");
+        debug!("TODO: unexpected DM");
         vec![]
     }
 
     /// DISC received from peer.
     #[must_use]
     fn disc(&self, _data: &mut Data, _packet: &Disc) -> Vec<Action> {
-        eprintln!("TODO: unexpected DISC");
+        debug!("TODO: unexpected DISC");
         vec![]
     }
 }
@@ -1257,7 +1341,7 @@ impl State for AwaitingConnection {
 
     // Page 88.
     fn t1(&self, data: &mut Data) -> Vec<Action> {
-        eprintln!("t1 expired while connecting, retrying");
+        debug!("t1 expired while connecting, retrying");
         data.t1.stop();
         if data.rc == data.n2 {
             data.clear_iframe_queue();
@@ -1898,6 +1982,39 @@ pub enum Res {
     Some(Vec<u8>),
 }
 
+/// True for actions that must be addressed to a peer.
+fn needs_peer(a: &Action) -> bool {
+    !matches!(a, Action::State(_) | Action::DlError(_) | Action::Deliver(_) | Action::EOF)
+}
+
+/// Address a frame to the peer, through whatever path this link uses.
+///
+/// **Vendoring change.** Upstream wrote this out eight times, each carrying
+/// `digipeater: vec![]` and `rr_extseq: false` — right for a direct mod-8 link,
+/// which is the only kind it built. Both are now the link's own, in one place,
+/// so "every frame we send goes through the path, and says its sequence width"
+/// is one fact rather than eight copies of one that have to stay in step.
+///
+/// The `expect` is upstream's `unwrap`, and it is guarded by the `needs_peer`
+/// early return in `handle`: no packet-emitting action reaches here with no
+/// peer recorded.
+fn addressed(data: &Data, command: bool, packet_type: PacketType) -> ReturnEvent {
+    ReturnEvent::Packet(Packet {
+        src: data.me.clone(),
+        dst: data.peer.clone().expect("needs_peer checked this in handle"),
+        command_response: command,
+        command_response_la: !command,
+        digipeater: data.via.clone(),
+        rr_dist1: false,
+        // The Linux reserved bit, which is how a monitor — ours included —
+        // tells a mod-128 control field from a mod-8 one. Upstream never set
+        // it, so our own extended traffic read back as mod-8 and everything
+        // after the control field shifted by a byte.
+        rr_extseq: data.ext(),
+        packet_type,
+    })
+}
+
 /// Handle an incoming state, by shoving it through the state machine.
 ///
 /// Source and destination address are assumed to be correct, or in the case of
@@ -1906,11 +2023,6 @@ pub enum Res {
 /// A set of return events and possibly a new state is returned.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-/// True for actions that must be addressed to a peer.
-fn needs_peer(a: &Action) -> bool {
-    !matches!(a, Action::State(_) | Action::DlError(_) | Action::Deliver(_) | Action::EOF)
-}
-
 pub fn handle(
     state: &dyn State,
     data: &mut Data,
@@ -1970,96 +2082,37 @@ pub fn handle(
             Action::State(_) => {} // Ignore state change at this stage.
             DlError(code) => ret.push(ReturnEvent::DlError(*code)),
             // U frames.
-            SendSabm { pf } => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                // Always command per 4.3.3.
-                command_response: true,
-                command_response_la: false,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Sabm(Sabm { poll: *pf }),
-            })),
-            SendDisc { pf } => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                // Always command per 4.3.3.
-                command_response: true,
-                command_response_la: false,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Disc(Disc { poll: *pf }),
-            })),
-            SendUa { pf } => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                // Always response per 4.3.3.
-                command_response: false,
-                command_response_la: true,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Ua(Ua { poll: *pf }),
-            })),
-            SendDm { pf } => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                // Always response per 4.3.3.
-                command_response: false,
-                command_response_la: true,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Dm(Dm { poll: *pf }),
-            })),
+            // Always command per 4.3.3.
+            SendSabm { pf } => {
+                ret.push(addressed(data, true, PacketType::Sabm(Sabm { poll: *pf })));
+            }
+            // Always command per 4.3.3.
+            SendDisc { pf } => {
+                ret.push(addressed(data, true, PacketType::Disc(Disc { poll: *pf })));
+            }
+            // Always response per 4.3.3.
+            SendUa { pf } => ret.push(addressed(data, false, PacketType::Ua(Ua { poll: *pf }))),
+            // Always response per 4.3.3.
+            SendDm { pf } => ret.push(addressed(data, false, PacketType::Dm(Dm { poll: *pf }))),
             // S frames.
-            SendRej { pf, nr } => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                // TODO: REJ can be commands, in status probes.
-                command_response: false,
-                command_response_la: true,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Rej(Rej { poll: *pf, nr: *nr }),
-            })),
-            SendRr { pf, nr, command } => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                command_response: *command,
-                command_response_la: !*command,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Rr(Rr { poll: *pf, nr: *nr }),
-            })),
-            SendRnr { pf, nr, command } => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                command_response: *command,
-                command_response_la: !*command,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Rnr(Rnr { poll: *pf, nr: *nr }),
-            })),
+            // TODO: REJ can be commands, in status probes.
+            SendRej { pf, nr } => {
+                ret.push(addressed(data, false, PacketType::Rej(Rej { poll: *pf, nr: *nr })));
+            }
+            SendRr { pf, nr, command } => {
+                ret.push(addressed(data, *command, PacketType::Rr(Rr { poll: *pf, nr: *nr })));
+            }
+            SendRnr { pf, nr, command } => {
+                ret.push(addressed(data, *command, PacketType::Rnr(Rnr { poll: *pf, nr: *nr })));
+            }
             // I frame.
-            SendIframe(iframe) => ret.push(ReturnEvent::Packet(Packet {
-                src: data.me.clone(),
-                dst: data.peer.clone().unwrap().clone(),
-                // 4.3.1 seems to say that all I frames are commands.
-                //
-                // TODO: confirm this.
-                command_response: true,
-                command_response_la: false,
-                digipeater: vec![],
-                rr_dist1: false,
-                rr_extseq: false,
-                packet_type: PacketType::Iframe(iframe.clone()),
-            })),
+            //
+            // 4.3.1 seems to say that all I frames are commands.
+            //
+            // TODO: confirm this.
+            SendIframe(iframe) => {
+                ret.push(addressed(data, true, PacketType::Iframe(iframe.clone())));
+            }
             // TODO: can we avoid the copy?
             Deliver(p) => ret.push(ReturnEvent::Data(Res::Some(p.clone()))),
             EOF => ret.push(ReturnEvent::Data(Res::EOF)),
@@ -2077,6 +2130,78 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::PacketType as PT;
+
+    /// A BBS is usually a hop or two away through a node. Upstream built every
+    /// frame direct, so a connect went out addressed to nobody the far end
+    /// could hear and retried N2 times against silence.
+    #[test]
+    fn an_emitted_frame_carries_the_digipeater_path() -> Result<()> {
+        let mut data = Data::new(Addr::new("OE3JJS-10")?);
+        data.set_via(vec![Addr::new("OE3XLR-1")?, Addr::new("OE3XMS-1")?]);
+        let (_, ret) = handle(
+            &*new(),
+            &mut data,
+            &Event::Connect { addr: Addr::new("OE1XAB-8")?, ext: false },
+        );
+        let sabm = ret
+            .iter()
+            .find_map(|r| match r {
+                ReturnEvent::Packet(p) if matches!(p.packet_type(), PT::Sabm(_)) => Some(p),
+                _ => None,
+            })
+            .expect("no SABM went out");
+        let path: Vec<_> = sabm.digipeaters().iter().map(Addr::call).collect();
+        assert_eq!(path, vec!["OE3XLR-1", "OE3XMS-1"]);
+        Ok(())
+    }
+
+    /// The Linux reserved bit is how a monitor tells a two-byte control field
+    /// from a one-byte one. Without it our own extended traffic reads back as
+    /// mod-8 and everything after the control field shifts by a byte.
+    ///
+    /// Also the first mod-128 coverage in this file: every test carried across
+    /// from upstream is mod-8.
+    #[test]
+    fn an_extended_link_sets_the_reserved_bit() -> Result<()> {
+        let mut data = Data::new(Addr::new("OE3JJS-10")?);
+        let (_, ret) =
+            handle(&*new(), &mut data, &Event::Connect { addr: Addr::new("OE1XAB-8")?, ext: true });
+        let bytes = ret
+            .iter()
+            .find_map(|r| r.serialize(data.ext()))
+            .expect("an extended connect emitted nothing");
+        // Parsed the way a monitor does — asking the frame itself how wide its
+        // sequence numbers are.
+        let back = Packet::parse(&bytes, None)?;
+        assert!(matches!(back.packet_type(), PT::Sabme(_)), "an extended connect sent a SABM");
+        assert!(back.rr_extseq, "the reserved bit did not go out");
+        Ok(())
+    }
+
+    /// The window is re-applied on every version negotiation, not set once.
+    /// A link the far end re-establishes mid-session would otherwise go back
+    /// to the specification's default with nothing to show for it.
+    #[test]
+    fn the_window_preference_survives_a_received_sabm() -> Result<()> {
+        let mut data = Data::new(Addr::new("OE3JJS-10")?);
+        data.maxframe(2);
+        assert_eq!(data.k, 2);
+        data.set_version_2();
+        assert_eq!(data.k, 2, "a received SABM put the window back");
+        data.set_version_2_2();
+        assert_eq!(data.k, 2, "a received SABME put the window back");
+        // Out of range is clamped rather than believed: mod-8 counts to seven
+        // and a window above it can never be acknowledged. The *preference* is
+        // kept whole, so the same link negotiating mod-128 later gets the
+        // number the operator actually asked for.
+        let mut data = Data::new(Addr::new("OE3JJS-10")?);
+        data.maxframe(32);
+        assert_eq!(data.k, 7, "mod-8 accepted a window it cannot count to");
+        data.set_version_2_2();
+        assert_eq!(data.k, 32, "the preference was clamped away on the mod-8 link");
+        Ok(())
+    }
 
     fn assert_all(want: &[ReturnEvent], got: &[ReturnEvent], more: &str) {
         for w in want {

@@ -176,7 +176,11 @@ impl RadioController for LocalController {
     /// the settings dialog calls this after its window closure rather than
     /// during it, so a blocking scan costs one frame and nothing else.
     fn probe(&mut self, req: sdroxide_types::DeviceProbe) -> Option<sdroxide_types::ProbeAnswer> {
-        Some(crate::devices::probe(req))
+        // Named, because one of the questions is about a radio rather than
+        // about this machine: the diagnostic report is this radio's session,
+        // and on a station with two of a kind the other one's is worse than
+        // none.
+        Some(crate::devices::probe(req, self.store.radio_id()))
     }
 
     fn radio_config(&self) -> Option<RadioConfig> {

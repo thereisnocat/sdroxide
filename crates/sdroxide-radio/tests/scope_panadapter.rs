@@ -17,7 +17,7 @@
 use std::time::{Duration, Instant};
 
 use sdroxide_radio::{Complex32, EngineConfig, IqSource, Result, start_engine};
-use sdroxide_types::{Command, DeviceCaps, Mode, RadioEvent, RxId, SpectrumFrame};
+use sdroxide_types::{Command, DeviceCaps, Mode, RadioEvent, RxId, SpectrumConfig, SpectrumFrame};
 
 /// The audio-band lane reaches its window through the analyser's fractional
 /// viewport, so its edges land a few parts in 10^15 off the round number. Close
@@ -178,6 +178,58 @@ fn a_digital_mode_gets_the_audio_band_back() {
     assert_eq!(state.sample_rate, AUDIO_BW);
     // USB-side: audio f maps to dial + f, so the window hangs off the dial.
     about(frame.center_hz, DIAL + AUDIO_BW / 2.0, "the audio window hangs off the dial");
+}
+
+/// Zoom in far enough and the scope stops being the better picture.
+///
+/// A serial CAT rig's sweep is a fixed number of points across whatever span it
+/// was told to cover — 475 on an IC-705 — so past a point the operator is
+/// magnifying rather than resolving, and a signal stays one block wide however
+/// far they go. The audio the same rig is already sending covers exactly the
+/// passband at some three hertz a bin, so inside that window it draws instead.
+#[test]
+fn a_view_inside_the_passband_is_drawn_from_the_audio_and_not_the_scope() {
+    // A kilohertz inside the upper-sideband passband, well clear of its edges.
+    let (lo, hi) = (DIAL + 700.0, DIAL + 1_700.0);
+    let cfg = SpectrumConfig { viewport: Some((lo, hi)), ..SpectrumConfig::default() };
+    let (frame, state) = run(
+        true,
+        &[Command::SetMode { rx: RxId::Main, mode: Mode::Usb }, Command::SetSpectrumCfg(cfg)],
+    );
+
+    about(frame.span_hz, hi - lo, "the frame is the window that was asked for");
+    about(frame.center_hz, (lo + hi) / 2.0, "centred on that window");
+
+    // The display axis stays the scope's, so zooming back out is the gesture it
+    // always was rather than a jump to a four-kilohertz panadapter.
+    assert_eq!(
+        state.sample_rate, SCOPE_SPAN,
+        "the axis followed the picture out from under the view"
+    );
+    assert_eq!(state.center_hz, DIAL);
+
+    // And the waterfall gets its rows clocked again: a continuous analyser is
+    // drawing now, not a sweep that arrives finished.
+    assert!(frame.rows_clocked, "the audio lane has to clock its own rows");
+}
+
+/// Wider than the passband there is nothing to switch to — the audio is a
+/// picture of what the rig demodulated, not of the band — so the scope keeps it.
+#[test]
+fn a_view_wider_than_the_passband_stays_on_the_scope() {
+    let (lo, hi) = (DIAL - 20_000.0, DIAL + 20_000.0);
+    let cfg = SpectrumConfig { viewport: Some((lo, hi)), ..SpectrumConfig::default() };
+    let (frame, _) = run(
+        true,
+        &[Command::SetMode { rx: RxId::Main, mode: Mode::Usb }, Command::SetSpectrumCfg(cfg)],
+    );
+    about(frame.span_hz, hi - lo, "the scope serves the window it was asked for");
+    // The scope arrives finished, so the client scrolls it on its own clock.
+    assert!(!frame.rows_clocked, "a finished sweep must not claim to clock rows");
+    // ...and it must not carry any either: the client repeats the spectrum on
+    // its own wall clock for such a lane, and rows sent alongside that
+    // instruction are a picture it would draw twice.
+    assert!(frame.rows.is_empty(), "a lane that does not clock rows handed some out");
 }
 
 #[test]

@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use sdroxide_types::RemoteAccess;
+use sdroxide_types::{AUTH_BUSY, AUTH_REFUSED, RemoteAccess};
 
 use crate::AccessFn;
 
@@ -170,12 +170,15 @@ pub(crate) async fn challenge(socket: &mut WebSocket, gate: &AuthGate, frames: F
             }
             Verdict::Wrong => {
                 // Deliberately the same message whether the username or the
-                // password was wrong: which one it was is exactly what an
-                // attacker with a list of callsigns wants told.
+                // password was wrong — see [`AUTH_REFUSED`].
                 warn!("{}: sign-in refused for {username:?}", frames.what);
-                "username or password not accepted"
+                AUTH_REFUSED
             }
-            Verdict::Busy => "another sign-in is being checked — try again",
+            // Not a refusal, and the wording is a shared constant because the
+            // client has to be able to tell it apart from one: an answer that
+            // was never compared must not cost a remembered password, and a
+            // tab nobody is looking at has to be free to offer it again.
+            Verdict::Busy => AUTH_BUSY,
         };
         if socket.send(Message::Binary((frames.rejected)(why).into())).await.is_err() {
             return false;

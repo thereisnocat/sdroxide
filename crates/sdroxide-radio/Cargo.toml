@@ -22,6 +22,9 @@ thiserror.workspace = true
 tracing.workspace = true
 soapysdr = { version = "0.5.1", optional = true }
 triple_buffer = "9.0.0"
+# The block loop's fork/join. Only `join` is used, and only onto a pool of this
+# crate's own making — see `lane_pool` in engine.rs.
+rayon = "1"
 crossbeam-channel.workspace = true
 rtrb.workspace = true
 sdroxide-config = { path = "../sdroxide-config" }

@@ -1063,8 +1063,14 @@ pub(in crate::app) fn settings_rtlsdr_tab(
         ui.label("HF reception").on_hover_text(
             "The tuner itself starts at 24 MHz. An RTL-SDR Blog V4 upconverts \
              below that in hardware; other dongles reach HF only by sampling the \
-             ADC directly, through the V3's HF port. Switching modes briefly \
-             interrupts the stream.",
+             ADC directly, through the V3's HF port. Automatic hands everything \
+             below 24 MHz to the ADC and everything above it to the tuner.\n\n\
+             Direct sampling covers every HF band, 17 m and 15 m included — they \
+             arrive in the ADC's second Nyquist zone, the right way up. Nothing \
+             filters the ADC's input, though, so whatever is at 28.8 MHz minus \
+             the dial comes with them: 10.7 MHz under 17 m, 7.726 MHz under \
+             15 m.\n\n\
+             Switching modes briefly interrupts the stream.",
         );
         let mut hf = cfg.rtlsdr.hf_mode;
         enum_combo(ui, "rtlsdr_hf", &mut hf, &RtlSdrHfMode::ALL, RtlSdrHfMode::label);
@@ -1273,9 +1279,11 @@ pub(in crate::app) fn settings_rtltcp_tab(
              chip and nothing else, and a V4 is indistinguishable from a plain \
              R828D over the wire.\n\n\
              On a V3 or any other dongle, Automatic switches the server to \
-             direct sampling below the crossover. Choose Direct sampling \
-             explicitly for a plain R828D that hears nothing on HF. Switching \
-             briefly interrupts the stream.",
+             direct sampling below the tuner's own 24 MHz floor — which covers \
+             every HF band, 17 m and 15 m arriving in the ADC's second Nyquist \
+             zone with 28.8 MHz minus the dial folded on top. Choose Direct \
+             sampling explicitly for a plain R828D that hears nothing on HF. \
+             Switching briefly interrupts the stream.",
         );
         let mut hf = cfg.rtltcp.hf_mode;
         enum_combo(ui, "rtltcp_hf", &mut hf, &RtlSdrHfMode::ALL, RtlSdrHfMode::label);
@@ -2084,8 +2092,9 @@ pub(in crate::app) fn settings_icomnet_tab(
                 if ui
                     .button("Copy diagnostic report")
                     .on_hover_text(
-                        "Copies the last session's handshake and CI-V trace to the clipboard, \
-                         for a bug report.",
+                        "Copies this radio's last session — its handshake and CI-V trace — \
+                         to the clipboard, for a bug report. This radio's, not the station's: \
+                         with two Icoms on the LAN each tab answers about its own address.",
                     )
                     .clicked()
                 {
@@ -2106,11 +2115,6 @@ pub(in crate::app) fn settings_icomnet_tab(
              a restart.",
         )
         .weak(),
-    );
-    ui.label(
-        RichText::new(sdroxide_icomnet_hint())
-            .weak()
-            .color(egui::Color32::from_rgb(0xd0, 0x90, 0x30)),
     );
 }
 
@@ -2762,13 +2766,6 @@ pub(in crate::app) fn settings_rsr200_tab(
         )
         .weak(),
     );
-}
-
-/// Kept as a function so the UI crate needs no dependency on the backend crate
-/// just to repeat one sentence.
-fn sdroxide_icomnet_hint() -> &'static str {
-    "Verified on an IC-705 over WiFi; every other model, and still rest on the documentation. \
-     If it misbehaves, please attach the diagnostic report to a bug report."
 }
 
 /// The outcome line under a "Test connection" button.
@@ -4244,10 +4241,10 @@ pub(in crate::app) fn settings_elad_tab(
         return;
     };
 
-    // What rebuilds the session. The rate is in here even though nothing is
-    // commanded by it: the engine builds its whole downconversion chain around
-    // `IqSource::sample_rate`, so reading the stream differently means opening
-    // the source again.
+    // What rebuilds the session. The rate is in here whichever model this is:
+    // on a sampler it is the FPGA image to load, and on a transceiver the engine
+    // still builds its whole downconversion chain around `IqSource::sample_rate`,
+    // so reading the stream differently means opening the source again.
     let before = (
         cfg.elad.serial.clone(),
         cfg.elad.sample_rate_hz,
@@ -4300,13 +4297,18 @@ pub(in crate::app) fn settings_elad_tab(
         ui.end_row();
 
         ui.label("Sample rate").on_hover_text(
-            "How the receiver's stream is READ — not what the receiver is told \
-             to do.\n\n\
-             Nothing sdroxide can send selects the ELAD's decimation. The device \
-             arrives at whatever rate it powered up in or was last left in by \
-             ELAD's own software (192 kHz on a fresh FDM-DUO), and this setting \
-             says which one that is. Get it wrong and the panadapter is simply \
-             the wrong width, with every frequency inside it scaled to match.\n\n\
+            "The six rates are six different FPGA images, not a register — which \
+             is why nothing in ELAD's protocol selects between them, and why what \
+             this setting means depends on the model.\n\n\
+             FDM-S1 / FDM-S2: a command. Their FPGA is loaded by the computer at \
+             every power-up, and sdroxide runs ELAD's own elad-firmware loader to \
+             put this rate's image in. Without that loader installed a sampler \
+             sends no samples at all, and sdroxide says so on screen.\n\n\
+             FDM-DUO: not a command. The radio boots its own FPGA and arrives at \
+             whatever rate it powered up in or FDM-SW2 last left it in (192 kHz on \
+             a fresh one), and this only says how the stream is READ. Get it wrong \
+             and the panadapter is simply the wrong width, with every frequency \
+             inside it scaled to match.\n\n\
              The stream's real rate is measured a couple of seconds after it \
              starts, and a mismatch is reported on screen. Takes effect on Apply.",
         );
@@ -4332,7 +4334,8 @@ pub(in crate::app) fn settings_elad_tab(
             );
             ui.add(
                 egui::Label::new(
-                    RichText::new("what the device is in, not what it is told").weak(),
+                    RichText::new("FDM-S: the FPGA image loaded — FDM-DUO: how the stream is read")
+                        .weak(),
                 )
                 .wrap(),
             );
@@ -5926,14 +5929,16 @@ pub(in crate::app) fn settings_sdrplay_tab(
         return;
     };
 
-    // Device, rate, bandwidth and RSPduo tuner rebuild the session; the rest
-    // rides `SetGain` (or `SetAntenna`) straight to the running device.
+    // Device, rate, bandwidth and the RSPduo's tuner arrangement rebuild the
+    // session; the rest rides `SetGain` (or `SetAntenna`) straight to the
+    // running device.
     let before = (
         cfg.sdrplay.serial.clone(),
         cfg.sdrplay.sample_rate_hz,
         cfg.sdrplay.bw_khz,
         cfg.sdrplay.duo_tuner,
-        cfg.sdrplay.diversity.enabled,
+        cfg.sdrplay.duo.enabled,
+        cfg.sdrplay.duo.role,
     );
 
     // Which rows to draw comes from the *selected* device's model, and with
@@ -5943,6 +5948,13 @@ pub(in crate::app) fn settings_sdrplay_tab(
     // isn't running yet.
     let listed = devices.iter().find(|d| d.serial == cfg.sdrplay.serial).or(devices.first());
     let model = listed.map(|d| d.model()).unwrap_or(SdrPlayModel::Rsp1b);
+    // ...and the same rule, kept rather than dropped, is what decides the
+    // RSPduo's own rows. An empty device list is *not* evidence that this is
+    // not an RSPduo — the service may not have been asked yet, may be down, or
+    // may have been asked while another application held the board — so the
+    // second-tuner rows stay up unless a listed device says otherwise. They
+    // vanishing on a rescan that came back empty is issue #165.
+    let maybe_duo = listed.is_none_or(|d| d.model() == SdrPlayModel::RspDuo);
 
     // Except that RSP1B is the one model with *no* antenna ports and the
     // shortest LNA ladder, so falling back to it does the very thing the rule
@@ -6025,7 +6037,7 @@ pub(in crate::app) fn settings_sdrplay_tab(
         // Two tuners share one ADC at a fixed clock, so the ladder they can
         // reach is a different — and much shorter — one. Offering the wide
         // rates would offer spans this configuration cannot open.
-        let dual = model == SdrPlayModel::RspDuo && cfg.sdrplay.diversity.enabled;
+        let dual = maybe_duo && cfg.sdrplay.duo.enabled;
         ui.label("Sample rate").on_hover_text(if dual {
             "With both tuners running, the API fixes the ADC at 6 MHz and hands back \
              2 Msps from a low IF — so 2 Msps is the widest span, and the narrower ones \
@@ -6179,14 +6191,23 @@ pub(in crate::app) fn settings_sdrplay_tab(
         }
         ui.end_row();
 
-        if model == SdrPlayModel::RspDuo {
-            ui.label(if cfg.sdrplay.diversity.enabled { "Main aerial's tuner" } else { "Tuner" })
-                .on_hover_text(if cfg.sdrplay.diversity.enabled {
-                    "Which of the RSPduo's two tuners carries the aerial you are listening \
-                     to. The other one carries the second aerial. Takes effect on Apply."
-                } else {
-                    "Which of the RSPduo's two tuners to run (one at a time). Takes effect \
-                     on Apply."
+        if maybe_duo {
+            ui.label(if cfg.sdrplay.duo.enabled { "This radio's tuner" } else { "Tuner" })
+                .on_hover_text(match (cfg.sdrplay.duo.enabled, cfg.sdrplay.duo.role) {
+                    (true, sdroxide_types::SdrPlayDuoRole::SecondRadio) => {
+                        "Which of the RSPduo's two tuners this radio listens on. The other \
+                         one belongs to the radio configured for it — give that one the \
+                         same receiver and the other tuner. Takes effect on Apply."
+                    }
+                    (true, _) => {
+                        "Which of the RSPduo's two tuners carries the aerial you are \
+                         listening to. The other one carries the second aerial. Takes \
+                         effect on Apply."
+                    }
+                    (false, _) => {
+                        "Which of the RSPduo's two tuners to run (one at a time). Takes \
+                         effect on Apply."
+                    }
                 });
             let mut tuner = cfg.sdrplay.duo_tuner;
             enum_combo(
@@ -6310,27 +6331,32 @@ pub(in crate::app) fn settings_sdrplay_tab(
         }
     });
 
-    // ---- the second tuner (issue #153) -------------------------------------
-    // Shown for an RSPduo, and for anything still carrying the setting: a
-    // switch that cannot be seen is a switch that cannot be turned off, and
-    // this one survives moving the configuration to another receiver.
-    if model == SdrPlayModel::RspDuo || cfg.sdrplay.diversity.enabled {
-        use sdroxide_types::{DIVERSITY_MAX_TAPS, DiversityMode, DiversityTechnique, diversity_cost_note};
+    // ---- the second tuner (issues #153, #165) ------------------------------
+    // Shown for an RSPduo, for anything the device list cannot rule out, and
+    // for anything still carrying the setting: a switch that cannot be seen is
+    // a switch that cannot be turned off, and this one survives moving the
+    // configuration to another receiver.
+    if maybe_duo || cfg.sdrplay.duo.enabled {
+        use sdroxide_types::{
+            DIVERSITY_MAX_TAPS, DiversityMode, DiversityTechnique, SdrPlayDuoRole,
+            diversity_cost_note,
+        };
 
         ui.add_space(6.0);
         ui.separator();
-        ui.label(RichText::new("Second aerial").strong());
+        ui.label(RichText::new("Second tuner").strong());
         ui.label(
             RichText::new(
-                "An RSPduo is two whole tuners on one board, clocked from one reference, so \
-                 running both gives two aerials hearing the same span at the same instant — \
-                 with a relative phase set by the feedlines rather than by chance. That is \
-                 what lets the two be combined: subtracted to null a local noise source, or \
-                 added to ride out a fade.",
+                "An RSPduo is two whole tuners on one board, clocked from one reference. \
+                 Run both and they hear their spans at the same instant from the same \
+                 clock — which makes two aerials on them coherent, with a relative phase \
+                 set by the feedlines rather than by chance, and lets the pair be combined. \
+                 Or leave them apart: the tuners tune separately, so the other one can be a \
+                 second radio on its own band.",
             )
             .weak(),
         );
-        if crate::chrome::checkbox(ui, &mut cfg.sdrplay.diversity.enabled, "Run both tuners")
+        if crate::chrome::checkbox(ui, &mut cfg.sdrplay.duo.enabled, "Run both tuners")
             .on_hover_text(
                 "Puts the RSPduo in the API's dual-tuner mode, where the ADC is fixed at \
                  6 MHz and the widest span is 2 Msps. Takes effect on Apply, because the \
@@ -6340,14 +6366,51 @@ pub(in crate::app) fn settings_sdrplay_tab(
         {
             // The wide rates do not exist in dual-tuner mode; carrying one in
             // would open at 2 Msps and leave the panel claiming otherwise.
-            if cfg.sdrplay.diversity.enabled {
+            if cfg.sdrplay.duo.enabled {
                 cfg.sdrplay.sample_rate_hz = cfg.sdrplay.sample_rate_hz.min(2_000_000.0);
                 cfg.sdrplay.bw_khz = 0;
             }
         }
 
-        if cfg.sdrplay.diversity.enabled {
-            let div = &mut cfg.sdrplay.diversity;
+        if cfg.sdrplay.duo.enabled {
+            egui::Grid::new("sdrplay-duo-grid").num_columns(2).spacing([12.0, 6.0]).show(
+                ui,
+                |ui| {
+                    ui.label("Used for").on_hover_text(
+                        "What the other tuner is for. Takes effect on Apply — like running \
+                         both at all, this is chosen when the board is opened.",
+                    );
+                    let mut role = cfg.sdrplay.duo.role;
+                    enum_combo(
+                        ui,
+                        "sdrplay_duo_role",
+                        &mut role,
+                        &SdrPlayDuoRole::ALL,
+                        SdrPlayDuoRole::label,
+                    );
+                    cfg.sdrplay.duo.role = role;
+                    ui.end_row();
+                },
+            );
+        }
+
+        if cfg.sdrplay.duo.enabled && cfg.sdrplay.duo.role == SdrPlayDuoRole::SecondRadio {
+            ui.label(
+                RichText::new(
+                    "Add a second radio (Settings → Radio → +), give it this same receiver \
+                     and the RSPduo's other tuner, and set it to run both tuners too — \
+                     whichever radio opens the board puts it in dual-tuner mode, so both \
+                     have to be expecting it. The two then tune independently: HF in one \
+                     tab and VHF in the other, off one board. They share one ADC clock, so \
+                     both run at the sample rate whichever radio opened the board asked \
+                     for, and neither can transmit.",
+                )
+                .weak(),
+            );
+        }
+
+        if cfg.sdrplay.duo.enabled && cfg.sdrplay.duo.role == SdrPlayDuoRole::Diversity {
+            let div = &mut cfg.sdrplay.duo;
             egui::Grid::new("sdrplay-div-grid").num_columns(2).spacing([12.0, 6.0]).show(
                 ui,
                 |ui| {
@@ -6629,6 +6692,12 @@ pub(in crate::app) fn settings_sdrplay_tab(
                 )
                 .weak(),
             );
+        }
+
+        // Both of the second tuner's jobs rest on the same unverified
+        // dual-tuner mode, and both are equally undone by a board that has
+        // only one tuner — so these two say so wherever the setting is on.
+        if cfg.sdrplay.duo.enabled {
             ui.label(
                 RichText::new(
                     "Not yet verified against an RSPduo: dual-tuner operation here is \
@@ -6636,20 +6705,22 @@ pub(in crate::app) fn settings_sdrplay_tab(
                 )
                 .color(Color32::from_rgb(220, 170, 70)),
             );
-            if model != SdrPlayModel::RspDuo {
+            if !maybe_duo {
                 ui.label(
-                    RichText::new(if devices.is_empty() {
-                        "Only an RSPduo has a second tuner, and no receiver is listed to \
-                         check against — the log says what actually opened."
-                            .to_string()
-                    } else {
-                        format!(
-                            "Only an RSPduo has a second tuner, and the receiver selected \
-                             here is an {}, so this will do nothing.",
-                            model.label()
-                        )
-                    })
+                    RichText::new(format!(
+                        "Only an RSPduo has a second tuner, and the receiver selected here \
+                         is an {}, so this will do nothing.",
+                        model.label()
+                    ))
                     .color(Color32::from_rgb(220, 170, 70)),
+                );
+            } else if devices.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "No receiver is listed to check this against — press Rescan, or read \
+                         the log for what actually opened.",
+                    )
+                    .weak(),
                 );
             }
         }
@@ -6673,7 +6744,8 @@ pub(in crate::app) fn settings_sdrplay_tab(
             cfg.sdrplay.sample_rate_hz,
             cfg.sdrplay.bw_khz,
             cfg.sdrplay.duo_tuner,
-            cfg.sdrplay.diversity.enabled,
+            cfg.sdrplay.duo.enabled,
+            cfg.sdrplay.duo.role,
         )
     {
         *apply = true;

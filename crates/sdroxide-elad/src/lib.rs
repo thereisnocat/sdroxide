@@ -26,17 +26,21 @@
 //! and transmit audio. This crate drives only the first. Nothing here
 //! transmits, on any model.
 //!
-//! # The sample rate cannot be set
+//! # The sample rate is an FPGA image, not a register
 //!
-//! The DDC delivers 192, 384, 768, 1536, 3072 or 6144 kHz and **no request this
-//! driver knows how to send selects between them**. ELAD's own GNU Radio module
-//! does not set it either — it takes the rate as a parameter and uses it only to
-//! scale — and the FDM-DUO has no front-panel menu for it, which together say
-//! the decimation is programmed by ELAD's Windows software through some request
-//! that has never been published. So `EladConfig::sample_rate_hz` says how the
-//! stream is *read*, the device arrives in whatever mode it was left in, and the
-//! driver measures the throughput a couple of seconds in and says so if the two
-//! disagree (see `handle::RxStats::check_rate`).
+//! The DDC delivers 192, 384, 768, 1536, 3072 or 6144 kHz and **no request in
+//! the vendor protocol selects between them** — because each rate is a
+//! different FPGA image. On an FDM-S1 or FDM-S2 the host loads that image at
+//! every power-up with ELAD's own `elad-firmware` loader, which is also why an
+//! untouched sampler answers every command and streams nothing at all: see
+//! [`fpga`], the whole of which exists for issue #178. So on a sampler
+//! `EladConfig::sample_rate_hz` really is a command, issued once per open.
+//!
+//! On the FDM-DUO it is not: the radio boots its own FPGA, has no front-panel
+//! menu for the rate, and arrives in whatever mode it was left in — there the
+//! setting says how the stream is *read*, and the driver measures the
+//! throughput a couple of seconds in and says so if the two disagree (see
+//! `handle::RxStats::check_rate`).
 //!
 //! # Provenance
 //!
@@ -48,6 +52,11 @@
 //! matter and both are cited where they are used. The FDM-DUO's CAT commands
 //! come from the *ELAD FDM-DUO User Manual* v2.6, §6.
 //!
+//! The FPGA load in [`fpga`] is the one thing `gr-elad` does not do at all — it
+//! assumes something else already has — and comes instead from ELAD's Linux
+//! loader and from [SoapyELAD](https://github.com/DisagioDigitale/SoapyELAD),
+//! which drives an FDM-S2 on Linux and is verified against one.
+//!
 //! # Not verified against hardware
 //!
 //! This driver was written from that reference, not on a bench. Every uncertain
@@ -58,6 +67,7 @@
 pub mod convert;
 pub mod device;
 pub mod error;
+pub mod fpga;
 pub mod handle;
 pub mod protocol;
 pub mod stream;

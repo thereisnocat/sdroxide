@@ -46,7 +46,7 @@
 
 CAudioSourceDecoder::CAudioSourceDecoder()
     :	bWriteToFile(false), TextMessage(false),
-      bUseReverbEffect(true), codec(nullptr)
+      bUseReverbEffect(true), pAudioSuperFrame(nullptr), codec(nullptr)
 {
     /* Initialize Audio Codec List */
     CAudioCodec::InitCodecList();
@@ -59,6 +59,9 @@ CAudioSourceDecoder::CAudioSourceDecoder()
 
 CAudioSourceDecoder::~CAudioSourceDecoder()
 {
+    delete pAudioSuperFrame;
+    pAudioSuperFrame = nullptr;
+
     /* Unreference Audio Codec List */
     CAudioCodec::UnrefCodecList();
 }
@@ -98,6 +101,12 @@ CAudioSourceDecoder::ProcessDataInternal(CParameter & Parameters)
     /* Audio data header parsing ********************************************* */
     /* Check if audio shall not be decoded */
     if (DoNotProcessAudDecoder)
+    {
+        return;
+    }
+
+    /* No parser means InitInternal() failed before it could build one. */
+    if (pAudioSuperFrame == nullptr)
     {
         return;
     }
@@ -413,6 +422,11 @@ CAudioSourceDecoder::GetNumCorDecAudio()
 void
 CAudioSourceDecoder::CloseDecoder()
 {
+    /* InitInternal() runs again on every mode, service and audio parameter
+       change and builds a fresh super frame parser each time. */
+    delete pAudioSuperFrame;
+    pAudioSuperFrame = nullptr;
+
     if (codec != nullptr)
         codec->DecClose();
 }

@@ -844,9 +844,19 @@ pub struct Model {
     pub name: &'static str,
     /// Bins in one `27 00` scope sweep.
     pub scope_bins: usize,
-    /// `1A 05 nn nn` sub-command for DATA-OFF MOD and DATA MOD, and the value
-    /// that selects LAN as the modulation source.
-    pub lan_mod_input: Option<(u16, u16, u8)>,
+    /// Top of the `27 00` amplitude scale. `160` on the IC-7300 generation,
+    /// `200` on the IC-7760 — the sweep is finished magnitude bins with no
+    /// documented dB per step, so this is only what "full scale" means.
+    pub scope_full_scale: u8,
+    /// Every `1A 05 nn nn` sub-command that picks a modulation source, and the
+    /// value that means LAN on this model.
+    ///
+    /// One item per DATA slot the radio has, DATA-OFF first: two on an
+    /// IC-7300MK2 or an IC-705, four on an IC-7760, which carries DATA1
+    /// through DATA3. All of them are written, because the operator may reach
+    /// any of them from the front panel and a slot still pointing at the
+    /// microphone transmits silence.
+    pub lan_mod_input: Option<(&'static [u16], u8)>,
     /// `1A 05 nn nn` sub-command for LAN AF/IF Output → Output Select.
     pub lan_afif_select: Option<u16>,
     /// `1A nn` sub-command carrying the DATA switch — the mode's `-D` variant.
@@ -869,6 +879,7 @@ pub const UNKNOWN_MODEL: Model = Model {
     civ_address: 0,
     name: "Icom (LAN)",
     scope_bins: 475,
+    scope_full_scale: 160,
     lan_mod_input: None,
     lan_afif_select: None,
     // The one field an unrecognised model still gets a value for. `1A 06` is
@@ -886,9 +897,10 @@ pub const MODELS: &[Model] = &[
         civ_address: 0xB6,
         name: "IC-7300MK2",
         scope_bins: 475,
+        scope_full_scale: 160,
         // IC-7300MK2 CI-V reference: 1A 05 00 84 = DATA OFF MOD, 00 85 = DATA MOD,
         // both `00=MIC … 05=LAN`.
-        lan_mod_input: Some((0x0084, 0x0085, 0x05)),
+        lan_mod_input: Some((&[0x0084, 0x0085], 0x05)),
         // 1A 05 00 79 = LAN AF/IF Output → Output Select, `00=AF, 01=IF`.
         lan_afif_select: Some(0x0079),
         data_mode_sub: Some(0x06),
@@ -897,16 +909,38 @@ pub const MODELS: &[Model] = &[
         civ_address: 0xA4,
         name: "IC-705",
         scope_bins: 475,
+        scope_full_scale: 160,
         // IC-705 CI-V reference guide, SET > Connectors: 1A 05 01 18 = MOD
         // Input > DATA OFF MOD, 01 19 = DATA MOD, both
         // `00=MIC, 01=USB, 02=MIC,USB, 03=WLAN`. Note the value: the radio has
         // no LAN socket, so the modulation source is `03`, not the `05` an
         // IC-7300MK2 takes.
-        lan_mod_input: Some((0x0118, 0x0119, 0x03)),
+        lan_mod_input: Some((&[0x0118, 0x0119], 0x03)),
         // 1A 05 01 14 = WLAN AF/IF Output > Output Select, `00=AF, 01=IF`.
         // 01 09 is the *USB* one — the same setting on the other port, and the
         // wrong one to write for a network session.
         lan_afif_select: Some(0x0114),
+        data_mode_sub: Some(0x06),
+    },
+    Model {
+        civ_address: 0xB2,
+        name: "IC-7760",
+        // The two-box IC-7760 is the first LAN Icom that does not send 475
+        // bins: its CI-V reference gives the LAN sweep as one 704-byte
+        // division carrying 689 points on a 0 ~ C8 scale. The USB form of the
+        // same sweep is split into 15, which is why the division field has to
+        // be read rather than assumed.
+        scope_bins: 689,
+        scope_full_scale: 200,
+        // IC-7760 CI-V reference guide, SET > Connectors > MOD Input:
+        // 1A 05 01 29 = DATA OFF MOD, 01 30 / 01 31 / 01 32 = DATA1 / DATA2 /
+        // DATA3 MOD. The list runs `00=MIC … 09=LAN`, so LAN is `09` here —
+        // neither the IC-7300MK2's `05` nor the IC-705's `03`.
+        lan_mod_input: Some((&[0x0129, 0x0130, 0x0131, 0x0132], 0x09)),
+        // 1A 05 01 23 = LAN AF/IF Output > Output Select, `00=AF, 01=IF`.
+        // 01 03 is the [USB B] port's copy and 01 10 the LINE-OUT one; both
+        // are the same setting on a socket this session is not using.
+        lan_afif_select: Some(0x0123),
         data_mode_sub: Some(0x06),
     },
 ];
@@ -929,6 +963,34 @@ pub fn model_for(civ_address: u8) -> Model {
         .copied()
         .find(|m| m.civ_address == civ_address)
         .unwrap_or(Model { civ_address, ..UNKNOWN_MODEL })
+}
+
+/// Look a radio up by the name *and* the address its capability block gave.
+///
+/// Two pieces of evidence, both of which the operator can move:
+/// SET > Connectors > CI-V > CI-V Address is a menu item on all of these
+/// radios, and so is the network radio name the capability block carries. So
+/// the name is consulted — a rig moved off its factory address would otherwise
+/// fall through to [`UNKNOWN_MODEL`] and be told to set its own menu items by
+/// hand, in the one case where sdroxide knows perfectly well which radio it is
+/// talking to — but only where it does not contradict a known address.
+///
+/// A name matching one model while the address is another model's factory
+/// value is a nickname somebody typed, not a radio: the address wins, because
+/// writing a menu index for the wrong Icom is the failure this whole table
+/// exists to avoid.
+///
+/// Whichever way it goes, the address the radio actually reported is what the
+/// session addresses its frames to.
+pub fn model_for_radio(name: &str, civ_address: u8) -> Model {
+    let want = name.trim().to_ascii_uppercase();
+    let by_name = MODELS.iter().copied().find(|m| m.name == want);
+    let by_address = MODELS.iter().copied().find(|m| m.civ_address == civ_address);
+    match (by_name, by_address) {
+        (Some(m), Some(a)) if m.name != a.name => a,
+        (Some(m), _) => Model { civ_address, ..m },
+        _ => model_for(civ_address),
+    }
 }
 
 #[cfg(test)]
@@ -1274,7 +1336,7 @@ mod tests {
         // constant.
         let ic705 = model_for(0xA4);
         assert_eq!(ic705.name, "IC-705");
-        assert_eq!(ic705.lan_mod_input, Some((0x0118, 0x0119, 0x03)));
+        assert_eq!(ic705.lan_mod_input, Some((&[0x0118u16, 0x0119][..], 0x03)));
         assert_eq!(ic705.lan_afif_select, Some(0x0114));
 
         // An unknown rig still works — it just does not get menu writes, which
@@ -1283,5 +1345,48 @@ mod tests {
         assert_eq!(other.civ_address, 0xA2);
         assert!(other.lan_mod_input.is_none());
         assert!(other.lan_afif_select.is_none());
+    }
+
+    #[test]
+    fn the_ic7760_is_the_odd_one_in_every_field_that_has_one() {
+        let r = model_for(0xB2);
+        assert_eq!(r.name, "IC-7760");
+        // A wider sweep on a taller scale than the IC-7300 generation: 689
+        // points, 0 ~ 200. Reading either from a neighbouring model draws a
+        // trace that is the wrong width *and* 20 dB out.
+        assert_eq!(r.scope_bins, 689);
+        assert_eq!(r.scope_full_scale, 200);
+        // Four DATA slots, and LAN is 09 — a value that means "MIC, USB, ACC"
+        // on the model whose numbering is nearest.
+        assert_eq!(r.lan_mod_input, Some((&[0x0129u16, 0x0130, 0x0131, 0x0132][..], 0x09)));
+        assert_eq!(r.lan_afif_select, Some(0x0123));
+    }
+
+    #[test]
+    fn a_radio_moved_off_its_factory_address_is_still_recognised_by_name() {
+        // CI-V > CI-V Address is a menu item, and a radio on a shared bus is
+        // routinely moved off its factory value. The name still names it.
+        let moved = model_for_radio("IC-7760", 0x7A);
+        assert_eq!(moved.name, "IC-7760");
+        assert_eq!(moved.scope_bins, 689);
+        // …and frames still go to where the radio said it is listening.
+        assert_eq!(moved.civ_address, 0x7A);
+
+        // The capability block is a fixed-width field with whatever the far end
+        // put in it, so neither the padding nor the case is worth trusting.
+        assert_eq!(model_for_radio(" ic-7760 ", 0xB2).name, "IC-7760");
+
+        // A name nobody knows falls back to the address, which is how the
+        // table behaved before names were consulted at all.
+        assert_eq!(model_for_radio("IC-9700", 0xB6).name, "IC-7300MK2");
+        assert_eq!(model_for_radio("IC-9700", 0xA2).name, UNKNOWN_MODEL.name);
+
+        // And a name that names one model while the address names another is a
+        // nickname somebody typed into the network settings. The address wins:
+        // an IC-705's menu numbers written into an IC-7760 land in the wrong
+        // block entirely.
+        let renamed = model_for_radio("IC-705", 0xB2);
+        assert_eq!(renamed.name, "IC-7760");
+        assert_eq!(renamed.lan_afif_select, Some(0x0123));
     }
 }

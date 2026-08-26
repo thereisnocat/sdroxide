@@ -11,32 +11,34 @@
 //! this one has never been run against real hardware, which is why every
 //! connection carries a diagnostic trace.
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
 use sdroxide_smartsdr::{FlexHandle, FlexUpdate};
 use sdroxide_types::TxTelemetry;
 
-/// The last session's trace, kept after the source is dropped.
-///
-/// A connection that fails or misbehaves is usually replaced immediately — by
-/// the engine's background retry, or by the operator pressing Apply — and the
-/// trace of the *interesting* session would go with it. Holding the most recent
-/// one here is what lets Settings → Radio still offer it afterwards.
-static LAST_TRACE: Mutex<Option<String>> = Mutex::new(None);
+use crate::session_trace::TraceStore;
 
-/// The most recent SmartSDR session trace, for a bug report.
-pub fn last_diagnostics() -> Option<String> {
-    LAST_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+/// The last session's trace of each radio, kept after the source is dropped.
+/// See [`crate::session_trace`] — including why there is one per radio rather
+/// than one for the process.
+static TRACES: TraceStore = TraceStore::new();
+
+/// Which FlexRadio a session was with: the address it was dialled at, the one
+/// thing both the source and the tab asking for the report can spell.
+fn session_key(cfg: &sdroxide_types::SmartSdrConfig) -> String {
+    cfg.target().unwrap_or("").trim().to_ascii_lowercase()
 }
 
-fn record_trace(trace: &sdroxide_smartsdr::Trace) {
-    *LAST_TRACE.lock().unwrap_or_else(|e| e.into_inner()) = Some(trace.dump());
+fn record_trace(key: &str, trace: &sdroxide_smartsdr::Trace) {
+    TRACES.record(key, trace.dump());
 }
 
 pub struct SmartSdrSource {
     handle: FlexHandle,
+    /// Which radio this session is with, for [`TRACES`] — see the field of the
+    /// same name on [`crate::icomnet_source::IcomNetSource`].
+    key: String,
     center: f64,
     scratch: Vec<f32>,
     label: String,
@@ -99,6 +101,7 @@ impl SmartSdrSource {
             scratch: Vec::new(),
             label,
             handle,
+            key: session_key(cfg),
             if_offset: 0.0,
             last_telem: None,
             trace,
@@ -130,7 +133,7 @@ fn wait_for_rate(handle: &FlexHandle, requested: f64) -> f64 {
 
 impl Drop for SmartSdrSource {
     fn drop(&mut self) {
-        record_trace(&self.trace);
+        record_trace(&self.key, &self.trace);
     }
 }
 
@@ -265,7 +268,7 @@ impl IqSource for SmartSdrSource {
     /// reconnect that raced its own predecessor for channel 1 would fail with
     /// "channel in use" against a stream we ourselves had just abandoned.
     fn release(&mut self) {
-        record_trace(&self.trace);
+        record_trace(&self.key, &self.trace);
         self.handle.tx_end();
     }
 }
@@ -287,12 +290,14 @@ pub fn discover() -> Vec<sdroxide_types::SmartSdrDevice> {
         .collect()
 }
 
-/// Shared with the settings UI's "Copy diagnostic report" button.
-pub fn diagnostics_or_hint() -> String {
-    match last_diagnostics() {
+/// Shared with the settings UI's "Copy diagnostic report" button: the trace of
+/// the radio *this* configuration names, never another one's.
+pub fn diagnostics_or_hint(cfg: &sdroxide_types::SmartSdrConfig) -> String {
+    match TRACES.get(&session_key(cfg)) {
         Some(t) => format!("{t}\n{}\n", sdroxide_smartsdr::FIELD_REPORT_HINT),
         None => format!(
-            "No SmartSDR session has run yet — connect to a radio first.\n\n{}\n",
+            "No SmartSDR session has run yet for {} — connect to that radio first.\n\n{}\n",
+            cfg.target().unwrap_or("this radio"),
             sdroxide_smartsdr::FIELD_REPORT_HINT
         ),
     }

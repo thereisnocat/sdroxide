@@ -50,6 +50,7 @@ mod sstv;
 mod state;
 mod station;
 mod tciserver;
+pub mod text;
 mod tone;
 mod ui;
 mod voice;
@@ -58,7 +59,7 @@ mod winlink;
 mod wsjtx;
 mod wspr;
 
-pub use access::{AuthPhase, RemoteAccess, RemoteServer};
+pub use access::{AUTH_BUSY, AUTH_REFUSED, AuthPhase, RemoteAccess, RemoteServer, is_auth_busy};
 pub use aprs::{
     APRS_MESSAGE_MAX, APRS_MSG_RETRIES, APRS_STATION_MAX, APRS_TRACK_MAX, APRS_TRAFFIC_MAX,
     AprsEntryKind, AprsMessage, AprsMsgState, AprsPosition, AprsStation, AprsStatus, AprsSymbol,
@@ -87,12 +88,13 @@ pub use command::Command;
 pub use contacts::FsqContact;
 pub use controller::{AudioDevices, PeerRadio, RadioController, RadioEvent};
 pub use digi::{
-    ClockHealth, CwStatus, Decode, DigiConfig, DigiStatus, DxpedMode, FOX_MAX_SLOTS,
+    ClockHealth, CwStatus, Decode, DecodeSort, DigiConfig, DigiStatus, DxpedMode, FOX_MAX_SLOTS,
     FOX_ZONE_MAX_HZ, FoxCaller, FsqHeard, FsqMsg, HOUND_ZONE_MAX_HZ, HellVariant, PACKET_HEARD_MAX,
-    PacketBaud, PacketHeard, PacketStatus, QsoLive, QsoRecord, QsoStep, QueuedCall, RTTY_CENTER_HZ,
-    RadeStatus, ThorMode, TranscriptLine, adif_band, adif_records, adif_to_qso_log, clock_health,
-    cq_is_for_us, fmt_report, qso_log_to_adif, qso_log_to_text, utc_ymd_hms, worked_before,
-    ymd_hms_to_unix,
+    PACKET_TERM_LINE_MAX, PACKET_TERM_MAX, PacketBaud, PacketHeard, PacketLink, PacketLinkOwner,
+    PacketStatus, PacketTermKind, PacketTermLine, QsoLive, QsoRecord, QsoStep, QueuedCall,
+    RTTY_CENTER_HZ, RadeStatus, ThorMode, TranscriptLine, adif_band, adif_records, adif_to_qso_log,
+    clock_health, cq_is_for_us, fmt_report, qso_log_to_adif, qso_log_to_text, utc_ymd_hms,
+    worked_before, ymd_hms_to_unix,
 };
 pub use drm::{
     DrmChannel, DrmCodec, DrmConstellation, DrmRobustness, DrmService, DrmStatus, DrmSync, DrmTime,
@@ -148,23 +150,23 @@ pub use propagation::{
 pub use radio::{
     AirspyConfig, AirspyDevice, AirspyGain, AirspyHfConfig, AirspyHfDevice, AirspyHfModel, Backend,
     CAT_IQ_DC_BLOCK_MAX_HZ, CAT_IQ_RATES, CAT_SCOPE_MIN_BAUD, CONVERTER_OFFSET_MAX_HZ,
-    CONVERTER_PRESETS, CatConfig, CatFamily, ConverterTx, CwKeying, DIVERSITY_MAX_TAPS, DigiMode,
-    DiversityMode, DiversityTechnique, ELAD_ATTENUATOR_DB, ELAD_CAT_BAUDS, ELAD_DEFAULT_CAT_BAUD,
-    ELAD_DEFAULT_RATE_HZ,
-    ELAD_SAMPLE_RATES, EladAntenna, EladConfig, EladDevice, EladTxInput, FREQ_RANGE_MAX_HZ,
-    HackRfConfig, HackRfDevice, HpsdrConfig, HpsdrDevice, HpsdrFilterBoard, HpsdrIoRxInput,
-    HydraSdrConfig, HydraSdrDevice, HydraSdrGain, HydraSdrPort, IcomModel, IcomNetConfig,
-    IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend, LimeAuxConfig, LimeAuxRole, LimeConfig,
-    LimeDevice, LineState, ModeControl, PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio,
-    PanadapterConfig, PanadapterTap, Parity, PlutoAgc, PlutoConfig, PlutoDevice, PlutoDuplex,
-    PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ, RadioConfig, Rsr200ChannelMode,
-    Rsr200Config, Rsr200Diversity, Rsr200Transport, RtlSdrAgc,
+    CONVERTER_PRESETS, CatConfig, CatFamily, ConverterTx, CwKeying, DIV_FREEZE_ELEMENT,
+    DIV_MODE_ELEMENT, DIV_RATE_ELEMENT, DIV_RESET_ELEMENT, DIV_TAPS_ELEMENT, DIVERSITY_MAX_TAPS,
+    DigiMode, DiversityMode, DiversityTechnique, ELAD_ATTENUATOR_DB, ELAD_CAT_BAUDS,
+    ELAD_DEFAULT_CAT_BAUD, ELAD_DEFAULT_RATE_HZ, ELAD_SAMPLE_RATES, EladAntenna, EladConfig,
+    EladDevice, EladTxInput, FREQ_RANGE_MAX_HZ, HackRfConfig, HackRfDevice, HpsdrConfig,
+    HpsdrDevice, HpsdrFilterBoard, HpsdrIoRxInput, HydraSdrConfig, HydraSdrDevice, HydraSdrGain,
+    HydraSdrPort, IcomModel, IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend,
+    LimeAuxConfig, LimeAuxRole, LimeConfig, LimeDevice, LineState, ModeControl,
+    PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio, PanadapterConfig, PanadapterTap, Parity, PlutoAgc,
+    PlutoConfig, PlutoDevice, PlutoDuplex, PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ,
+    RadioConfig, Rsr200ChannelMode, Rsr200Config, Rsr200Diversity, Rsr200Transport, RtlSdrAgc,
     RtlSdrConfig, RtlSdrDevice, RtlSdrHfMode, RtlTcpConfig, Rx888Config, Rx888Device, SdrPlayAgc,
-    SdrPlayConfig,
-    SdrPlayDevice, SdrPlayDiversity, SdrPlayDuoTuner, SdrPlayModel, SerialConfig, SmartSdrConfig,
-    SmartSdrDevice, SoapyConfig, SoapyDeviceInfo, SoundFormat, SpyServerConfig, SpyServerFormat,
-    StopBits, TciConfig, cat_iq_offset_max_hz, converter_preset_name, diversity_cost_note,
-    elad_cat_baud, format_freq_ranges, hackrf_serial_matches, parse_freq_ranges,
+    SdrPlayConfig, SdrPlayDevice, SdrPlayDuo, SdrPlayDuoRole, SdrPlayDuoTuner, SdrPlayModel,
+    SerialConfig, SmartSdrConfig, SmartSdrDevice, SoapyConfig, SoapyDeviceInfo, SoundFormat,
+    SpyServerConfig, SpyServerFormat, StopBits, TciConfig, cat_iq_offset_max_hz,
+    converter_preset_name, diversity_cost_note, elad_cat_baud, format_freq_ranges,
+    hackrf_serial_matches, parse_freq_ranges,
 };
 pub use rds::{
     RdsClock, RdsData, RdsGroupLog, RdsStandard, RdsStats, RtPlus, af_code_hz, pi_callsign,
@@ -192,7 +194,10 @@ pub use scanner::{SCAN_STEPS_HZ, ScanKind, ScanResume, ScanState, ScannerConfig}
 pub use skimmer::{
     CW_SLOT_CHOICES, CW_SLOTS_DEFAULT, CwSkimmerDecoder, SkimmerKind, SkimmerSettings, SkimmerSpot,
 };
-pub use spectrum::{SpectrumConfig, SpectrumFrame};
+pub use spectrum::{
+    DEFAULT_DISPLAY_BINS, DEFAULT_ROWS_PER_SEC, MAX_DISPLAY_BINS, MAX_ROWS_PER_SEC, SpectrumConfig,
+    SpectrumFrame,
+};
 pub use speech::{
     CallsignStyle, CategoryFlags, DecodeSpeech, FreqStyle, SpeechSettings, TextSpeech, TuneSpeech,
     Verbosity,
@@ -207,7 +212,9 @@ pub use state::{
 pub use station::StationConfig;
 pub use tciserver::TciServerConfig;
 pub use tone::{CTCSS_TONES, SubTone};
-pub use ui::{BandplanKind, ChromeStyle, FontSize, LayoutMode, Speed, UiSettings, UiTheme};
+pub use ui::{
+    BandplanKind, ChromeStyle, FontSize, LayoutMode, SpectrumDetail, Speed, UiSettings, UiTheme,
+};
 pub use voice::{VOICE_MAX_LEN_S, VOICE_SLOTS, VoiceSlotInfo, VoiceStatus, slot_label};
 pub use wefax::{WEFAX_STATIONS, WefaxChartMeta, WefaxIoc, WefaxLpm, WefaxStation, WefaxStatus};
 pub use winlink::{

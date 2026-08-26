@@ -93,14 +93,33 @@ impl Drop for PortLease {
     }
 }
 
+/// Take exclusive use of a link, or `None` if somebody already has it.
+///
+/// Shared by both ends: the lease is one flag and either end may take it, so
+/// the operator's terminal and a forwarding session exclude each other without
+/// either knowing the other exists.
+fn claim(flag: &Arc<AtomicBool>) -> Option<PortLease> {
+    if flag.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    Some(PortLease { claimed: Arc::clone(flag) })
+}
+
 impl PortHandle {
     /// Take exclusive use of the link, or `None` if somebody already has it.
     #[must_use]
     pub fn try_claim(&self) -> Option<PortLease> {
-        if self.claimed.swap(true, Ordering::SeqCst) {
-            return None;
-        }
-        Some(PortLease { claimed: Arc::clone(&self.claimed) })
+        claim(&self.claimed)
+    }
+
+    /// Whether two handles name the same link.
+    ///
+    /// A mode change destroys the controller and builds a fresh pair, so a
+    /// holder of the old handle is holding a link whose other end is gone —
+    /// and a handle carries no other identity to tell that from the new one.
+    #[must_use]
+    pub fn same_link(&self, other: &PortHandle) -> bool {
+        Arc::ptr_eq(&self.claimed, &other.claimed)
     }
 
     /// Ask the link to do something. `Err` means the engine end is gone — the
@@ -147,6 +166,7 @@ pub struct PortClosed;
 pub struct PortEndpoint {
     rx: Receiver<PortRequest>,
     tx: Sender<PortEvent>,
+    claimed: Arc<AtomicBool>,
     pub cfg: LinkConfig,
 }
 
@@ -157,10 +177,38 @@ impl PortEndpoint {
         self.rx.try_iter().collect()
     }
 
-    /// Tell the session something. Dropped silently when the session has gone,
-    /// which is normal: it may have given up while the link was still tidying.
-    pub fn emit(&self, ev: PortEvent) {
-        let _ = self.tx.send(ev);
+    /// Take the link for this end — the operator, rather than a session.
+    ///
+    /// The same flag [`PortHandle::try_claim`] uses, so whichever of the two
+    /// asks first gets it and the other is refused. One radio, one channel:
+    /// two owners interleaving would produce traffic neither understands.
+    #[must_use]
+    pub fn try_claim(&self) -> Option<PortLease> {
+        claim(&self.claimed)
+    }
+
+    /// Whether anybody holds the link right now.
+    ///
+    /// Also the answer to "should this station be answering calls?": while a
+    /// forwarding session has the link, an incoming connect has nowhere to go.
+    #[must_use]
+    pub fn is_claimed(&self) -> bool {
+        self.claimed.load(Ordering::SeqCst)
+    }
+
+    /// Tell the session something. **Never blocks.**
+    ///
+    /// `false` means the queue was full and the event is gone. It has to be
+    /// checked: this runs on the audio thread, and the caller's answer to a
+    /// full queue must be to fail the link, because a gap in a B2F stream is
+    /// not noticed until the CRC at the end of the whole message.
+    ///
+    /// Blocking here instead — which is what `send` on a bounded channel does,
+    /// and what this used to do — wedges the audio thread outright: the engine
+    /// holds the receiving handle for the whole life of a packet mode, so the
+    /// channel never disconnects and the send never returns.
+    pub fn emit(&self, ev: PortEvent) -> bool {
+        self.tx.try_send(ev).is_ok()
     }
 }
 
@@ -172,9 +220,11 @@ pub fn port_pair(cfg: LinkConfig) -> (PortHandle, PortEndpoint) {
     // must not block the audio thread, but an unbounded queue would let a
     // stalled session grow one without limit.
     let (ev_tx, ev_rx) = bounded(WINDOW * 8);
+    // One flag, cloned into both ends: see `PortEndpoint::try_claim`.
+    let claimed = Arc::new(AtomicBool::new(false));
     (
-        PortHandle { tx: req_tx, rx: ev_rx, claimed: Arc::new(AtomicBool::new(false)) },
-        PortEndpoint { rx: req_rx, tx: ev_tx, cfg },
+        PortHandle { tx: req_tx, rx: ev_rx, claimed: Arc::clone(&claimed) },
+        PortEndpoint { rx: req_rx, tx: ev_tx, claimed, cfg },
     )
 }
 
@@ -191,7 +241,7 @@ mod tests {
         let (h, e) = port_pair(cfg());
         h.send(PortRequest::Data(b"hello".to_vec())).unwrap();
         assert_eq!(e.take_requests(), vec![PortRequest::Data(b"hello".to_vec())]);
-        e.emit(PortEvent::Connected);
+        assert!(e.emit(PortEvent::Connected));
         assert_eq!(h.recv().unwrap(), PortEvent::Connected);
     }
 
@@ -214,6 +264,58 @@ mod tests {
         assert!(h.try_claim().is_none(), "two owners on one link");
         drop(lease);
         assert!(h.try_claim().is_some(), "the lease did not come back");
+    }
+
+    /// The operator and a forwarding session are two owners of one radio, and
+    /// they hold the link from opposite ends. Whichever asks first gets it.
+    #[test]
+    fn either_end_can_take_the_lease_and_the_other_is_refused() {
+        let (h, e) = port_pair(cfg());
+        assert!(!e.is_claimed());
+        let lease = e.try_claim().expect("the controller's end may claim");
+        assert!(e.is_claimed());
+        assert!(h.try_claim().is_none(), "a session took a link the operator holds");
+        drop(lease);
+        assert!(!e.is_claimed());
+        let lease = h.try_claim().expect("and back the other way");
+        assert!(e.try_claim().is_none(), "the operator took a link a session holds");
+        assert!(e.is_claimed(), "the controller cannot see that the link is busy");
+        drop(lease);
+    }
+
+    /// `emit` runs on the audio thread. A session that stops reading must cost
+    /// a refused event, not a stalled receiver — and the channel never
+    /// disconnects, so a blocking send here would never return at all.
+    #[test]
+    fn a_full_event_queue_is_refused_not_a_block() {
+        let (_h, e) = port_pair(cfg());
+        // Run it on a thread and join with a deadline: a regression reports
+        // "emit blocked" rather than hanging the whole test binary.
+        let done = std::thread::spawn(move || {
+            let mut refused = 0;
+            for _ in 0..1000 {
+                if !e.emit(PortEvent::Data(vec![0; 4])) {
+                    refused += 1;
+                }
+            }
+            refused
+        });
+        let start = std::time::Instant::now();
+        while !done.is_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "emit blocked");
+            std::thread::yield_now();
+        }
+        assert!(done.join().unwrap() > 0, "a bounded queue accepted a thousand events");
+    }
+
+    /// A mode change builds a fresh pair. Whoever kept the old handle is
+    /// holding a link whose other end is gone, and nothing else says so.
+    #[test]
+    fn same_link_tells_a_replaced_port_from_the_original() {
+        let (a, _ea) = port_pair(cfg());
+        let (b, _eb) = port_pair(cfg());
+        assert!(a.same_link(&a.clone()));
+        assert!(!a.same_link(&b));
     }
 
     /// A dropped controller must surface as an error, not a hang: the mode

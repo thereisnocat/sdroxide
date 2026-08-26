@@ -17,6 +17,11 @@
 //! callbacks, effective rates 62.5 kHz–10.66 MHz (the ADC floor is 2 Msps;
 //! lower rates use the service's decimator).
 //!
+//! An RSPduo is two receivers in one box, and [`SdrPlayDevice`] is the session
+//! both share: one API handle, one thread, and a [`SdrPlayHandle`] stream per
+//! tuner — combined into one span for diversity, or handed to two radios on
+//! two frequencies (issues #153 and #165).
+//!
 //! Must never be a dependency of any wasm-targeted crate.
 
 mod api;
@@ -29,5 +34,5 @@ mod stream;
 
 pub use api::{list, try_list};
 pub use error::{Error, Result};
-pub use handle::SdrPlayHandle;
-pub use stream::spawn;
+pub use handle::{DuoMode, SdrPlayDevice, SdrPlayHandle};
+pub use stream::{open, spawn};

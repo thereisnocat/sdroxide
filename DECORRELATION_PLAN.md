@@ -224,7 +224,7 @@ the synthetic version of exactly what real air showed.
   STFT-based per-bin version, genuinely new infrastructure, not an extension of anything
   existing. Reuses `covariance_eigen` and `cancel_weight` from `diversity.rs` rather than
   duplicating either.
-- **Done**: `sdroxide_types::SdrPlayDiversity` gained `technique` (`DiversityTechnique`:
+- **Done**: `sdroxide_types::SdrPlayDuo` gained `technique` (`DiversityTechnique`:
   `Adaptive`/`Decorrelate`/`WidebandDecorrelate` — a new, RSPduo-config-level enum, since the
   distinction spans two different DSP *components*, not one setting either takes) and `gate_db`.
   `Rsr200Diversity`, per the other plan, does not exist yet — nothing has started there.
@@ -268,8 +268,8 @@ the synthetic version of exactly what real air showed.
   loudest and most correlated. Ported as `sdroxide_dsp::diversity::RefBand` (private to the crate;
   `Diversity::set_ref_band(enabled, sample_rate_hz, offset_hz, width_hz)` is the public surface) —
   two cascaded boxcar decimators, exactly the original's own design, feeding the same `raa`/`rbb`/
-  `rab` inputs `covariance_eigen` already took. `Rsr200Diversity`/`SdrPlayDiversity` both gained
-  `ref_band_enabled`/`ref_band_freq_hz`/`ref_band_width_hz` (`PROTO_VERSION` 96 → 97), exposed in
+  `rab` inputs `covariance_eigen` already took. `Rsr200Diversity`/`SdrPlayDuo` both gained
+  `ref_band_enabled`/`ref_band_freq_hz`/`ref_band_width_hz` (`PROTO_VERSION` 101 → 102 — was 96 → 97 before this branch's own version chain got renumbered to sit after upstream's, reconciling the two), exposed in
   both settings tabs as a checkbox + absolute frequency (MHz) + width (Hz) — no "centre on VFO"
   convenience yet (see `RSR200_PLAN.md`'s own note on why: `Diversity::process` runs on raw
   wideband IQ, before any VFO/demod tuning exists to read; superseded the same night, see
@@ -327,7 +327,7 @@ the synthetic version of exactly what real air showed.
   `Rsr200Source`/`SdrPlaySource` track `vfo_hz` and recompute the reference band's offset from it
   in `refresh_ref_band()` on every call, in place of the old `ref_band_freq_hz - center`
   calculation. `ref_band_freq_hz` and `DIV_REFBAND_FREQ_ELEMENT` removed outright from
-  `Rsr200Diversity`/`SdrPlayDiversity` (`PROTO_VERSION` 97 → 98) — safe as a hard removal rather
+  `Rsr200Diversity`/`SdrPlayDuo` (`PROTO_VERSION` 102 → 103 — was 97 → 98 before the same renumbering) — safe as a hard removal rather
   than a deprecation because v97 was never released. The "Reference frequency" field is gone from
   both settings tabs; only "Reference band" (enable) and "Reference width" remain.
 - Continuous-resolve vs. one-shot-then-freeze as the *default* behavior for scalar decorrelation

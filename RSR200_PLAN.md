@@ -457,7 +457,7 @@ separately and shipped each as it landed):
    `src/rsr200_source.rs` owns the combiner exactly the way `sdrplay_source.rs` does — all
    three `DiversityTechnique` variants (Adaptive, Decorrelate, WidebandDecorrelate; `sdroxide-
    dsp` itself needed zero changes, genuine reuse as promised in §3), a `Rsr200Diversity`
-   config (`sdroxide-types`) field-for-field the same shape as `SdrPlayDiversity`'s own filter
+   config (`sdroxide-types`) field-for-field the same shape as `SdrPlayDuo`'s own filter
    settings minus its two SDRplay-specific second-tuner gain fields (this radio's second-ADC
    gain is `attenuator2`, already its own top-level field). `settings_rsr200_tab` grew a
    Channels selector (reopen-triggering, like the transport/decimation fields) and, when
@@ -887,3 +887,23 @@ separately and shipped each as it landed):
   own completion. WidebandDecorrelate's pre-existing full-band-wipeout bug (step 4) also still
   needs retesting with the routing fix in place; nothing suggests the fix touches that bug either
   way, but it hasn't been checked.
+
+## 16. Reconciled with upstream, same night as the Windows confirmation
+
+`origin` (Ralph's fork, `thereisnocat/sdroxide`) had fallen 34 commits behind `upstream`
+(`dividebysandwich/sdroxide`) by the time the Windows USB work above landed — merged in
+wholesale (`7037df2`) rather than left to compound further. The one commit that actually touched
+this plan's own territory: `885dbdb`, "Put the diversity controls on the main strip, and run an
+RSPduo's two tuners as two radios" (issue #165) — renamed `SdrPlayDiversity` to `SdrPlayDuo`
+(hence its name throughout this document from here on) and added a second thing the RSPduo's
+spare tuner can be, a radio of its own on its own frequency, alongside the diversity/QRM-
+suppression use this plan and `DECORRELATION_PLAN.md` are both built around. Reconciliation was
+mechanical for RSR200 itself — nothing upstream touches this crate at all — and mostly automatic
+for the SDRplay diversity work (`git`'s own three-way merge resolved the bulk of
+`settings_sdrplay_tab` and the `SdrPlayDuo` struct correctly on its own); the one genuinely manual
+piece was `src/sdrplay_source.rs`, where upstream's registry-based device sharing and this
+project's `DiversityTechnique`-driven combiner selection had to be woven together by hand. Full
+workspace build and test suite clean afterward (a handful of failures, all confirmed pre-existing
+on a clean `upstream/main` checkout, none related). `PROTO_VERSION` renumbered from this branch's
+own 89→98 chain to 89→103, sitting after upstream's independent 89→94 chain from the same base —
+see `sdroxide-proto/src/lib.rs`'s own doc comment for the full, entry-by-entry account.

@@ -5369,7 +5369,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-rsr200"
-version = "1.5.1"
+version = "1.5.3"
 dependencies = [
  "crossbeam-channel",
  "libloading 0.8.9",

@@ -327,16 +327,23 @@ touch those (plus the FIFO-channel conversion) are similarly cfg-gated. Type-che
 against the `x86_64-pc-windows-gnu` target (`cargo check -p sdroxide-rsr200 --target
 x86_64-pc-windows-gnu`, added as a rustup target for exactly this) — catches ABI/signature
 mistakes without needing a Windows machine or a local mingw-w64 linker, neither of which this
-desk has. **Not yet run against a real Windows machine with the radio attached** — that's the
-next real step, whenever Ralph has one available; the Windows MSI build (`windows-msi.yml`,
-already existing CI on an actual `windows-latest` runner) will compile it on every run from now
-on, which is the first real signal beyond `cargo check` here. `Api::load()`'s Windows DLL search
-tries the bare `FTD3XXWU.dll` name first (catches the app's own directory, `System32`, `PATH` —
-matching how the SDR++ sibling's own Windows packaging script copies the DLL next to its `.exe`
-rather than installing it system-wide), then the absolute path its own `CMakeLists.txt` links
-against at build time, on the chance a real driver install leaves the runtime DLL there too —
-genuinely unconfirmed for an end-user install specifically, flagged as such in `ffi.rs`'s own
-doc.
+desk has.
+
+**Confirmed working against real RSR200 hardware over USB on Windows, the same night** — a
+`.msi` built off the `rsr200` branch via `windows-msi.yml` (Ralph's fork's Actions needed
+enabling first; disabled by default on a fresh fork) on a Windows VM with the radio passed
+through over USB, LAN already working on the same machine. One real gotcha along the way,
+worth remembering rather than mistaking for a code bug next time: `FTD3XXWU.dll` downloaded
+directly from `ftdichip.com`'s own D3XX drivers page failed to load for sdroxide even with the
+driver correctly installed and bound in Device Manager — while the SDR++ sibling loaded a copy
+placed the same way (beside its own `.exe`) without trouble, ruling out both a driver-install
+problem and a bindings bug. Swapping in the exact `FTD3XXWU.dll` bundled with a working SDR++
+install (matching the version vendored at that project's own `third_party/ftd3xx_winusb/`,
+1.4.0.1) fixed it immediately. Separately, an unrelated diagnostic bug was found and fixed
+along the way: `Api::load()` was reporting only the *last* candidate path's error (an absolute
+fallback Ralph never installed) and `libloading::Error`'s own `Display` for `LoadLibraryExW`
+doesn't include the real OS error code at all — both fixed (`8ba6d0a`) so a future load failure
+actually says something useful.
 
 ## 7. Suggested build order
 
@@ -645,9 +652,9 @@ separately and shipped each as it landed):
    is correct" (this entry's own closing line) has still not been tested with a real, physically
    independent second aerial in the loop, and now that the routing bug is fixed, it still needs to
    be.
-7. **Done on Linux/macOS, hardware-verified; Windows bindings written and type-checked, not yet
-   hardware-verified — see §6's own "Windows research spike happened" entry for the full
-   account.** USB transport (branch `rsr200`) — done out of order, ahead of steps 4–6, at
+7. **Done and hardware-verified on Linux, macOS, and Windows alike — see §6's own "Windows
+   research spike happened" entry for the full account, including the real gotcha hit getting
+   Windows confirmed.** USB transport (branch `rsr200`) — done out of order, ahead of steps 4–6, at
    Ralph's request. `sdroxide-rsr200::ffi` (hand-written D3XX bindings, loaded with
    `dlopen`/`LoadLibrary` at runtime via `libloading` on every platform — same pattern as
    `sdroxide-sdrplay`'s own `ffi.rs`, so this crate still builds and ships everywhere and

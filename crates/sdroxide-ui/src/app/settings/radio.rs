@@ -2176,8 +2176,10 @@ pub(in crate::app) fn settings_rsr200_tab(
             "The RSR200's LAN port and its USB interface speak the same command set — this \
              is one radio either way, not two. USB needs FTDI's D3XX driver installed \
              (libftd3xx / FTD3XXWU on Linux/macOS; the WinUSB D3XX driver package on \
-             Windows — not the older WDF-based one). Windows USB is untested against real \
-             hardware so far.",
+             Windows — not the older WDF-based one). Confirmed on real hardware on all three \
+             platforms. On Windows, a FTD3XXWU.dll downloaded straight from ftdichip.com has \
+             failed to load here even with the driver installed — if that happens, try the \
+             copy bundled with a working SDR++ install instead.",
         );
         ComboBox::from_id_salt("rsr200_transport")
             .selected_text(cfg.rsr200.transport.label())
@@ -2735,8 +2737,7 @@ pub(in crate::app) fn settings_rsr200_tab(
     ui.label(
         RichText::new(
             "Reuter RSR200 support is new: verified against real hardware over both LAN and \
-             USB on Linux/macOS. Windows USB bindings are written but not yet run against \
-             real Windows hardware. Connection, \
+             USB, on Linux/macOS and Windows alike. Connection, \
              address/port or serial, ADC clock, decimation, GPS discipline, channels, \
              sample width, antenna input/preamp, swap channels, upper sideband, the \
              automatic attenuator and the hardware diversity weight take effect on Apply; \

@@ -58,17 +58,24 @@
 //! own comment ("verified there against real hardware: 0.00% packet loss"),
 //! so [`crate::usb`] skips [`to_fifo_channel`]'s conversion on Windows.
 //!
-//! **Not yet verified against real hardware from *this* codebase** — ported
-//! carefully from the vendor header and the SDR++ sibling's own
-//! already-hardware-verified implementation, and type-checked against the
-//! `x86_64-pc-windows-gnu` target, but no Windows machine with the radio
-//! attached has run it yet. The runtime DLL search in [`Api::load`]'s
-//! Windows path is a best-effort guess at where a real end-user driver
-//! install leaves `FTD3XXWU.dll` (the bare name catches the app's own
-//! directory, `System32`, and `PATH`; the absolute fallback matches where
-//! FTDI's SDK doc and the SDR++ sibling's own `CMakeLists.txt`/packaging
-//! script both point when *building against* the SDK) — flag if it turns
-//! out an installed driver leaves the DLL somewhere else.
+//! **Confirmed working against real RSR200 hardware over USB on Windows**
+//! (2026-08-26, Ralph, a Windows VM with the radio passed through via USB) —
+//! bindings, symbol resolution, and calling convention are all correct as
+//! written. LAN was already working on the same machine; USB now is too.
+//!
+//! **One real gotcha hit getting there, worth knowing before chasing a load
+//! failure as a code bug**: a `FTD3XXWU.dll` downloaded directly from
+//! `ftdichip.com`'s own D3XX drivers page failed to load for sdroxide
+//! specifically, even with the driver properly installed and bound in
+//! Device Manager, and even though the SDR++ sibling loaded a DLL the same
+//! way (beside its own `.exe`) without trouble — pointing at a DLL/version
+//! mismatch rather than anything wrong with [`Api::load`]'s search or
+//! [`Api::from_lib`]'s bindings. Swapping in the exact
+//! `FTD3XXWU.dll` that ships beside a working SDR++ install (matching the
+//! version vendored at the SDR++ sibling's own
+//! `third_party/ftd3xx_winusb/`, 1.4.0.1) fixed it immediately. If
+//! `Api::load` fails on Windows, try that DLL specifically before assuming
+//! the binding itself is wrong.
 //!
 //! # A second, undocumented split beyond Windows vs. Linux/macOS
 //!
@@ -378,9 +385,11 @@ impl Api {
                 "the FTDI D3XX WinUSB driver was not found — tried: {tried} — install the \
                  \"WinUSB D3XX driver\" package from ftdichip.com (not the older WDF-based \
                  one), then rescan; if FTD3XXWU.dll isn't on PATH or beside sdroxide.exe, copy \
-                 it there. If it IS there and this still fails with \"module could not be \
-                 found\", the DLL's own dependency — the Microsoft Visual C++ x64 \
-                 Redistributable — is the next thing to check, not FTD3XXWU.dll itself."
+                 it there. If it's there and this still fails, the DLL itself may be the \
+                 problem, not this binding: a copy downloaded directly from ftdichip.com has \
+                 failed to load here before even with the driver properly installed, while the \
+                 exact DLL bundled with a working SDR++ install loaded fine — try that copy if \
+                 you have one."
             ))
         }
         #[cfg(not(target_os = "windows"))]

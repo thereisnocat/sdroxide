@@ -461,7 +461,22 @@ impl Diversity {
             pow: 0.0,
             in_pow: 0.0,
             out_pow: 0.0,
-            decorr_k0: Complex32::new(0.0, 0.0),
+            // Unity on main, nothing from aux -- i.e. "do nothing yet",
+            // not "null everything". A real bug this default's own history
+            // has now hit twice: `(0, 0)` here means a `Diversity` asked to
+            // start `frozen` before it has ever solved once -- a real
+            // sequence, not hypothetical: settings persist `frozen: true`
+            // from a previous session, and a fresh rebuild honors it from
+            // the first block -- would multiply every sample by zero
+            // forever, since being frozen is exactly what stops it from
+            // ever getting to solve. Found live: Separate mode opened with
+            // Hold already on produced total silence and a blank spectrum,
+            // and turning Hold off (letting it solve at least once) fixed
+            // it instantly. `decorr_solved` still distinguishes "never
+            // solved" from "solved to a real answer" for anything that
+            // reads it (`decorrelated_weight()`); this only changes what
+            // gets *applied* to samples in the meantime.
+            decorr_k0: Complex32::new(1.0, 0.0),
             decorr_k1: Complex32::new(0.0, 0.0),
             decorr_solved: false,
             ref_band: RefBand::default(),
@@ -566,7 +581,11 @@ impl Diversity {
         self.pow = 0.0;
         self.in_pow = 0.0;
         self.out_pow = 0.0;
-        self.decorr_k0 = Complex32::new(0.0, 0.0);
+        // Unity on main, nothing from aux -- see `Self::new`'s own doc on
+        // this exact pair of values: `(0, 0)` here means "Restart" while
+        // frozen would silence everything until Hold is turned off, the
+        // same real bug construction-time freezing had.
+        self.decorr_k0 = Complex32::new(1.0, 0.0);
         self.decorr_k1 = Complex32::new(0.0, 0.0);
         self.decorr_solved = false;
     }
@@ -1204,6 +1223,32 @@ mod tests {
         let mut main2: Vec<Complex32> = other.iter().map(|q| q * 3.0).collect();
         d.process(&mut main2, &other);
         assert_eq!(d.decorrelated_weight(), Some(held), "the weight moved while frozen");
+    }
+
+    /// A real bug found live, not a hypothetical: a fresh `Diversity` asked
+    /// to start `frozen` before it has ever solved once (settings persist
+    /// `frozen: true` from a previous session, and honoring it from the
+    /// first block is the normal, expected behavior) must not silence
+    /// everything forever, since being frozen is exactly what stops it from
+    /// ever getting the chance to solve. Separate mode opened with Hold
+    /// already on produced total silence and a blank spectrum on real
+    /// hardware; turning Hold off (letting it solve at least once) fixed it
+    /// instantly, which is what pinned this down to the starting weight
+    /// rather than anything about the solve itself.
+    #[test]
+    fn freezing_before_ever_solving_leaves_main_untouched_not_silenced() {
+        let n = 20_000;
+        let qrm = noise(n, 11);
+        let mut main: Vec<Complex32> = (0..n).map(|i| Complex32::new(i as f32, -(i as f32))).collect();
+        let before = main.clone();
+
+        let mut d = Diversity::new(DiversityMode::Cancel, 1, 0.5);
+        d.set_algorithm(DiversityAlgorithm::Decorrelate);
+        d.set_frozen(true);
+        d.process(&mut main, &qrm);
+
+        assert_eq!(d.decorrelated_weight(), None, "frozen before ever solving has no answer yet");
+        assert_eq!(main, before, "main was silenced instead of passed through untouched");
     }
 
     /// `decorrelated_weight()` is honest about not having an answer yet, and

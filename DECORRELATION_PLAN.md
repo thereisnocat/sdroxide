@@ -277,9 +277,42 @@ the synthetic version of exactly what real air showed.
   failure and the fix synthetically: two interferers at different frequencies and gains, one far
   stronger than the other — the whole-span solve, dominated by the strong one, does a mediocre job
   on the weak one; the reference band, pointed at the weak one specifically, nulls it deep
-  regardless of what the strong one is doing elsewhere. **Not yet re-verified against real
-  hardware** — built and tested synthetically the same night the A/B that motivated it happened;
-  a fresh real-air retest with the reference band pointed at WNYC is the natural next step.
+  regardless of what the strong one is doing elsewhere.
+
+  **Real-air retest the same night: the reference band alone was not the fix.** Ralph tried it at
+  widths from 100 Hz to 20 kHz, pointed at WNYC — "essentially no difference," still nowhere near
+  SDR++'s own null, and not because a single weight is inherently too weak either: single-frequency
+  decorrelation on **two independent implementations** (SDR++ *and* a Perseus22 with its own vendor
+  software) nulled cleanly on the same antennas. That ruled out "inherent one-weight ceiling" and
+  pointed at something structurally missing from sdroxide's own solve.
+
+  **Found by reading SDR++'s `dsp::combine::decorrelator.h` directly: whitening.** Solving the raw
+  covariance for maximum power/minimum variance is biased by whichever channel is noisier —
+  `covariance_eigen` had no correction for that at all. Whitening, calibrated from a genuine
+  noise-only capture ("point the radio at a quiet channel first"), normalises the two channels to
+  equal, uncorrelated noise before solving, removing that bias. Ported the same night:
+  `Matrix2`/`raw_eigen`/`inverse_sqrt`/`transform`/`whitened_to_raw` (f64, a second
+  eigendecomposition alongside the existing f32 `covariance_eigen` rather than round-tripping
+  through that one's own already-conjugated convention twice per calibration) and
+  `Diversity::capture_noise(seconds, sample_rate_hz)`/`has_whitening()`/`clear_whitening()`. Two new
+  momentary controls per settings tab ("Capture noise (1 s)" / "Clear"), not persisted fields — the
+  calibration is receiver-environment-specific and would go stale the moment conditions change, so
+  no `PROTO_VERSION` bump for this one. New synthetic test,
+  `whitening_finds_the_null_a_channel_noise_floor_mismatch_hides`: two antennas hearing the same
+  interferer, one channel's own front-end noise 30× louder than the other's — raw solve finds
+  essentially no null (0.9 dB), whitened finds a near-perfect one (53.7 dB), with the solved weight
+  landing almost exactly on the true cancellation gain and phase.
+
+  **Confirmed on real hardware the same night**: Ralph captured noise, then nulled WNYC (820 kHz)
+  completely, then retuned and nulled a Toronto station on 860 kHz completely too — both after a
+  fresh capture on each frequency. A residual "little noisy, with pops" quality remained; ruled out
+  as coming from the decorrelation weight itself (Hold made no difference — the weight was
+  literally frozen and pops persisted unchanged) and from packet loss (no drops in the debug log
+  during a live test). SDR++'s own recording has "some similar popping, to a lesser extent" at the
+  same task — most likely a shared, largely inherent characteristic (real atmospheric noise exposed
+  once the dominant carrier is gone, or a downstream AGC/audio-chain difference) rather than a
+  defect in sdroxide's decorrelation math specifically, though sdroxide's being more pronounced is
+  a real, smaller gap worth a closer look another time.
 - Continuous-resolve vs. one-shot-then-freeze as the *default* behavior for scalar decorrelation
   in `Combine`-style use — both are worth having per the section above, but which one an operator
   gets without touching a setting is a real UX choice, not obviously either way.

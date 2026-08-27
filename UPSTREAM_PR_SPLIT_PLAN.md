@@ -113,12 +113,15 @@ reconciliation just taught directly.
    engineering record, hard-won findings like the whitening fix's whole diagnostic path) — as an
    attached/linked reference, not the PR body itself.
 
+## Decided
+
+- **PR 2 (RSR200) waits until PR 1 (decorrelation) actually merges upstream** — Ralph's call.
+  `upstream-pr-rsr200` gets built and verified locally now (per the Construction section above)
+  but doesn't go up as a real PR until PR 1 has landed; rebase it onto whatever upstream's tip
+  looks like at that point rather than assuming its own base commit still applies cleanly.
+
 ## Open questions, not resolved here
 
-- **Submit PR 2 only after PR 1 actually merges upstream, or as a stacked/dependent PR
-  immediately?** Waiting is cleaner for the maintainer to review (nothing to review out of
-  order); stacking is faster but means PR 2 sits un-mergeable until PR 1 lands, and needs
-  rebasing if PR 1 changes during review. Ralph's call, not decided here.
 - **Whether to open an issue first** describing the whitening finding before the PR, the way
   several of upstream's own recent merges reference an issue number — matches the project's own
   visible convention, not required by anything technical.

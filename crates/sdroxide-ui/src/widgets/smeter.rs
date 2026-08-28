@@ -155,52 +155,11 @@ fn swr_frac(swr: f32) -> f32 {
     (swr.max(1.0).ln() / SWR_MAX.ln()).clamp(0.0, 1.0)
 }
 
-/// Which face the meter wears. Cycled by clicking the meter; persisted in the
-/// client's view state.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SmeterStyle {
-    /// Analog moving-coil instrument with a swinging needle.
-    #[default]
-    Needle,
-    /// Horizontal gradient bar with a graduated scale beneath it.
-    Bar,
-    /// Scrolling trace of the last quarter-minute — reads fading and QSB (and,
-    /// on transmit, how SWR behaved across the over) the way neither of the
-    /// instantaneous faces can.
-    Trace,
-}
-
-impl SmeterStyle {
-    /// The next style in the click cycle.
-    pub fn next(self) -> Self {
-        match self {
-            SmeterStyle::Needle => SmeterStyle::Bar,
-            SmeterStyle::Bar => SmeterStyle::Trace,
-            SmeterStyle::Trace => SmeterStyle::Needle,
-        }
-    }
-
-    /// The face for a box wider than it is tall — the shape the compact strip
-    /// hands the meter on a phone.
-    ///
-    /// The needle drops out there. Its arc is a chord across the box, so its
-    /// radius follows the *width*, and the headline chip ends up covering the
-    /// half of the scale the arc has not yet descended past — the reading and
-    /// the instrument printed over each other. The bar says the same thing in
-    /// a strip, which is exactly the shape available.
-    pub fn compact(self) -> Self {
-        match self {
-            SmeterStyle::Needle => SmeterStyle::Bar,
-            other => other,
-        }
-    }
-
-    /// The next style in the click cycle, skipping any this box cannot show.
-    pub fn next_compact(self) -> Self {
-        let next = self.next();
-        if next.compact() != next { next.next() } else { next }
-    }
-}
+/// Which face the meter wears — the operator's choice, kept in `[ui]` with
+/// the rest of this screen's preferences (see [`sdroxide_types::SmeterStyle`]),
+/// and re-exported here so a caller drawing a meter has the face beside the
+/// widget that draws it.
+pub use sdroxide_types::SmeterStyle;
 
 /// Draw the S-meter in the selected style, filling the box's full interior.
 /// Returns the (clickable) response so the caller can cycle the style.
@@ -616,6 +575,8 @@ struct Reading {
     right: String,
     /// Whether `right` is a co-equal reading (TX) or a quiet sub-label (RX).
     right_strong: bool,
+    /// The right-hand reading is a warning, and prints in the red-line red.
+    right_alert: bool,
 }
 
 fn reading(meters: Option<&Meters>) -> Reading {
@@ -632,6 +593,7 @@ fn reading(meters: Option<&Meters>) -> Reading {
                 accent: RED(),
                 right: power,
                 right_strong: true,
+                right_alert: false,
             },
             // No SWR bridge: the needle falls back to the engine's own drive
             // level, which is the only TX quantity every backend reports.
@@ -642,6 +604,7 @@ fn reading(meters: Option<&Meters>) -> Reading {
                 accent: RED(),
                 right: power,
                 right_strong: true,
+                right_alert: false,
             },
         };
     }
@@ -652,13 +615,19 @@ fn reading(meters: Option<&Meters>) -> Reading {
         Some(_) if dbm > S9_DBM => (format!("S9+{:.0}", dbm - S9_DBM), format!("{dbm:.0} dBm")),
         Some(m) => (format!("S{}", m.s_units().0), format!("{dbm:.0} dBm")),
     };
+    // The converter is into its rails. This takes the dBm's place rather than
+    // sitting beside it, because the dBm is no longer a measurement: a clipped
+    // carrier reads *lower* than it is, so leaving the number up would have the
+    // instrument quietly disagreeing with the warning printed next to it.
+    let overload = meters.is_some_and(Meters::adc_overloaded);
     Reading {
         scale: s_scale(),
         frac: frac_of(dbm),
         chip: primary,
-        accent: crate::theme::CYAN(),
-        right: secondary,
-        right_strong: false,
+        accent: if overload { RED() } else { crate::theme::CYAN() },
+        right: if overload { "OVL".to_string() } else { secondary },
+        right_strong: overload,
+        right_alert: overload,
     }
 }
 
@@ -754,7 +723,11 @@ fn header(p: &Painter, rect: Rect, r: &Reading, k: f32) -> Rect {
     let (chip_pt, strong_pt) = header_pt(k);
     let chip_rect = chip(p, pos2(rect.left() + 6.0 * k, head_y), &r.chip, r.accent, chip_pt);
     if !r.right.is_empty() {
-        let (pt, ink) = if r.right_strong { (strong_pt, READOUT()) } else { (chip_pt, SUBDUED()) };
+        let (pt, ink) = match (r.right_strong, r.right_alert) {
+            (_, true) => (strong_pt, RED()),
+            (true, false) => (strong_pt, READOUT()),
+            (false, false) => (chip_pt, SUBDUED()),
+        };
         // The secondary reading goes only where there is room for it beside the
         // headline one. In a box narrow enough for the two to meet, the chip is
         // the one worth keeping — it carries the signal report, and the pair

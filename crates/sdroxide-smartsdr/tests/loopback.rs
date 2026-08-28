@@ -382,3 +382,164 @@ fn dropping_the_handle_releases_the_radios_streams() {
     assert!(sim.wait_for(PATIENCE, |s| s.saw_command("stream remove")));
     assert!(sim.stats.saw_command("display panafall remove"));
 }
+
+// ─── Identity: who gets evicted, and who does not ────────────────────────────
+
+#[test]
+fn a_client_id_somebody_else_holds_is_not_stolen() {
+    // The default station name is "sdroxide" on every installation, so the id
+    // derived from it is the same everywhere. Two sdroxide sessions therefore
+    // arrive at a radio holding the same identity — and a radio resolves that by
+    // evicting the incumbent, who reconnects and evicts the newcomer, forever.
+    let held = sdroxide_smartsdr::gui_client_id("test");
+    let sim = SimRadio::start(SimConfig {
+        existing_clients: vec![(held.clone(), "OtherShack".into())],
+        ..SimConfig::default()
+    })
+    .expect("start simulator");
+
+    let h = connect(&sim, 48_000.0);
+    let dump = h.trace.dump();
+
+    // Registering under the id we would have derived is what evicts them.
+    assert!(
+        !dump.contains(&format!("client gui {held}")),
+        "registered under an id another client already holds:\n{dump}"
+    );
+    assert!(dump.contains("client gui "), "no registration at all:\n{dump}");
+    assert!(
+        dump.contains("already registered by handle") && dump.contains("OtherShack"),
+        "the trace does not say whose id it was:\n{dump}"
+    );
+    // And the incumbent is still there: the radio never had cause to throw them
+    // off, so no duplicate-id notice was ever sent.
+    assert!(
+        !dump.contains("duplicate_client_id=1"),
+        "another client was evicted after all:\n{dump}"
+    );
+}
+
+#[test]
+fn a_free_client_id_is_still_the_stable_one() {
+    // The avoidance above must not cost the session restore in the ordinary
+    // case: with nobody holding it, the derived id is what goes on the wire, and
+    // it is the same string on the next run.
+    let sim = sim();
+    let h = connect(&sim, 48_000.0);
+    let want = sdroxide_smartsdr::gui_client_id("test");
+    assert!(
+        h.trace.dump().contains(&format!("client gui {want}")),
+        "the stable id was abandoned for no reason:\n{}",
+        h.trace.dump()
+    );
+}
+
+#[test]
+fn an_eviction_for_a_duplicate_id_is_reported_as_one() {
+    // A client that sees only the TCP close learns nothing, reconnects with the
+    // same id, and starts the fight again. The radio does say why, once.
+    let sim = SimRadio::start(SimConfig {
+        evict_after: Some(Duration::from_millis(300)),
+        ..SimConfig::default()
+    })
+    .expect("start simulator");
+    let h = connect(&sim, 48_000.0);
+
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while h.is_alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!h.is_alive(), "the session outlived its own eviction");
+    assert!(
+        h.evicted_for_duplicate_id(),
+        "the eviction was not recognised, so a retry would repeat it:\n{}",
+        h.trace.dump()
+    );
+}
+
+#[test]
+fn a_transient_identity_registers_under_an_id_of_its_own() {
+    let sim = sim();
+    let h = FlexHandle::connect_with(&sdroxide_smartsdr::ConnectOptions {
+        address: sim.address(),
+        iq_rate_hz: 48_000.0,
+        station: "test".into(),
+        transient_identity: true,
+        ..sdroxide_smartsdr::ConnectOptions::default()
+    })
+    .expect("connect to simulator");
+
+    let derived = sdroxide_smartsdr::gui_client_id("test");
+    assert!(!h.trace.dump().contains(&format!("client gui {derived}")));
+    assert!(h.is_alive());
+}
+
+#[test]
+fn a_configured_client_id_is_used_verbatim() {
+    // The way back to the radio's session restore for an operator whose station
+    // name collides with somebody else's.
+    let sim = sim();
+    let mine = "11112222-3333-4444-8555-666677778888";
+    let h = FlexHandle::connect_with(&sdroxide_smartsdr::ConnectOptions {
+        address: sim.address(),
+        iq_rate_hz: 48_000.0,
+        station: "test".into(),
+        client_id: mine.into(),
+        ..sdroxide_smartsdr::ConnectOptions::default()
+    })
+    .expect("connect to simulator");
+    assert!(h.trace.dump().contains(&format!("client gui {mine}")));
+}
+
+// ─── The data path ───────────────────────────────────────────────────────────
+
+#[test]
+fn iq_still_arrives_when_the_radio_refuses_client_udpport() {
+    // The v1.4.0.0 protocol a FLEX-6600 speaks can answer `client udpport` with
+    // "command not supported", leaving the registration datagram as the only
+    // thing that tells the radio where to stream. A client that sends it once,
+    // early, and never again has no second chance if that datagram is lost or
+    // arrives before the stream exists.
+    let sim = SimRadio::start(SimConfig { require_udp_register: true, ..SimConfig::default() })
+        .expect("start simulator");
+    let mut h = connect(&sim, 48_000.0);
+
+    let iq = collect_iq(&mut h, 4096);
+    assert!(
+        iq.len() >= 4096,
+        "no IQ arrived on a radio that ignores `client udpport` — got {} samples",
+        iq.len()
+    );
+}
+
+#[test]
+fn a_dax_iq_stream_left_unbound_is_bound_again() {
+    // An unbound DAX IQ stream is created, accepts a rate, reports itself
+    // active, and carries nothing at all. It is the silent half of "connects
+    // fine, no spectrum", and the radio does say so: `pan=0x0`.
+    let sim = SimRadio::start(SimConfig { unbound_dax_iq: true, ..SimConfig::default() })
+        .expect("start simulator");
+    let mut h = connect(&sim, 48_000.0);
+
+    let iq = collect_iq(&mut h, 2048);
+    assert!(
+        iq.len() >= 2048,
+        "the stream was never bound to a panadapter — got {} samples:\n{}",
+        iq.len(),
+        h.trace.dump()
+    );
+    assert!(
+        h.trace.dump().contains("not bound to a panadapter"),
+        "the rebind happened without saying why:\n{}",
+        h.trace.dump()
+    );
+}
+
+#[test]
+fn transmit_audio_goes_to_the_radios_data_port() {
+    // 4992 carries the TCP protocol and the discovery broadcasts; the VITA-49
+    // data plane is 4991. Audio addressed to the control port is dropped without
+    // a word — the radio keys up and the operator transmits dead air.
+    assert_eq!(sdroxide_smartsdr::VITA_PORT, 4991);
+    assert_ne!(sdroxide_smartsdr::VITA_PORT, sdroxide_smartsdr::RADIO_PORT);
+}

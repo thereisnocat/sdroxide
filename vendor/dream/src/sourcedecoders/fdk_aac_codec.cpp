@@ -27,14 +27,48 @@
 \******************************************************************************/
 
 #include "fdk_aac_codec.h"
-#include <fdk-aac/aacenc_lib.h>
+#ifndef SDROXIDE_NO_AAC_ENCODER
+# include <fdk-aac/aacenc_lib.h>
+#endif
 #include <fdk-aac/FDK_audio.h>
 #include "src/SDC/SDC.h"
 #include <cstring>
+#ifdef SDROXIDE_FDK_DLOPEN
+# include "fdk_aac_dll.h"
+#endif
+
+#ifdef SDROXIDE_QUIET
+/* This file narrates every decode on stderr - the object type on open, and on
+   a fading signal a line per frame for a failed fill or a bad CRC. A library
+   has no business writing to a GUI application's stderr, and sdroxide logs
+   through `tracing` instead, so the stream is swallowed for this translation
+   unit only. Done here rather than as thirty guards because one line is what
+   has to be re-applied when Dream is next upgraded. */
+namespace {
+struct FdkNullSink
+{
+    template <class T> FdkNullSink& operator<<(const T&) { return *this; }
+    FdkNullSink& operator<<(std::ostream& (*)(std::ostream&)) { return *this; }
+    FdkNullSink& operator<<(std::ios_base& (*)(std::ios_base&)) { return *this; }
+};
+static FdkNullSink fdk_null_sink;
+} // namespace
+# define cerr fdk_null_sink
+#endif
 
 FdkAacCodec::FdkAacCodec() :
+#ifdef SDROXIDE_NO_AAC_ENCODER
+    hDecoder(nullptr),bUsac(false),decode_buf()
+#else
     hDecoder(nullptr), hEncoder(nullptr),bUsac(false),decode_buf()
+#endif
 {
+#ifdef SDROXIDE_FDK_DLOPEN
+    /* Cheap and idempotent: the library is looked up once per process and the
+       codec stays constructible either way, because CanDecode below reports
+       the failure rather than this constructor. */
+    FdkAacDllLoad();
+#endif
 }
 
 
@@ -45,11 +79,15 @@ FdkAacCodec::~FdkAacCodec()
 }
 
 static void aacinfo(LIB_INFO& inf) {
-    LIB_INFO info[12];
+    /* FDK_MODULE_LAST, not a round number: every per-module GetLibInfo the
+       library chains through scans this array up to FDK_MODULE_LAST looking
+       for the first free slot, so an array shorter than that is only safe for
+       as long as fewer modules than its length register. */
+    LIB_INFO info[FDK_MODULE_LAST];
     memset(info, 0, sizeof(info));
     aacDecoder_GetLibInfo(info);
     stringstream version;
-    for(int i=0; info[i].module_id!=FDK_NONE && i<12; i++) {
+    for(int i=0; i<FDK_MODULE_LAST && info[i].module_id!=FDK_NONE; i++) {
         if(info[i].module_id == FDK_AACDEC) {
             inf = info[i];
         }
@@ -69,6 +107,20 @@ FdkAacCodec::DecGetVersion()
 bool
 FdkAacCodec::CanDecode(CAudioParam::EAudCod eAudioCoding)
 {
+#ifdef SDROXIDE_FDK_DLOPEN
+    /* No library, no decoder. Every aacDecoder_* name below is a pointer that
+       is still null in that case, so this test has to come first. */
+    if (hFdkAacLib == nullptr)
+        return false;
+    /* Plain AAC is left to faad2 even when FDK-AAC is present. faad2 is built
+       in, so it is always there, it is the path this receiver was verified on,
+       and it carries sdroxide's fix for the zero-length first SBR frame.
+       InitCodecList puts this codec ahead of AacCodec, so without this line
+       FDK-AAC would quietly take over every ordinary broadcast the moment the
+       operator installed it - a change nobody asked for. */
+    if (eAudioCoding != CAudioParam::AC_xHE_AAC)
+        return false;
+#endif
     LIB_INFO linfo;
     aacinfo(linfo);
     if(eAudioCoding == CAudioParam::AC_AAC) {
@@ -204,6 +256,9 @@ FdkAacCodec::DecOpen(const CAudioParam& AudioParam, int& iAudioSampleRate)
 {
     unsigned type9Size;
     UCHAR *t9;
+    /* InitInternal() calls this again on every service and audio parameter
+       change without always closing first. */
+    DecClose();
     hDecoder = aacDecoder_Open (TRANSPORT_TYPE::TT_DRM, 3);
 
     // provide a default value for iAudioSampleRate in case we can't do better. TODO xHEAAC
@@ -249,8 +304,19 @@ FdkAacCodec::DecOpen(const CAudioParam& AudioParam, int& iAudioSampleRate)
         logFlags(*pinfo);
         //logNumbers(*pinfo);
         cerr << endl;
-        iAudioSampleRate = pinfo->extSamplingRate;
+        /* `sampleRate` is the rate of the PCM this decoder actually returns,
+           and it is the field that goes with the `frameSize` the copy at the
+           end of Decode() uses - the two have to be the matched pair or the
+           resampler ratio in CAudioSourceDecoder is wrong and the audio plays
+           at the wrong speed. `extSamplingRate` is an ASC field, is documented
+           as a decoder-internal member, and for USAC is often 0, in which case
+           upstream fell back to a guess from the SDC and got the ratio wrong
+           without ever saying so. */
+        iAudioSampleRate = pinfo->sampleRate;
 
+        if(iAudioSampleRate == 0) {
+            iAudioSampleRate = pinfo->extSamplingRate;
+        }
         if(iAudioSampleRate == 0) {
             iAudioSampleRate = iDefaultSampleRate; // get from AudioParam if codec couldn't get it
         }
@@ -270,6 +336,14 @@ FdkAacCodec::DecOpen(const CAudioParam& AudioParam, int& iAudioSampleRate)
 CAudioCodec::EDecError FdkAacCodec::Decode(const vector<uint8_t>& audio_frame, uint8_t aac_crc_bits, CVector<_REAL>& left, CVector<_REAL>& right)
 {
     writeFile(audio_frame);
+    /* A super frame directory can legitimately place a zero length frame, and
+       &audio_frame[0] on an empty vector is undefined behaviour. */
+    if(audio_frame.empty()) {
+        return CAudioCodec::DECODER_ERROR_UNKNOWN;
+    }
+    if(hDecoder == nullptr) {
+        return CAudioCodec::DECODER_ERROR_UNKNOWN;
+    }
     vector<uint8_t> data;
     uint8_t* pData;
     UINT bufferSize;
@@ -295,58 +369,35 @@ CAudioCodec::EDecError FdkAacCodec::Decode(const vector<uint8_t>& audio_frame, u
         return CAudioCodec::DECODER_ERROR_UNKNOWN;
     }
 
-    CStreamInfo *pinfo = aacDecoder_GetStreamInfo(hDecoder);
-    if (pinfo==nullptr) {
-        cerr << "No stream info" << endl;
-        //return nullptr; this breaks everything!
-    }
-
-    //cerr << "Decode";
-    //logAOT(*pinfo);
-    //logFlags(*pinfo);
-    //logNumbers(*pinfo);
-    //cerr << endl;
-
-    if(pinfo->aacNumChannels == 0) {
-        cerr << "zero output channels: " << err << endl;
-        //return CAudioCodec::DECODER_ERROR_UNKNOWN;
-    }
-    else {
-        //cerr << pinfo->aacNumChannels << " aac channels " << endl;
-    }
-
-    if(err != AAC_DEC_OK) {
-        cerr << "Fill failed: " << err << endl;
-        return CAudioCodec::DECODER_ERROR_UNKNOWN;
-    }
     //cerr << "aac decode after fill bufferSize " << bufferSize << ", bytesValid " << bytesValid << endl;
     if (bytesValid != 0) {
         cerr << "Unable to feed all " << bufferSize << " input bytes, bytes left " << bytesValid << endl;
         return CAudioCodec::DECODER_ERROR_UNKNOWN;
     }
 
-    if(pinfo->numChannels == 0) {
-        cerr << "zero output channels: " << err << endl;
-        //return CAudioCodec::DECODER_ERROR_UNKNOWN;
-    }
+    /* `timeDataSize` is the *capacity* of the output buffer, which is what the
+       library's own documentation says it is.
 
-    size_t output_size = unsigned(pinfo->frameSize * pinfo->numChannels);
-    if(sizeof (decode_buf) < sizeof(int16_t)*output_size) {
-        cerr << "can't fit output into decoder buffer" << endl;
-        return CAudioCodec::DECODER_ERROR_UNKNOWN;
-    }
-
-    memset(decode_buf, 0, sizeof(int16_t)*output_size);
-    err = aacDecoder_DecodeFrame(hDecoder, decode_buf, int(output_size), 0);
-
-    if(err == AAC_DEC_OK) {
-        double d = 0.0;
-        for(size_t i=0; i<output_size; i++) d += double(decode_buf[i]);
-        //cerr << "energy in good frame " << (d/output_size) << endl;
-    }
-    else if(err == AAC_DEC_PARSE_ERROR) {
+       Upstream instead computed it as frameSize * numChannels out of the stream
+       info as it stood *before* the decode, and reading those two fields early
+       is not valid: aacDecoder_GetStreamInfo describes the last decoded frame,
+       and until one has been decoded a USAC stream reports zero channels. So
+       xHE-AAC asked for an output buffer of zero samples on every frame, got
+       AAC_DEC_OUTPUT_BUFFER_TOO_SMALL back on every frame, and produced
+       silence from a signal it had otherwise decoded perfectly - the service
+       label, the bit rate and the scrolling text all arrive. For plain AAC the
+       fields happen to be right by the second frame, which is why this has
+       never shown up there. */
+    const int decode_buf_samples = int(sizeof(decode_buf) / sizeof(decode_buf[0]));
+    memset(decode_buf, 0, sizeof(decode_buf));
+    err = aacDecoder_DecodeFrame(hDecoder, decode_buf, decode_buf_samples, 0);
+    if(err == AAC_DEC_PARSE_ERROR) {
         cerr << "error parsing bitstream." << endl;
         return CAudioCodec::DECODER_ERROR_UNKNOWN;
+    }
+    else if(err == AAC_DEC_CRC_ERROR) {
+        /* Ordinary on a fading signal; the block is simply bad. */
+        return CAudioCodec::DECODER_ERROR_CRC;
     }
 #ifdef HAVE_USAC
     else if(err == AAC_DEC_OUTPUT_BUFFER_TOO_SMALL) {
@@ -362,8 +413,27 @@ CAudioCodec::EDecError FdkAacCodec::Decode(const vector<uint8_t>& audio_frame, u
         cerr << "Error condition is of unknown reason, or from a another module. Output buffer is invalid." << endl;
         return CAudioCodec::DECODER_ERROR_UNKNOWN;
     }
-    else {
+    else if(err != AAC_DEC_OK) {
         cerr << "other error " << hex << int(err) << dec << endl;
+        return CAudioCodec::DECODER_ERROR_UNKNOWN;
+    }
+
+    /* Now the stream info describes the frame that was just decoded. */
+    CStreamInfo *pinfo = aacDecoder_GetStreamInfo(hDecoder);
+    if (pinfo==nullptr) {
+        cerr << "No stream info" << endl;
+        /* Upstream carried on here - the comment it left behind ("return
+           nullptr; this breaks everything!") is about returning the wrong
+           thing, not about it being safe to continue. Every line below reads
+           through this pointer. */
+        return CAudioCodec::DECODER_ERROR_UNKNOWN;
+    }
+    if(pinfo->frameSize <= 0 || pinfo->numChannels <= 0) {
+        cerr << "no decoded samples" << endl;
+        return CAudioCodec::DECODER_ERROR_UNKNOWN;
+    }
+    if(int64_t(pinfo->frameSize) * pinfo->numChannels > decode_buf_samples) {
+        cerr << "decoder returned more than it was given room for" << endl;
         return CAudioCodec::DECODER_ERROR_UNKNOWN;
     }
 
@@ -406,6 +476,30 @@ FdkAacCodec::DecUpdate(CAudioParam&)
 {
 }
 
+
+#ifdef SDROXIDE_NO_AAC_ENCODER
+
+/* sdroxide never transmits DRM - it is a broadcast system with no amateur
+   allocation - so the encoder half is not built. That matters more than the
+   code it saves: the encoder is the half of FDK-AAC the patent licensing is
+   actually about, and CAudioCodec declares these pure virtual, so they have to
+   exist as something. CanEncode returning false keeps GetEncoder away from
+   them. */
+
+string FdkAacCodec::EncGetVersion() { return string(); }
+bool FdkAacCodec::CanEncode(CAudioParam::EAudCod) { return false; }
+bool FdkAacCodec::EncOpen(const CAudioParam&, unsigned long& lNumSampEncIn, unsigned long& lMaxBytesEncOut)
+{
+    lNumSampEncIn = 0;
+    lMaxBytesEncOut = 0;
+    return false;
+}
+int FdkAacCodec::Encode(CVector<_SAMPLE>&, unsigned long, CVector<uint8_t>&, unsigned long) { return 0; }
+void FdkAacCodec::EncClose() {}
+void FdkAacCodec::EncSetBitrate(int) {}
+void FdkAacCodec::EncUpdate(CAudioParam&) {}
+
+#else
 
 string
 FdkAacCodec::EncGetVersion()
@@ -613,6 +707,8 @@ void
 FdkAacCodec::EncUpdate(CAudioParam&)
 {
 }
+
+#endif // SDROXIDE_NO_AAC_ENCODER
 
 string
 FdkAacCodec::fileName(const CParameter& Parameters) const

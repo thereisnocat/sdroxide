@@ -25,9 +25,33 @@ pub struct SpectrumAnalyzer {
 
     /// Averaged linear power per bin, natural FFT order.
     avg_power: Vec<f32>,
+    /// Peak of [`Self::avg_power`] since the last waterfall row was taken —
+    /// empty while nobody is clocking rows.
+    ///
+    /// The waterfall's time resolution is bounded by how often rows are drawn,
+    /// not by how often transforms land: a front end streaming megahertz runs
+    /// hundreds of transforms a second and a screen draws at most ninety. With
+    /// only the latest one kept, everything between two rows is discarded, and
+    /// a CW dot shorter than a row interval can fall between two frames and
+    /// never be seen at all. Holding the maximum instead means a row is
+    /// "the strongest thing that happened in this slice of time", which is
+    /// what a waterfall is *for*.
+    hold: Vec<f32>,
+    /// Whether [`Self::make_frame`] pools from [`Self::hold`] instead of
+    /// [`Self::avg_power`]. Set for the length of one row build — see
+    /// [`Self::set_read_hold`].
+    read_hold: bool,
     alpha: f32,
     primed: bool,
     peak_abs: f32,
+    /// Whether [`Self::process`] scans every sample for the input peak.
+    ///
+    /// Off by default. It is a pass over the whole stream — on an RX-888 at
+    /// 32.4 Msps, thirty-two million squared magnitudes a second — kept for one
+    /// caller: the terminal waterfall prints a dBFS column beside each line.
+    /// Nothing in the GUI or the server reads it, and a lane that nobody asks
+    /// should not pay for it. See [`Self::take_peak_dbfs`].
+    peak_track: bool,
     seq: u32,
     /// Hide the hardware DC/LO-leakage spike in emitted frames.
     dc_suppress: bool,
@@ -78,9 +102,12 @@ impl SpectrumAnalyzer {
             scratch,
             work: vec![Complex32::default(); fft_size],
             avg_power: vec![0.0; fft_size],
+            hold: Vec::new(),
+            read_hold: false,
             alpha: 1.0,
             primed: false,
             peak_abs: 0.0,
+            peak_track: false,
             seq: 0,
             transforms: 0,
             dc_suppress: true,
@@ -109,8 +136,46 @@ impl SpectrumAnalyzer {
     pub fn reset(&mut self) {
         self.pending.clear();
         self.avg_power.iter_mut().for_each(|p| *p = 0.0);
+        self.hold.iter_mut().for_each(|p| *p = 0.0);
         self.primed = false;
         self.peak_abs = 0.0;
+    }
+
+    /// Start (or stop) holding the per-bin peak between waterfall rows.
+    ///
+    /// Costs one `max` per bin per transform, so it is only switched on for a
+    /// lane whose rows somebody is actually clocking.
+    pub fn set_row_hold(&mut self, on: bool) {
+        if on == self.row_hold() {
+            return;
+        }
+        self.hold = if on { self.avg_power.clone() } else { Vec::new() };
+    }
+
+    /// Whether the peak hold is running.
+    pub fn row_hold(&self) -> bool {
+        !self.hold.is_empty()
+    }
+
+    /// Read the next [`Self::make_frame`] from the held peaks rather than the
+    /// running average.
+    ///
+    /// A flag rather than a second `make_frame`, so a row and the frame it
+    /// rides in are pooled by *exactly* the same code over exactly the same
+    /// viewport — two copies of that arithmetic would drift apart on the first
+    /// change to either. Set it, build the row, clear it; see
+    /// `Engine::make_row`.
+    pub fn set_read_hold(&mut self, on: bool) {
+        self.read_hold = on && !self.hold.is_empty();
+    }
+
+    /// Begin a fresh row: the peak starts again from where the spectrum is now,
+    /// so a row whose interval contained no transform at all still reads as the
+    /// current spectrum rather than as zero.
+    pub fn reset_hold(&mut self) {
+        if !self.hold.is_empty() {
+            self.hold.copy_from_slice(&self.avg_power);
+        }
     }
 
     pub fn set_avg_tc(&mut self, tc_secs: f32, sample_rate: f64) {
@@ -118,36 +183,73 @@ impl SpectrumAnalyzer {
         self.alpha = if tc_secs <= 0.0 { 1.0 } else { 1.0 - (-hop_time / tc_secs).exp() };
     }
 
+    /// Start (or stop) tracking the input peak [`Self::take_peak_dbfs`] reads.
+    ///
+    /// Off by default, because it costs a pass over every sample and only the
+    /// terminal waterfall wants it — see [`Self::peak_track`](#structfield.peak_track).
+    pub fn set_peak_track(&mut self, on: bool) {
+        self.peak_track = on;
+        if !on {
+            self.peak_abs = 0.0;
+        }
+    }
+
     /// Consume IQ samples, running as many overlapped FFTs as fit.
     pub fn process(&mut self, iq: &[Complex32]) {
-        for s in iq {
-            let a = s.norm_sqr();
-            if a > self.peak_abs {
-                self.peak_abs = a;
+        if self.peak_track {
+            let mut peak = self.peak_abs;
+            for s in iq {
+                let a = s.norm_sqr();
+                if a > peak {
+                    peak = a;
+                }
             }
+            self.peak_abs = peak;
         }
         self.pending.extend_from_slice(iq);
 
-        while self.pending.len() >= self.fft_size {
-            for (w, (x, win)) in self.work.iter_mut().zip(self.pending.iter().zip(&self.window)) {
+        // Walk the buffer with an offset and compact it once at the end, rather
+        // than draining a hop off the front after every transform.
+        //
+        // `Vec::drain` from the front shifts everything after it down, so the
+        // old loop memmoved the whole remaining buffer once per transform: on a
+        // block of sixteen thousand samples through a 4096-point window that is
+        // eight shifts of some ten thousand complex samples apiece, tens of
+        // megabytes a second of pure copying, and it grows with the front end's
+        // rate. One compaction per block does the same job.
+        let mut at = 0;
+        while self.pending.len() - at >= self.fft_size {
+            let frame = &self.pending[at..at + self.fft_size];
+            for (w, (x, win)) in self.work.iter_mut().zip(frame.iter().zip(&self.window)) {
                 *w = x * win;
             }
             self.fft.process_with_scratch(&mut self.work, &mut self.scratch);
 
             let norm = 1.0 / (self.coherent_gain * self.coherent_gain);
-            if self.primed {
+            let alpha = if self.primed { self.alpha } else { 1.0 };
+            self.primed = true;
+            // Two loops rather than one with a branch inside: this runs
+            // `fft_size` times per transform and hundreds of times a second on
+            // a wide front end, and the hold is off on most lanes.
+            if self.hold.is_empty() {
                 for (avg, x) in self.avg_power.iter_mut().zip(&self.work) {
                     let p = x.norm_sqr() * norm;
-                    *avg += self.alpha * (p - *avg);
+                    *avg += alpha * (p - *avg);
                 }
             } else {
-                for (avg, x) in self.avg_power.iter_mut().zip(&self.work) {
-                    *avg = x.norm_sqr() * norm;
+                for ((avg, h), x) in self.avg_power.iter_mut().zip(&mut self.hold).zip(&self.work) {
+                    let p = x.norm_sqr() * norm;
+                    *avg += alpha * (p - *avg);
+                    if *avg > *h {
+                        *h = *avg;
+                    }
                 }
-                self.primed = true;
             }
             self.transforms = self.transforms.wrapping_add(1);
-            self.pending.drain(..self.hop);
+            at += self.hop;
+        }
+        if at > 0 {
+            self.pending.drain(..at);
         }
     }
 
@@ -158,6 +260,8 @@ impl SpectrumAnalyzer {
     }
 
     /// Peak input magnitude (dBFS) since the last call; resets on read.
+    ///
+    /// Reads zero unless [`Self::set_peak_track`] switched the scan on.
     pub fn take_peak_dbfs(&mut self) -> f32 {
         let p = self.peak_abs;
         self.peak_abs = 0.0;
@@ -202,13 +306,17 @@ impl SpectrumAnalyzer {
             _ => (0.0, 1.0, center_hz, span_hz),
         };
 
+        // Held peaks for a waterfall row, or the running average for the
+        // trace — see [`Self::set_read_hold`]. Same pooling either way.
+        let power: &[f32] = if self.read_hold { &self.hold } else { &self.avg_power };
+
         // DC spike suppression (hardware LO leakage): read the ±2 bins
         // around DC as the average of their neighbors. Patch at read time so
         // the running average stays uncontaminated.
         let dc_repl = if self.dc_suppress && n > 16 {
             let mut acc = 0.0f32;
             for d in 3..=6 {
-                acc += self.avg_power[d] + self.avg_power[n - d];
+                acc += power[d] + power[n - d];
             }
             Some(acc / 8.0)
         } else {
@@ -221,22 +329,45 @@ impl SpectrumAnalyzer {
                     return repl;
                 }
             }
-            self.avg_power[nat]
+            power[nat]
         };
         let lo_bin = frac_lo * n as f64;
         let bin_range = (frac_hi - frac_lo) * n as f64;
 
         let mut bins = Vec::with_capacity(out_bins);
-        for b in 0..out_bins {
-            let lo = (lo_bin + b as f64 * bin_range / out_bins as f64) as usize;
-            let hi =
-                ((lo_bin + (b + 1) as f64 * bin_range / out_bins as f64) as usize).clamp(lo + 1, n);
-            let mut max_p = 0.0f32;
-            for i in lo..hi.max(lo + 1).min(n) {
-                max_p = max_p.max(shifted(i));
+        if bin_range < out_bins as f64 {
+            // Stretching, not pooling: the window holds fewer bins than there
+            // are columns to fill, so each bin has to cover several. Reading
+            // between them rather than repeating them — a repeated bin is a
+            // hard block, and a wall of them is what a zoom past the transform's
+            // resolution used to look like. The same rule the finished-sweep
+            // pooler uses; see `pool_window_to_frame` in the engine.
+            //
+            // Interpolated in power and then taken to dB, so the ramp between
+            // two bins is the ramp between the two levels rather than between
+            // their logarithms.
+            for b in 0..out_bins {
+                // Centre of this column in bin coordinates, less the half bin
+                // that puts bin centres on column centres.
+                let at = lo_bin + (b as f64 + 0.5) * bin_range / out_bins as f64 - 0.5;
+                let k = at.floor().clamp(0.0, (n - 1) as f64) as usize;
+                let t = (at - k as f64).clamp(0.0, 1.0) as f32;
+                let (p0, p1) = (shifted(k), shifted((k + 1).min(n - 1)));
+                let db = 10.0 * (p0 + (p1 - p0) * t + 1e-20).log10();
+                bins.push(((db - db_floor) * scale).clamp(0.0, 255.0) as u8);
             }
-            let db = 10.0 * (max_p + 1e-20).log10();
-            bins.push(((db - db_floor) * scale).clamp(0.0, 255.0) as u8);
+        } else {
+            for b in 0..out_bins {
+                let lo = (lo_bin + b as f64 * bin_range / out_bins as f64) as usize;
+                let hi = ((lo_bin + (b + 1) as f64 * bin_range / out_bins as f64) as usize)
+                    .clamp(lo + 1, n);
+                let mut max_p = 0.0f32;
+                for i in lo..hi.max(lo + 1).min(n) {
+                    max_p = max_p.max(shifted(i));
+                }
+                let db = 10.0 * (max_p + 1e-20).log10();
+                bins.push(((db - db_floor) * scale).clamp(0.0, 255.0) as u8);
+            }
         }
 
         self.seq = self.seq.wrapping_add(1);
@@ -247,6 +378,8 @@ impl SpectrumAnalyzer {
             db_floor,
             db_ceil,
             bins,
+            rows: Vec::new(),
+            rows_clocked: false,
         }
     }
 }
@@ -255,6 +388,89 @@ impl SpectrumAnalyzer {
 mod tests {
     use super::*;
     use std::f32::consts::TAU;
+
+    /// A tone that came and went between two waterfall rows still shows up in
+    /// the row it happened in.
+    ///
+    /// The running average keeps only the newest transform (`avg_tc` 0, which
+    /// is what the panadapter asks for), so by the time a row is taken the
+    /// burst is already gone from it. That is how a CW dot shorter than the
+    /// gap between two frames used to vanish entirely — the transform that saw
+    /// it was computed, folded in, and overwritten before anyone looked. The
+    /// peak hold is what makes a row mean "the loudest thing in this slice of
+    /// time" instead of "whatever was last".
+    #[test]
+    fn a_burst_between_rows_survives_into_the_row_it_happened_in() {
+        let fs = 1_000_000.0;
+        let n = 1024;
+        let tone_hz = 250_000.0f32;
+        let mut an = SpectrumAnalyzer::new(n, fs, 0.0);
+        an.set_dc_suppress(false);
+        an.set_row_hold(true);
+
+        let burst: Vec<Complex32> = (0..n * 4)
+            .map(|i| {
+                let ph = TAU * tone_hz * i as f32 / fs as f32;
+                Complex32::new(ph.cos(), ph.sin())
+            })
+            .collect();
+        let quiet = vec![Complex32::new(0.0, 0.0); n * 8];
+
+        // The burst, then silence — all inside one row interval.
+        an.process(&burst);
+        an.process(&quiet);
+
+        // The strongest column anywhere in the frame — the tone's exact bin is
+        // the other test's business.
+        let loudest = |f: &SpectrumFrame| f.bins.iter().copied().max().unwrap_or(0);
+
+        // The running average has forgotten it: this is what the trace draws,
+        // and it is correct for the trace — the band *is* quiet now.
+        let now = an.make_frame(0.0, fs, -120.0, 0.0, n, None);
+        assert!(loudest(&now) < 40, "the average should have moved on: {}", loudest(&now));
+
+        // The row has not.
+        an.set_read_hold(true);
+        let row = an.make_frame(0.0, fs, -120.0, 0.0, n, None);
+        an.set_read_hold(false);
+        assert!(loudest(&row) > 200, "the row should still hold the burst: {}", loudest(&row));
+
+        // And the next row starts from where the band is now, not from the
+        // peak it just reported — otherwise one burst would smear down the
+        // whole waterfall.
+        an.reset_hold();
+        an.set_read_hold(true);
+        let next = an.make_frame(0.0, fs, -120.0, 0.0, n, None);
+        an.set_read_hold(false);
+        assert!(loudest(&next) < 40, "the hold should have been released: {}", loudest(&next));
+    }
+
+    /// With the hold off, nothing about the analyser changes — the same
+    /// numbers, the same frames, for every lane that does not clock rows.
+    #[test]
+    fn the_hold_is_inert_until_it_is_switched_on() {
+        let fs = 1_000_000.0;
+        let n = 256;
+        let iq: Vec<Complex32> = (0..n * 4)
+            .map(|i| {
+                let ph = TAU * 100_000.0 * i as f32 / fs as f32;
+                Complex32::new(ph.cos(), ph.sin())
+            })
+            .collect();
+
+        let mut plain = SpectrumAnalyzer::new(n, fs, 0.0);
+        let mut held = SpectrumAnalyzer::new(n, fs, 0.0);
+        held.set_row_hold(true);
+        plain.process(&iq);
+        held.process(&iq);
+
+        assert!(!plain.row_hold());
+        assert!(held.row_hold());
+        assert_eq!(
+            plain.make_frame(0.0, fs, -120.0, 0.0, n, None).bins,
+            held.make_frame(0.0, fs, -120.0, 0.0, n, None).bins,
+        );
+    }
 
     #[test]
     fn tone_lands_in_the_right_bin_at_the_right_level() {

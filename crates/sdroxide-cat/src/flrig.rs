@@ -560,10 +560,15 @@ fn candidates(m: Mode) -> &'static [&'static str] {
         // no WFM position would report `FM` back, which reads as NFM and would
         // bounce the app out of a mode it is demodulating itself. Nothing
         // about listening needs the rig moved, so nothing goes out instead.
-        Mode::Wfm => &["WFM", "FM-W"],
+        // No rig has an ADS-B mode and none ever will: the dial is at
+        // 1090 MHz. Grouped with FM so nothing downstream has to special-case
+        // a mode a radio can neither be put into nor report back.
+        Mode::Wfm | Mode::Adsb => &["WFM", "FM-W"],
         // Data over FM rather than over a sideband: the carrier is the
         // signal's centre, not one edge of it.
-        Mode::Rifp | Mode::Packet | Mode::Aprs => &["PKT-FM", "PKTFM", "DATA-FM", "FM-D", "FM"],
+        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm => {
+            &["PKT-FM", "PKTFM", "DATA-FM", "FM-D", "FM"]
+        }
         Mode::Digl => &["DATA-R", "DATA-L", "DIGL", "PKT-LSB", "PKTLSB", "PKT-L", "LSB-D", "LSB"],
         Mode::Digu
         | Mode::Ft8

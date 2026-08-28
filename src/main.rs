@@ -20,6 +20,7 @@ mod rtlsdr_source;
 mod rx888_source;
 mod sdrplay_source;
 mod server_main;
+mod session_trace;
 mod smartsdr_source;
 mod spyserver_source;
 mod tci_source;
@@ -79,7 +80,7 @@ struct Cli {
     gain: Option<f64>,
 
     /// Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8,
-    /// FT4, FT2, PSK, RTTY, PACKET, APRS, SSTV, RIFP, OLIVIA, THOR, FSQ)
+    /// FT4, FT2, PSK, RTTY, PACKET, APRS, ADS-B, SSTV, RIFP, OLIVIA, THOR, FSQ)
     ///
     /// Default: the mode the last session was left in.
     #[arg(long)]
@@ -2114,8 +2115,9 @@ fn sdrplay_caps(src: &sdrplay_source::SdrPlaySource) -> DeviceCaps {
         // With both RSPduo tuners running the API fixes the ADC clock and
         // downconverts from a low IF, which leaves a much shorter ladder —
         // and publishing the long one would offer spans this session cannot
-        // reach.
-        sample_rates: if src.dual_tuner() {
+        // reach. True however the pair is being used: two radios sharing the
+        // board are as bound by its one clock as one radio combining them.
+        sample_rates: if src.dual_tuner() || src.split_tuner() {
             SdrPlayConfig::DUAL_SAMPLE_RATES.to_vec()
         } else {
             SdrPlayConfig::SAMPLE_RATES.to_vec()
@@ -2137,6 +2139,9 @@ fn sdrplay_caps(src: &sdrplay_source::SdrPlaySource) -> DeviceCaps {
             },
         ],
         antennas_rx: src.antennas().to_vec(),
+        // Two aerials arriving as one span: what puts the filter's controls on
+        // the main strip rather than only in the settings dialog (issue #165).
+        diversity: src.dual_tuner(),
         ..DeviceCaps::default()
     }
 }
@@ -2238,13 +2243,34 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
     }
 }
 
-/// Capabilities for an RTL-SDR: wideband IQ, receive only.
+/// The receive ranges an RTL-SDR publishes, given what its front end can do.
 ///
-/// The frequency ranges are the interesting part. A Blog V4 upconverts HF in
-/// hardware, so it is continuous from DC. Anything else reaches HF only through
-/// direct sampling, which tops out at the ADC's Nyquist limit — leaving a gap
-/// between there and the tuner's 24 MHz floor. Overlapping or disjoint ranges
-/// are both fine: `DeviceCaps::can_rx_hz` is an `any` over the list.
+/// A Blog V4 upconverts HF in hardware, so it is continuous from DC. Anything
+/// else reaches HF only by sampling the ADC directly, which is good for
+/// everything below the ADC's own clock — the first Nyquist zone up to
+/// 14.4 MHz, and its second zone above that, which the DDC's frequency word
+/// wraps into on its own. See `sdroxide_rtlsdr::DIRECT_SAMPLING_TOP_HZ`.
+///
+/// That upper half is what this used to stop short of, and stopping short of it
+/// greyed out 17 m and 15 m — the two bands with nowhere else to go, above the
+/// ADC's Nyquist limit and below the tuner's floor (issue #179). The two ranges
+/// overlap by design and that is fine: `DeviceCaps::can_rx_hz` is an `any` over
+/// the list.
+///
+/// Split out from [`rtlsdr_caps`] so the front ends can be checked without a
+/// dongle on the bus.
+fn rtlsdr_rx_ranges(is_blog_v4: bool, hf_capable: bool) -> Vec<(f64, f64)> {
+    let tuner = (sdroxide_rtlsdr::TUNER_MIN_HZ, sdroxide_rtlsdr::TUNER_MAX_HZ);
+    if is_blog_v4 {
+        vec![(0.0, sdroxide_rtlsdr::TUNER_MAX_HZ)]
+    } else if hf_capable {
+        vec![(0.0, sdroxide_rtlsdr::DIRECT_SAMPLING_TOP_HZ), tuner]
+    } else {
+        vec![tuner]
+    }
+}
+
+/// Capabilities for an RTL-SDR: wideband IQ, receive only.
 ///
 /// `driver` distinguishes the two ways in — `rtlsdr` over USB, `rtltcp` over
 /// the network — because it is what names the interface in the UI and what a
@@ -2253,13 +2279,7 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
 /// rate and HF answers come from the source, which knows which link it is on.
 fn rtlsdr_caps(src: &rtlsdr_source::RtlSdrSource, driver: &str) -> DeviceCaps {
     let rate = src.sample_rate_hz();
-    let freq_ranges_rx = if src.is_blog_v4() {
-        vec![(0.0, 1_766_000_000.0)]
-    } else if src.hf_capable() {
-        vec![(0.0, 14_400_000.0), (24_000_000.0, 1_766_000_000.0)]
-    } else {
-        vec![(24_000_000.0, 1_766_000_000.0)]
-    };
+    let freq_ranges_rx = rtlsdr_rx_ranges(src.is_blog_v4(), src.hf_capable());
     DeviceCaps {
         driver: driver.into(),
         label: format!("{} ({}, {:.3} Msps)", src.describe(), src.tuner(), rate / 1e6),
@@ -2683,6 +2703,43 @@ mod tests {
         assert!(!hf_only.may_rx_hz(145_500_000.0), "no VHF receiver, no 2 m");
         assert!(!hf_only.may_tx_hz(145_500_000.0));
         assert!(hf_only.may_tx_hz(50_150_000.0), "6 m is untouched");
+    }
+
+    /// Issue #179: on a dongle that reaches HF by direct sampling, 17 m and
+    /// 15 m were the only two amateur bands with no published range — above the
+    /// ADC's 14.4 MHz Nyquist limit, below the tuner's 24 MHz floor — so their
+    /// band buttons were greyed out and the engine refused to tune there. The
+    /// ADC hears them in its second Nyquist zone; every band from 160 m up must
+    /// now be reachable.
+    #[test]
+    fn a_direct_sampling_dongle_reaches_every_hf_band() {
+        let caps = |ranges: Vec<(f64, f64)>| DeviceCaps {
+            freq_ranges_rx: ranges,
+            ..DeviceCaps::default()
+        };
+
+        let ds = caps(rtlsdr_rx_ranges(false, true));
+        for (band, hz) in [
+            ("160 m", 1_840_000.0),
+            ("40 m", 7_074_000.0),
+            ("20 m", 14_074_000.0),
+            ("17 m", 18_100_000.0),
+            ("15 m", 21_074_000.0),
+            ("12 m", 24_915_000.0),
+            ("10 m", 28_074_000.0),
+            ("2 m", 144_174_000.0),
+        ] {
+            assert!(ds.may_rx_hz(hz), "{band} on a direct-sampling dongle");
+        }
+        assert!(!ds.may_rx_hz(2_000_000_000.0), "still an envelope at the top");
+
+        // A V4 upconverts and never had the gap; a dongle with HF switched off
+        // still stops at the tuner's floor, which is the honest answer for it.
+        let v4 = caps(rtlsdr_rx_ranges(true, true));
+        assert!(v4.may_rx_hz(1_840_000.0) && v4.may_rx_hz(21_074_000.0));
+        let tuner_only = caps(rtlsdr_rx_ranges(false, false));
+        assert!(!tuner_only.may_rx_hz(21_074_000.0));
+        assert!(tuner_only.may_rx_hz(28_074_000.0), "10 m is the tuner's own");
     }
 
     fn session(freq_hz: f64, mode: sdroxide_types::Mode) -> sdroxide_config::Session {

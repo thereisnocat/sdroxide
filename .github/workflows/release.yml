@@ -663,8 +663,13 @@ jobs:
             (Windows `.msi`, macOS `.dmg`).
           - **SoapySDR** (`-soapysdr` suffix) — everything above *plus* a
             dynamic link against **SoapySDR**, for devices that have no native
-            driver here (HackRF, Airspy R2/Mini, PlutoSDR, …). Ships as a portable
-            archive only.
+            driver here (HackRF, Airspy R2/Mini, PlutoSDR, …). No Windows or
+            macOS installer, but on Linux it comes as a `.deb` (package
+            `sdroxide-soapysdr`) as well as a portable archive — take
+            `sdroxide-<version>-linux-aarch64-compat-soapysdr.deb` for a
+            Raspberry Pi, Orange Pi or other ARM board, and the `x86_64` one for
+            a PC. Every `.deb` has the browser client built into the binary, so
+            the server serves the web UI with nothing else installed.
 
           On Linux both builds additionally come as a **`-compat`** artifact
           (e.g. `linux-x86_64-compat`), compiled against an older glibc (2.35).

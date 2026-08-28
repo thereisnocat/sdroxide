@@ -23,9 +23,10 @@
 
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, Slider};
 use sdroxide_types::{
-    AgcMode, BURST_MS_RANGE, Band, Command, CwSkimmerDecoder, DCS_CODES, DeviceCaps, Direction,
+    AgcMode, BURST_MS_RANGE, Band, Command, CwSkimmerDecoder, DCS_CODES, DIV_FREEZE_ELEMENT,
+    DIV_MODE_ELEMENT, DIV_RATE_ELEMENT, DIV_RESET_ELEMENT, DeviceCaps, Direction, DiversityMode,
     GainElement, MAX_OFFSET_HZ, Mode, NrEngine, NrLevel, NrStrength, RadioState, RxId, Shift,
-    SkimmerKind, SubTone, ToneMode, Vfo,
+    SkimmerKind, SpectrumDetail, Speed, SubTone, ToneMode, Vfo,
 };
 
 use crate::widgets::{freq_display, smeter};
@@ -51,6 +52,11 @@ const RIGHT_W: f32 = 96.0;
 /// is the strip's bottomless width absorber, and a row that carries it always
 /// reaches the right edge.
 const SMETER_W: f32 = 250.0;
+/// What the diversity mode chip reads, by whether it is combining. Measured
+/// and drawn from the same pair, so the box cannot be planned around a label
+/// it does not carry.
+const DIV_MODE_LABELS: [&str; 2] = ["CANCEL", "COMBINE"];
+
 /// Width of the sub-receiver box at its design size.
 const SUB_W: f32 = 404.0;
 /// How much a box that grows by lengthening its slider rails or widening its
@@ -111,6 +117,13 @@ const TX_SLIDER_VALUE_W: f32 = 48.0;
 /// Width of the condensed TX box's mic column: the "Mic" label over a vertical
 /// rail. Calibrated the same way, guarded by the same test.
 const TX_MIC_COL_W: f32 = 30.0;
+/// Width of the condensed TX box's transmit-audio column, which stands in the
+/// mic column's place in the modes where the microphone is not the payload
+/// (issue #186). Wider than [`TX_MIC_COL_W`] because its caption is its
+/// readout — the level in dB, permanently on screen rather than behind a hover
+/// — and "-40 dB" is what it has to fit: 30 pt of it at the desktop tier,
+/// against the 18 the word "Mic" takes. Same calibration, same test.
+const TX_LEVEL_COL_W: f32 = 36.0;
 /// Padding between the TX rows' readouts and the mic column, so the vertical
 /// rail stands apart from the sliders beside it.
 const TX_MIC_GAP: f32 = 16.0;
@@ -313,6 +326,7 @@ fn plan_short_strip(
 enum MenuChip {
     Rx,
     Vfo,
+    Div,
     Sub,
     Tx,
     Disp,
@@ -324,6 +338,7 @@ impl MenuChip {
         match self {
             Self::Rx => "RX",
             Self::Vfo => "VFO",
+            Self::Div => "DIV",
             Self::Sub => "SUB",
             Self::Tx => "TX",
             Self::Disp => "DISP",
@@ -683,6 +698,7 @@ impl SdroxideApp {
             Smeter,
             VfoRit,
             RxFilter,
+            Div,
             Sub,
             Tx,
             Display,
@@ -700,6 +716,14 @@ impl SdroxideApp {
                 StripBox { w, flex: 2.0, max_w: w + RAIL_STRETCH_MAX }
             }),
         ];
+        // Only while two aerials are actually being combined — the same rule
+        // as the sub receiver below, and for the same two reasons: the box
+        // appearing is the confirmation that the filter is running, and a
+        // strip is too narrow to carry controls for hardware nobody has.
+        if self.has_diversity() {
+            let w = div_rows_w(ui);
+            boxes.push((Kind::Div, StripBox { w, flex: 1.0, max_w: w + RAIL_STRETCH_MAX }));
+        }
         // Only while the sub is running: the module appearing is itself the
         // confirmation that SUB took effect, and it costs strip width that
         // operators who never use it should not have to pay.
@@ -744,6 +768,7 @@ impl SdroxideApp {
                         Kind::Smeter => self.smeter_box(ui, w, crate::chrome::MODULE_TALL_H, false),
                         Kind::VfoRit => self.vfo_rit_module(ui, cmds, w),
                         Kind::RxFilter => self.rx_filter_module(ui, cmds, w),
+                        Kind::Div => self.div_module(ui, cmds, w),
                         Kind::Sub => self.sub_rx_module(ui, cmds, w),
                         Kind::Tx => self.tx_condensed(ui, cmds, w),
                         Kind::Display => self.display_condensed(ui, cmds, w),
@@ -759,8 +784,11 @@ impl SdroxideApp {
     /// but not drawn — or the reverse — cannot break the plan around it.
     fn menu_chips(&self, tx_capable: bool) -> Vec<MenuChip> {
         let mut chips = vec![MenuChip::Rx, MenuChip::Vfo];
-        // Only while the sub is running: the chip appearing is itself the
-        // confirmation that SUB took effect.
+        // Both of these appear only while what they drive is running: the chip
+        // appearing is itself the confirmation.
+        if self.has_diversity() {
+            chips.push(MenuChip::Div);
+        }
         if self.state.sub_rx_enabled {
             chips.push(MenuChip::Sub);
         }
@@ -776,6 +804,13 @@ impl SdroxideApp {
     fn menu_chip_lit(&self, chip: MenuChip) -> bool {
         match chip {
             MenuChip::Vfo => self.state.split,
+            // Lit while the pair is being combined rather than cancelled: the
+            // difference the chip is there to show at a glance.
+            MenuChip::Div => self.radio_cfg.as_ref().is_some_and(|c| match c.backend {
+                sdroxide_types::Backend::Lime => c.lime.aux.mode == DiversityMode::Combine,
+                sdroxide_types::Backend::SdrPlay => c.sdrplay.duo.mode == DiversityMode::Combine,
+                _ => false,
+            }),
             MenuChip::Sub => true,
             MenuChip::Tx => self.state.tx.tune,
             MenuChip::Rx | MenuChip::Disp | MenuChip::Sys => false,
@@ -830,6 +865,7 @@ impl SdroxideApp {
     fn short_strip(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let tx_capable = self.tx_capable();
         let sub = self.state.sub_rx_enabled;
+        let div = self.has_diversity();
         let gap = ui.spacing().item_spacing.x;
         let chip_h = crate::chrome::chip_height(ui, None);
         let fit = ReadoutFit::measure(ui);
@@ -854,10 +890,18 @@ impl SdroxideApp {
             tag_w,
             bm_w,
             ptt_w,
-            row1: if sub {
-                (3, widest(&["RX", "VFO", "SUB"]))
-            } else {
-                (2, widest(&["RX", "VFO"]))
+            row1: {
+                // The same list the row below is drawn from, in the same
+                // order: a chip counted but not drawn — or the reverse —
+                // breaks the plan around it.
+                let mut r1 = vec!["RX", "VFO"];
+                if div {
+                    r1.push("DIV");
+                }
+                if sub {
+                    r1.push("SUB");
+                }
+                (r1.len(), widest(&r1))
             },
             row2: if tx_capable {
                 (3, widest(&["TX", "DISP", "SYS"]))
@@ -899,7 +943,7 @@ impl SdroxideApp {
                     // whatever height the readout did. Bar or trace only — a
                     // strip this shape cannot hold the needle's arc, see
                     // [`smeter::SmeterStyle::compact`].
-                    let style = self.view.smeter_style;
+                    let style = self.ui_settings.smeter_style;
                     ui.allocate_ui_with_layout(
                         egui::vec2(ui.available_width(), meter_h),
                         egui::Layout::left_to_right(egui::Align::Min),
@@ -907,7 +951,7 @@ impl SdroxideApp {
                             let resp = smeter::show(ui, self.meters.as_ref(), style.compact())
                                 .on_hover_text("Click to cycle meter face: bar / trace");
                             if resp.clicked() {
-                                self.view.smeter_style = style.next_compact();
+                                self.set_smeter_style(style.next_compact());
                             }
                         },
                     );
@@ -940,6 +984,11 @@ impl SdroxideApp {
                     self.rx_menu(ui, btn, cmds);
                     let btn = crate::chrome::chip_sized(ui, self.state.split, "VFO", cell1);
                     self.vfo_menu(ui, btn, cmds, true);
+                    if div {
+                        let lit = self.menu_chip_lit(MenuChip::Div);
+                        let btn = crate::chrome::chip_sized(ui, lit, "DIV", cell1);
+                        self.div_menu(ui, btn, cmds);
+                    }
                     if sub {
                         let btn = crate::chrome::chip_sized(ui, true, "SUB", cell1);
                         self.sub_menu(ui, btn, cmds);
@@ -1036,6 +1085,7 @@ impl SdroxideApp {
                 // selector and the other VFO's frequency; the phone box shows
                 // only a tag, so its VFO menu carries them instead.
                 MenuChip::Vfo => self.vfo_menu(ui, btn, cmds, tier == crate::layout::Tier::Phone),
+                MenuChip::Div => self.div_menu(ui, btn, cmds),
                 MenuChip::Sub => self.sub_menu(ui, btn, cmds),
                 MenuChip::Tx => self.tx_menu(ui, btn, cmds),
                 MenuChip::Disp => self.disp_menu(ui, btn, cmds),
@@ -1092,6 +1142,18 @@ impl SdroxideApp {
         });
     }
 
+    /// The DIV menu, shown only while two aerials are being combined.
+    fn div_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
+        let btn = btn.on_hover_text(
+            "The diversity filter: which way it combines the two aerials, how fast it \
+             adapts, and holding it where it is",
+        );
+        crate::chrome::menu_popup(ui, &btn, |ui| {
+            crate::chrome::menu_caption(ui, "Diversity");
+            self.div_controls(ui, cmds, true);
+        });
+    }
+
     /// The SUB menu, shown only while the second receiver runs.
     fn sub_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
         let btn = btn.on_hover_text("The second receiver's frequency, mode, filter and level");
@@ -1125,7 +1187,10 @@ impl SdroxideApp {
 
     /// The DISP menu: waterfall, spectrum and skimmer controls.
     fn disp_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
-        let btn = btn.on_hover_text("Waterfall contrast, FFT size, peak hold and the skimmers");
+        let btn = btn.on_hover_text(
+            "The panadapter — its two layers, their speeds and detail, peak hold — plus \
+             waterfall contrast, FFT size and the skimmers",
+        );
         crate::chrome::menu_popup(ui, &btn, |ui| {
             crate::chrome::menu_caption(ui, "Display");
             self.display_controls(ui, cmds, true);
@@ -1431,11 +1496,7 @@ impl SdroxideApp {
     /// offers no switch — put its radio down and pick it back up.
     fn power_chip(&mut self, ui: &mut egui::Ui, on: bool, size: egui::Vec2) {
         let chip = crate::chrome::chip_power(ui, on, size);
-        let tip = if on {
-            "Switch this radio off: its interface is closed, its settings are kept"
-        } else {
-            "Switch this radio on"
-        };
+        let tip = if on { crate::chrome::POWER_OFF_TIP } else { crate::chrome::POWER_ON_TIP };
         if chip.on_hover_text(tip).clicked() {
             self.radio_tab_requests
                 .push(crate::app::RadioTabRequest::Power { id: self.radio_id, on: !on });
@@ -1569,6 +1630,19 @@ impl SdroxideApp {
         format!("{hz:.6} MHz", hz = hz / 1e6)
     }
 
+    /// Take the face a click asked for and write it out.
+    ///
+    /// Straight to disk rather than left for eframe's periodic save: the face
+    /// is a screen preference in `[ui]` (issue #185), it is written the moment
+    /// it changes like every other one, and a session that ends in a `pkill`
+    /// or a crash then still comes back on the instrument the operator chose.
+    fn set_smeter_style(&mut self, style: sdroxide_types::SmeterStyle) {
+        if self.ui_settings.smeter_style != style {
+            self.ui_settings.smeter_style = style;
+            crate::app::persist::persist_ui_settings(&self.ui_settings);
+        }
+    }
+
     /// The S-meter in a label-less box, always pinned top-right. Clicking it
     /// cycles the needle / bar / trace faces.
     ///
@@ -1585,8 +1659,9 @@ impl SdroxideApp {
     /// its scale readable by capping and centring it (see
     /// [`crate::widgets::smeter::NEEDLE_FACE_MAX_W`]).
     fn smeter_box(&mut self, ui: &mut egui::Ui, w: f32, h: f32, compact: bool) {
-        let style = self.view.smeter_style;
+        let style = self.ui_settings.smeter_style;
         let shown = if compact { style.compact() } else { style };
+        let mut picked = None;
         crate::chrome::module_bare_flush_h(ui, w, h, |ui| {
             let resp = smeter::show(ui, self.meters.as_ref(), shown).on_hover_text(if compact {
                 "Click to cycle meter face: bar / trace"
@@ -1594,9 +1669,12 @@ impl SdroxideApp {
                 "Click to cycle meter face: needle / bar / trace"
             });
             if resp.clicked() {
-                self.view.smeter_style = if compact { style.next_compact() } else { style.next() };
+                picked = Some(if compact { style.next_compact() } else { style.next() });
             }
         });
+        if let Some(style) = picked {
+            self.set_smeter_style(style);
+        }
     }
 
     /// Combined VFO + RIT/XIT box: the VFO A/B utility chips on top, with the
@@ -2157,6 +2235,14 @@ impl SdroxideApp {
         self.rx_gains().first().cloned()
     }
 
+    /// Whether the SQL rail drives the *radio's* squelch rather than the
+    /// engine's own gate — true on a transceiver that hands us audio it has
+    /// already squelched, which is the only front end where the software gate
+    /// cannot reach what is muting the operator.
+    fn rig_squelch(&self) -> bool {
+        self.caps.as_ref().is_some_and(|c| c.commands_squelch)
+    }
+
     /// The device rate the front end is streaming, and the deepest decimation
     /// it has the bandwidth for. `None` on a radio with no IQ to decimate — a
     /// CAT rig on a sound card — and on one already streaming so narrow a span
@@ -2348,24 +2434,50 @@ impl SdroxideApp {
         // noise chips, then mute and record, the two that act on the finished
         // audio rather than on the level.
         crate::chrome::control_row(ui, narrow, |ui| {
-            let mut sql = self.state.rx[0].squelch_db;
             ui.label("SQL");
-            if crate::chrome::slider(
-                ui,
-                Slider::new(&mut sql, sdroxide_types::SQUELCH_OPEN_DB..=-30.0)
-                    .show_value(true)
-                    .custom_formatter(|v, _| {
-                        if v <= (sdroxide_types::SQUELCH_OPEN_DB + 1.0) as f64 {
-                            "off".into()
-                        } else {
-                            format!("{v:.0}")
-                        }
+            if self.rig_squelch() {
+                // The radio's own gate, on the radio's own scale. The dBFS rail
+                // below would be a control that does nothing here: what the
+                // sound card receives has already been through the rig's
+                // squelch, so a threshold on this side can close further on
+                // what got through and can never open what was shut out
+                // (issue #192).
+                let mut sql = self.state.rig_squelch;
+                if crate::chrome::slider(
+                    ui,
+                    Slider::new(&mut sql, 0.0..=1.0).show_value(true).custom_formatter(|v, _| {
+                        if v <= 0.001 { "open".into() } else { format!("{:.0}%", v * 100.0) }
                     }),
-            )
-            .changed()
-            {
-                self.state.rx[0].squelch_db = sql; // optimistic echo
-                cmds.push(Command::SetSquelch { rx: RxId::Main, db: sql });
+                )
+                .on_hover_text(
+                    "The radio's own squelch, sent over the control link. This is the \
+                     gate the audio actually passes through — the software one would only \
+                     close further on what the rig already let by.",
+                )
+                .changed()
+                {
+                    self.state.rig_squelch = sql; // optimistic echo
+                    cmds.push(Command::SetRigSquelch { frac: sql });
+                }
+            } else {
+                let mut sql = self.state.rx[0].squelch_db;
+                if crate::chrome::slider(
+                    ui,
+                    Slider::new(&mut sql, sdroxide_types::SQUELCH_OPEN_DB..=-30.0)
+                        .show_value(true)
+                        .custom_formatter(|v, _| {
+                            if v <= (sdroxide_types::SQUELCH_OPEN_DB + 1.0) as f64 {
+                                "off".into()
+                            } else {
+                                format!("{v:.0}")
+                            }
+                        }),
+                )
+                .changed()
+                {
+                    self.state.rx[0].squelch_db = sql; // optimistic echo
+                    cmds.push(Command::SetSquelch { rx: RxId::Main, db: sql });
+                }
             }
             for &c in &chips[lifted..] {
                 self.rx_chip(ui, cmds, c, narrow);
@@ -2540,6 +2652,17 @@ impl SdroxideApp {
                         format!("DRM: {}. Click for the broadcast's details", d.service.label)
                     }
                     Some(_) if decoding => "DRM is decoding — click for the details".to_string(),
+                    // Locked and reading the multiplex, and silent: the one
+                    // dark-chip state that is not a signal problem.
+                    Some(d) if d.locked && !d.service.codec_supported => match d.service.codec {
+                        Some(c) => format!(
+                            "DRM: {} — locked, but its {} audio cannot be decoded here. \
+                             Click for what is missing",
+                            d.summary(),
+                            c.label()
+                        ),
+                        None => format!("DRM: {} — click for the decoder's state", d.summary()),
+                    },
                     Some(d) => format!("DRM: {} — click for the decoder's state", d.summary()),
                     None => "DRM — click for the decoder's state".to_string(),
                 };
@@ -2780,6 +2903,143 @@ impl SdroxideApp {
                 ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
                 self.sub_controls(ui, cmds, false, extra);
             });
+        });
+    }
+
+    /// Whether two coherent aerials are being combined into the span on
+    /// screen — a LimeSDR's two chains, an RSPduo's two tuners. The source
+    /// says so; nothing here has to know which board it is.
+    fn has_diversity(&self) -> bool {
+        self.caps.as_ref().is_some_and(|c| c.diversity)
+    }
+
+    /// The filter's settings, from the radio's own configuration.
+    ///
+    /// Fetched here rather than waiting for the settings dialog to be opened:
+    /// these controls are on the strip precisely so that nobody has to open
+    /// it. One read of one small file, once, on a radio that has a filter.
+    fn div_cfg(&mut self) -> Option<(DiversityMode, f32, bool)> {
+        if self.radio_cfg.is_none() {
+            self.radio_cfg = self.ctrl.radio_config();
+        }
+        let cfg = self.radio_cfg.as_ref()?;
+        match cfg.backend {
+            sdroxide_types::Backend::Lime => {
+                Some((cfg.lime.aux.mode, cfg.lime.aux.rate, cfg.lime.aux.frozen))
+            }
+            sdroxide_types::Backend::SdrPlay => {
+                Some((cfg.sdrplay.duo.mode, cfg.sdrplay.duo.rate, cfg.sdrplay.duo.frozen))
+            }
+            // Every other interface with a second receiver keeps them apart.
+            _ => None,
+        }
+    }
+
+    /// Change the filter and remember the change.
+    ///
+    /// Two messages, and both are wanted: the pseudo-gain reaches the running
+    /// filter now, and the configuration is what it comes back as after a
+    /// reconnect. Saving without reopening is exactly what the settings
+    /// dialog's own live controls do.
+    fn div_edit(&mut self, cmds: &mut Vec<Command>, element: &str, db: f64) {
+        cmds.push(Command::SetGain { dir: Direction::Rx, element: element.to_string(), db });
+        // A restart is momentary — there is nothing about it to remember.
+        if element == DIV_RESET_ELEMENT {
+            return;
+        }
+        let Some(cfg) = self.radio_cfg.as_mut() else { return };
+        let (mode, rate, frozen) = match cfg.backend {
+            sdroxide_types::Backend::Lime => {
+                let a = &mut cfg.lime.aux;
+                (&mut a.mode, &mut a.rate, &mut a.frozen)
+            }
+            sdroxide_types::Backend::SdrPlay => {
+                let d = &mut cfg.sdrplay.duo;
+                (&mut d.mode, &mut d.rate, &mut d.frozen)
+            }
+            _ => return,
+        };
+        match element {
+            DIV_MODE_ELEMENT => {
+                *mode = if db >= 0.5 { DiversityMode::Combine } else { DiversityMode::Cancel }
+            }
+            DIV_RATE_ELEMENT => *rate = db as f32,
+            DIV_FREEZE_ELEMENT => *frozen = db >= 0.5,
+            _ => return,
+        }
+        cmds.push(Command::SetRadioConfig { cfg: Box::new(cfg.clone()), reopen: false });
+    }
+
+    /// The DIV box: the diversity filter, on the strip because it is worked
+    /// while listening (issue #165).
+    fn div_module(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, w: f32) {
+        let extra = (w - div_rows_w(ui)).clamp(0.0, RAIL_STRETCH_MAX);
+        crate::chrome::module_bare_h(ui, w, crate::chrome::MODULE_TALL_H, |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
+                ui.spacing_mut().slider_width = STRIP_RAIL_W + extra;
+                self.div_controls(ui, cmds, false);
+            });
+        });
+    }
+
+    /// The diversity filter's controls — the body of the DIV box, and of the
+    /// DIV menu. See [`crate::chrome::control_row`] for `narrow`.
+    ///
+    /// Which way it combines, how fast it chases, and holding it: the three
+    /// an operator reaches for with the waterfall in front of them. Everything
+    /// else about the filter — how many taps, what the second aerial's gain
+    /// is — is set once and left, and stays in Settings → Radio.
+    fn div_controls(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, narrow: bool) {
+        let Some((mode, rate, frozen)) = self.div_cfg() else { return };
+        crate::chrome::control_row(ui, narrow, |ui| {
+            ui.label(RichText::new("DIV").size(11.0).strong());
+            // A cycling chip rather than a combo, for the same reason as the
+            // AGC chip: a combo inside a menu opens a second popup layer, and
+            // clicking it counts as "outside" and closes the menu it was
+            // opened from. Two settings is hardly a walk.
+            let combine = mode == DiversityMode::Combine;
+            if crate::chrome::chip(ui, combine, DIV_MODE_LABELS[usize::from(combine)])
+                .on_hover_text(
+                    "What the second aerial is for — click to swap.\n\n\
+                     CANCEL subtracts it from the first, in the gain, phase and delay that \
+                     make a local noise source line up on both: the DSP form of a \
+                     noise-cancelling phaser. COMBINE adds the two in the phase that \
+                     reinforces, weighted by how well each hears — diversity reception, \
+                     which fills in fades.",
+                )
+                .clicked()
+            {
+                self.div_edit(cmds, DIV_MODE_ELEMENT, f64::from(u8::from(!combine)));
+            }
+            if crate::chrome::chip(ui, frozen, "HOLD")
+                .on_hover_text(
+                    "Stop the filter moving. Reach for this the moment a null appears: a \
+                     filter left adapting will re-aim itself at whatever becomes loudest, \
+                     which on a quiet band is the station you are listening to.",
+                )
+                .clicked()
+            {
+                self.div_edit(cmds, DIV_FREEZE_ELEMENT, f64::from(u8::from(!frozen)));
+            }
+            if crate::chrome::chip(ui, false, "RESTART")
+                .on_hover_text("Zero the filter and find the null again.")
+                .clicked()
+            {
+                self.div_edit(cmds, DIV_RESET_ELEMENT, 1.0);
+            }
+        });
+        crate::chrome::control_row(ui, narrow, |ui| {
+            ui.label("Adapt").on_hover_text(
+                "How fast the filter chases: slow and steady at the left, converging inside \
+                 a fraction of a second and visibly hunting at the right. Start fast to find \
+                 the null, then HOLD it.",
+            );
+            let mut v = rate;
+            if crate::chrome::slider(ui, Slider::new(&mut v, 0.0..=1.0).show_value(false)).changed()
+            {
+                self.div_edit(cmds, DIV_RATE_ELEMENT, f64::from(v));
+            }
         });
     }
 
@@ -3038,23 +3298,158 @@ impl SdroxideApp {
         });
     }
 
+    /// Whether the digital transmit-audio level is the live control for what is
+    /// on the air — and so whether the strip should offer it (issue #186).
+    ///
+    /// Three things have to hold, and each rules out a rail that would do
+    /// nothing:
+    ///
+    /// - the radio modulates what we send it (a CAT rig on its sound card, a
+    ///   FLEX, an Icom on its network port). Where we modulate it ourselves the
+    ///   modulator and Drive own the level and this is never consulted;
+    /// - the mode transmits through the digi engine at all;
+    /// - and for CW, that the rig is keyed as audio. With its own keyer sending,
+    ///   CW leaves as text over the control port and never touches the card.
+    ///
+    /// Not gated on the mode being *digital*: RADE is, and its microphone is
+    /// the payload, so it keeps the mic rail and reaches this one from the TX
+    /// menu instead — see [`Self::tx_controls`].
+    fn digi_tx_level_applies(&self) -> bool {
+        digi_tx_level_applies_to(self.state.rx[0].mode, self.caps.as_ref())
+    }
+
+    /// The mode's transmit-audio level as the strip should draw it, in dB.
+    fn digi_tx_level_db(&self) -> f32 {
+        sdroxide_types::tx_level_db(self.digi_cfg_edit.tx_level_for(self.state.rx[0].mode))
+    }
+
+    /// Send a level the operator has just set, and keep the local copy in step
+    /// so the rail does not snap back before the engine's echo arrives.
+    ///
+    /// Gated on `digi_cfg_seeded` like every other write to this configuration:
+    /// before the first status the local copy is `DigiConfig::default()`, and a
+    /// command built from it would be a level nobody asked for.
+    fn set_digi_tx_level(&mut self, db: f32, cmds: &mut Vec<Command>) {
+        if !self.digi_cfg_seeded {
+            return;
+        }
+        let mode = self.state.rx[0].mode;
+        let level = sdroxide_types::tx_level_from_db(db);
+        self.digi_cfg_edit.set_tx_level(mode, level);
+        cmds.push(Command::SetDigiTxLevel { mode, level });
+    }
+
+    /// The hover that explains the transmit-audio level wherever it is drawn.
+    fn digi_tx_level_hover(&self) -> &'static str {
+        if self.state.rx[0].mode.is_fm_carrier() {
+            "Deviation: how far this mode's burst swings a radio that modulates \
+             it itself. An FM transmitter turns audio level into frequency swing \
+             and has no ALC to catch it, so full scale into a data input set for \
+             voice over-deviates — which sounds completely normal to a listener \
+             and decodes for nobody.\n\nKept per mode, so a deviation set for \
+             1200 baud packet never lands on FT8."
+        } else {
+            "Transmit audio: how hard this mode drives the modulator of a radio \
+             that modulates what we send it — a CAT rig on its sound card, a \
+             FLEX, an Icom on its network port. Bring it down until the rig's \
+             ALC is barely moving and set the power at the radio; ALC riding on \
+             a constant-envelope digital mode is what splatters.\n\nDrive is \
+             not this control: on these radios Drive reaches the rig's power \
+             register and never touches its audio.\n\nKept per mode — FT8, \
+             RTTY, PSK and MCW each keep their own."
+        }
+    }
+
+    /// The transmit-audio level: label + rail + dB readout, laid out like Drive.
+    fn tx_digi_level(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let mut db = self.digi_tx_level_db();
+        ui.label("TX audio");
+        if crate::chrome::slider(
+            ui,
+            Slider::new(&mut db, sdroxide_types::TX_AUDIO_LEVEL_MIN_DB..=0.0)
+                .show_value(true)
+                .custom_formatter(|v, _| format!("{v:.0} dB")),
+        )
+        .on_hover_text(self.digi_tx_level_hover())
+        .changed()
+        {
+            self.set_digi_tx_level(db, cmds);
+        }
+    }
+
+    /// The transmit-audio level as a vertical rail, in the mic rail's place.
+    ///
+    /// Its caption is its readout rather than a name: the level in dB, which is
+    /// the number the operator is trying to see. The control it replaces was a
+    /// drag-value in a dialog most digital modes cannot even open, and being
+    /// unable to see the figure is half of what issue #186 reported.
+    fn tx_digi_level_vertical(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let mut db = self.digi_tx_level_db();
+        let hover = self.digi_tx_level_hover();
+        let mut set = None;
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new(format!("{db:.0} dB")).size(10.5));
+            // The rail takes whatever height the caption left it.
+            ui.spacing_mut().slider_width = (ui.available_height() - 2.0).max(24.0);
+            if crate::chrome::slider(
+                ui,
+                Slider::new(&mut db, sdroxide_types::TX_AUDIO_LEVEL_MIN_DB..=0.0)
+                    .vertical()
+                    .show_value(false),
+            )
+            .on_hover_text(hover)
+            .changed()
+            {
+                set = Some(db);
+            }
+        });
+        if let Some(db) = set {
+            self.set_digi_tx_level(db, cmds);
+        }
+    }
+
     /// The transmit controls as the TX menu shows them: the keyer and the
     /// levels, in the order the box draws them. PTT is on the strip already;
     /// TUNE rides with the caller (see [`Self::tx_menu`]). See
     /// [`crate::chrome::control_row`] for `narrow`.
     fn tx_controls(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, narrow: bool) {
+        // Both levels where both apply, unlike the condensed box: this is a
+        // list with room to grow, so there is no reason to make RADE — the one
+        // mode that has a use for each — choose between them.
+        //
+        // Mic stays wherever the box would still be showing it, which is what
+        // keeps the two surfaces saying the same thing. It is inert in a
+        // digital mode whatever the radio is, but only where the level rail
+        // stands in its place has anything replaced it; dropping it in the menu
+        // and not in the box would just be the same control missing from one of
+        // the two places it lives.
+        let level = self.digi_tx_level_applies();
+        let mic = self.state.rx[0].mode.allows_voice_keyer() || !level;
         crate::chrome::control_row(ui, narrow, |ui| {
             self.tx_keyer_chip(ui);
             self.tx_drive(ui, cmds);
             self.tx_tune_level(ui, cmds);
-            self.tx_mic(ui, cmds);
+            if mic {
+                self.tx_mic(ui, cmds);
+            }
+            if level {
+                self.tx_digi_level(ui, cmds);
+            }
         });
     }
 
     /// The condensed TX box's natural width — [`tx_rows_w_for`] with the
     /// voice keyer's presence read off the current mode.
     fn tx_rows_w(&self, ui: &egui::Ui) -> f32 {
-        tx_rows_w_for(ui, self.state.rx[0].mode.allows_voice_keyer())
+        tx_rows_w_for(ui, self.state.rx[0].mode.allows_voice_keyer(), self.tx_side_col_w())
+    }
+
+    /// What the condensed TX box's right-hand column costs: the transmit-audio
+    /// rail where it applies, else the mic rail. Exactly one of the two is
+    /// drawn, so the box pays for one of them.
+    fn tx_side_col_w(&self) -> f32 {
+        if self.digi_tx_level_applies() { TX_LEVEL_COL_W } else { TX_MIC_COL_W }
     }
 
     /// The condensed TX box, keyed by what each row transmits: PTT beside the
@@ -3065,9 +3460,11 @@ impl SdroxideApp {
     /// width the packer granted.
     fn tx_condensed(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, w: f32) {
         let keyer = self.state.rx[0].mode.allows_voice_keyer();
+        let level = self.digi_tx_level_applies();
+        let side_w = self.tx_side_col_w();
         let (fixed1, fixed2) = tx_rows_fixed_w(ui, keyer);
         let inner = w - 2.0 * crate::chrome::MODULE_MARGIN_X - 4.0;
-        let rows_w = inner - TX_MIC_GAP - TX_MIC_COL_W;
+        let rows_w = inner - TX_MIC_GAP - side_w;
         let (rail1, rail2) =
             ((rows_w - fixed1).max(STRIP_RAIL_W), (rows_w - fixed2).max(STRIP_RAIL_W));
         crate::chrome::module_bare_h(ui, w, crate::chrome::MODULE_TALL_H, |ui| {
@@ -3085,10 +3482,22 @@ impl SdroxideApp {
                     self.tx_tune_level(ui, cmds);
                 });
             });
-            // The mic rail stands apart from the rows' readouts, so it reads
+            // The side rail stands apart from the rows' readouts, so it reads
             // as its own control rather than a fourth element of the rows.
+            //
+            // One rail, not two. In a digital mode the mic gain reaches nothing
+            // — the microphone is drained and discarded, and only the voice
+            // paths ever scale it — so the level rail takes its place rather
+            // than crowding a box of fixed height with a dead control beside a
+            // live one. Flipping USB to FT8 and watching the rail change is
+            // also how an operator finds this at all, which is the other half
+            // of issue #186.
             ui.add_space(TX_MIC_GAP - MODULE_ROW_SPACING);
-            self.tx_mic_vertical(ui, cmds);
+            if level {
+                self.tx_digi_level_vertical(ui, cmds);
+            } else {
+                self.tx_mic_vertical(ui, cmds);
+            }
         });
     }
 
@@ -3225,17 +3634,17 @@ impl SdroxideApp {
         }
     }
 
-    /// The chips that pick what the main view draws — the condensed Display
-    /// box's top row, and the head of the DISP menu's row. `extra` stretches
-    /// each chip past its label; the popup passes 0, which draws exactly the
-    /// chip it always drew.
+    /// The solar view and the chips that pick what the panadapter draws — the
+    /// condensed Display box's top row, and the head of the DISP menu's row.
+    /// `extra` stretches each chip past its label; the popup passes 0, which
+    /// draws exactly the chip it always drew.
     ///
     /// `narrow` marks the menu, which cannot open SPEC's popup — a popup
     /// opened from a popup counts as a click outside the first and closes it,
-    /// exactly as for SKIM and FFT below — so the menu leaves the chip out
-    /// here and [`Self::display_controls`] inlines the layer chips instead.
+    /// exactly as for SKIM and FFT below — so the menu leaves the chip out here
+    /// and [`Self::display_controls`] inlines its contents instead.
     fn display_view_chips(&mut self, ui: &mut egui::Ui, narrow: bool, extra: f32) {
-        let [fit, peak, spec, wide] = DISPLAY_VIEW_CHIPS;
+        let [_, spec, wide] = DISPLAY_VIEW_CHIPS;
         // Only a front end with a full-band lane has ever sent one of these, so
         // its presence is what says the strip is on offer at all — there is no
         // capability flag for it, and inventing one would mean a wire-format
@@ -3244,28 +3653,7 @@ impl SdroxideApp {
         // A phone draws the waterfall alone, so the two chips that choose what
         // else is drawn have nothing to control there.
         let picks_layers = !crate::layout::tier(ui.ctx()).waterfall_only();
-        // Lit while the floor/ceiling are kept fitted by themselves. Switching
-        // it on fits immediately, which is also how a one-off fit is asked for:
-        // click it off and on again.
-        if chip_stretched(ui, self.view.auto_fit, fit, extra)
-            .on_hover_text(
-                "Keep the floor/ceiling set for best waterfall contrast — eased back into place \
-                 on a band change, after a pan or zoom, and when the levels drift. Switch it on \
-                 to fit at once; switch it off to keep the levels where you set them.",
-            )
-            .clicked()
-        {
-            self.view.auto_fit = !self.view.auto_fit;
-            if self.view.auto_fit {
-                self.fit_levels_now(ui.input(|i| i.time));
-            }
-        }
-        if chip_stretched(ui, self.view.peak_hold, peak, extra)
-            .on_hover_text("Decaying peak-hold trace")
-            .clicked()
-        {
-            self.view.peak_hold = !self.view.peak_hold;
-        }
+        self.solar_button(ui, extra);
         if picks_layers && !narrow {
             self.layers_button(ui, spec, extra);
         }
@@ -3305,8 +3693,7 @@ impl SdroxideApp {
                 ui.set_opacity(alpha);
                 crate::chrome::window_body_bg(ui);
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                crate::chrome::menu_caption(ui, "Layers");
-                self.layer_chips(ui);
+                self.panadapter_controls(ui);
             });
         if let Some(r) = &resp {
             crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, alpha);
@@ -3316,34 +3703,160 @@ impl SdroxideApp {
         }
     }
 
-    /// One chip per panadapter layer, switched independently — spectrum,
-    /// waterfall, both, or neither. Switching both off is a display in its own
-    /// right and not a state to be talked out of: the panadapter is not drawn
-    /// at all, a mode with an operating panel gives it the whole height, and
-    /// this chip in the Display module is the way back.
+    /// The SPEC popup's body, and what the DISP menu inlines in its place:
+    /// everything the panadapter is drawn by, in two boxes — one for the
+    /// spectrum line across the top, one for the waterfall under it — so each
+    /// setting sits with the half of the picture it changes.
+    ///
+    /// The two switches are labelled SHOW … rather than named after their
+    /// layer: lit-means-drawn only reads as a switch once you already know
+    /// what the chip does, and one of the four displays they reach — both off,
+    /// no panadapter at all — is not a place to arrive at by guessing.
+    /// Reaching it deliberately stays allowed, and is not a state to be talked
+    /// out of: a mode with an operating panel gives it the whole height, and
+    /// this popup is the way back.
+    ///
+    /// The detail and the two speeds are this screen's own preferences rather
+    /// than the radio's ([`sdroxide_types::UiSettings`]), which is why they are
+    /// written and persisted here instead of going out as a [`Command`].
+    /// Everything that reads them picks them up again next frame, the engine's
+    /// spectrum config among it.
     ///
     /// Its own function because the DISP menu has to inline it rather than
     /// open it as a popup, for the reason given on [`Self::skimmer_controls`].
-    fn layer_chips(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let (spec_on, wf_on) = (self.view.spectrum_visible(), self.view.waterfall_visible());
-            if crate::chrome::chip(ui, spec_on, "SPECTRUM")
-                .on_hover_text("The spectrum line above the waterfall")
-                .clicked()
-            {
-                self.view.set_spectrum_visible(!spec_on);
+    fn panadapter_controls(&mut self, ui: &mut egui::Ui) {
+        // A phone draws the waterfall alone: there is no spectrum line to
+        // switch on, to peak-hold, or to slow down, so its box is left out —
+        // and the detail row, which sizes both layers, moves into the box that
+        // is still there rather than going with it.
+        let picks_layers = !crate::layout::tier(ui.ctx()).waterfall_only();
+        let w = panadapter_group_w(ui);
+        let mut cfg = self.ui_settings;
+        if picks_layers {
+            crate::chrome::menu_group(ui, "Spectrum", w, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let on = self.view.spectrum_visible();
+                    if crate::chrome::chip(ui, on, "SHOW SPECTRUM")
+                        .on_hover_text(
+                            "Draw the spectrum line across the top of the panadapter. \
+                             Switched off, the waterfall takes the whole height.",
+                        )
+                        .clicked()
+                    {
+                        self.view.set_spectrum_visible(!on);
+                    }
+                    if crate::chrome::chip(ui, self.view.peak_hold, "PEAK HOLD")
+                        .on_hover_text(
+                            "Trace the highest level each column has reached over the live \
+                             line, decaying back down — what the band did while you were \
+                             looking elsewhere",
+                        )
+                        .clicked()
+                    {
+                        self.view.peak_hold = !self.view.peak_hold;
+                    }
+                });
+                speed_row(
+                    ui,
+                    "reaction",
+                    &mut cfg.spectrum_speed,
+                    &Speed::ALL,
+                    "How quickly the spectrum line follows the band. Slower averages more \
+                     frames into each other: a steadier line, and a weak carrier that stands \
+                     still long enough to read. The waterfall is not touched by it — those \
+                     rows get every frame either way.",
+                );
+                self.detail_row(ui, &mut cfg);
+            });
+        }
+        crate::chrome::menu_group(ui, "Waterfall", w, |ui| {
+            if picks_layers {
+                let on = self.view.waterfall_visible();
+                if crate::chrome::chip(ui, on, "SHOW WATERFALL")
+                    .on_hover_text(
+                        "Draw the scrolling waterfall below the spectrum. Switched off, the \
+                         spectrum line takes the whole height.",
+                    )
+                    .clicked()
+                {
+                    self.view.set_waterfall_visible(!on);
+                }
             }
-            if crate::chrome::chip(ui, wf_on, "WATERFALL")
-                .on_hover_text("The scrolling waterfall below the spectrum")
-                .clicked()
-            {
-                self.view.set_waterfall_visible(!wf_on);
+            speed_row(
+                ui,
+                "scroll",
+                &mut cfg.waterfall_speed,
+                &Speed::WATERFALL,
+                "How fast the waterfall scrolls, in lines a second: Slow 5, Medium 28, Fast \
+                 56, Faster 112, Fastest 224. The engine clocks these itself, so the two \
+                 fastest are real detail rather than the same line drawn twice — as far as \
+                 the receiver can feed them: a line can never show more than one transform, \
+                 and a narrow front end makes only a few dozen a second. They cost history, \
+                 since the waterfall keeps a fixed number of lines — 73 seconds at Medium, 9 \
+                 at Fastest.",
+            );
+            if !picks_layers {
+                self.detail_row(ui, &mut cfg);
             }
+        });
+        if cfg != self.ui_settings {
+            self.ui_settings = cfg;
+            crate::app::persist::persist_ui_settings(&self.ui_settings);
+        }
+    }
+
+    /// The detail row of [`Self::panadapter_controls`]: how many columns the
+    /// panadapter is asked for, and the width that choice actually comes out at
+    /// on this machine.
+    ///
+    /// A step this renderer cannot hold is drawn greyed with its reason on the
+    /// hover rather than left out. A ladder with rungs missing reads as a bug;
+    /// a ladder with rungs out of reach reads as the truth.
+    fn detail_row(&self, ui: &mut egui::Ui, cfg: &mut sdroxide_types::UiSettings) {
+        let report = self.detail_report(cfg.spectrum_detail);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("detail").size(10.0).color(crate::theme::CYAN_DIM()))
+                .on_hover_text(
+                    "How many columns the panadapter and its waterfall are drawn with. Auto \
+                     reads this machine's renderer and the size of the panadapter and picks \
+                     the most it can carry — a 4K screen wants 4096. Every column is a byte \
+                     in every frame, so a client connected to a remote station pays for the \
+                     detail on its link: 4096 columns at 60 fps is about a quarter of a \
+                     megabyte a second, twice the standard width.",
+                );
+            for d in SpectrumDetail::ALL {
+                let over = d.columns().is_some_and(|c| c > report.ceiling);
+                let r = crate::chrome::chip_enabled(
+                    ui,
+                    !over,
+                    cfg.spectrum_detail == d,
+                    &detail_chip_label(d),
+                );
+                if over {
+                    r.on_disabled_hover_text(&report.reason);
+                } else {
+                    let hint = match d.columns() {
+                        None => "Read this machine and this screen, take the most they can \
+                                 carry, and follow them if they change"
+                            .to_string(),
+                        Some(c) => format!("{c} columns, whatever Auto would have picked here"),
+                    };
+                    if r.on_hover_text(hint).clicked() {
+                        cfg.spectrum_detail = d;
+                    }
+                }
+            }
+            ui.label(
+                RichText::new(format!("{} columns", report.chosen))
+                    .size(10.0)
+                    .color(Color32::from_gray(150)),
+            )
+            .on_hover_text("The width in force right now, whatever the row above asks for");
         });
     }
 
-    /// The solar, skimmer and FFT chips — the condensed Display box's bottom
-    /// row, and the tail of the DISP menu's row.
+    /// The level fit, the skimmers and the FFT popup — the condensed Display
+    /// box's bottom row, and the tail of the DISP menu's row.
     fn display_tool_chips(
         &mut self,
         ui: &mut egui::Ui,
@@ -3351,8 +3864,23 @@ impl SdroxideApp {
         narrow: bool,
         extra: f32,
     ) {
-        let [_, _, fft] = DISPLAY_TOOL_CHIPS;
-        self.solar_button(ui, extra);
+        let [fit, _, fft] = DISPLAY_TOOL_CHIPS;
+        // Lit while the floor/ceiling are kept fitted by themselves. Switching
+        // it on fits immediately, which is also how a one-off fit is asked for:
+        // click it off and on again.
+        if chip_stretched(ui, self.view.auto_fit, fit, extra)
+            .on_hover_text(
+                "Keep the floor/ceiling set for best waterfall contrast — eased back into place \
+                 on a band change, after a pan or zoom, and when the levels drift. Switch it on \
+                 to fit at once; switch it off to keep the levels where you set them.",
+            )
+            .clicked()
+        {
+            self.view.auto_fit = !self.view.auto_fit;
+            if self.view.auto_fit {
+                self.fit_levels_now(ui.input(|i| i.time));
+            }
+        }
         // In a box these two hang off chips of their own. A menu inlines
         // them below instead: a popup opened from a popup counts as a click
         // outside the first and closes it.
@@ -3392,11 +3920,11 @@ impl SdroxideApp {
             self.display_tool_chips(ui, cmds, narrow, 0.0);
         });
         if narrow {
-            // A phone draws the waterfall alone, so there are no layers to pick.
-            if !crate::layout::tier(ui.ctx()).waterfall_only() {
-                crate::chrome::menu_caption(ui, "Layers");
-                self.layer_chips(ui);
-            }
+            // Unconditional, unlike the SPEC chip above, which a phone leaves
+            // out: the panadapter box holds more than the layer switches it is
+            // the only home for, and it hides the switches itself where there
+            // are no layers to pick.
+            self.panadapter_controls(ui);
             crate::chrome::menu_caption(ui, "Skimmers");
             self.skimmer_controls(ui, cmds);
             self.spectrum_controls(ui);
@@ -3407,7 +3935,7 @@ impl SdroxideApp {
     /// rows plus the box margins.
     fn display_rows_w(&self, ui: &egui::Ui) -> f32 {
         let row1: &[&str] =
-            if self.wide_frame.is_some() { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..3] };
+            if self.wide_frame.is_some() { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..2] };
         chip_row_w(ui, row1).max(chip_row_w(ui, &DISPLAY_TOOL_CHIPS))
             + 2.0 * crate::chrome::MODULE_MARGIN_X
     }
@@ -3417,7 +3945,7 @@ impl SdroxideApp {
     fn display_condensed(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, w: f32) {
         let inner = w - 2.0 * crate::chrome::MODULE_MARGIN_X;
         let row1: &[&str] =
-            if self.wide_frame.is_some() { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..3] };
+            if self.wide_frame.is_some() { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..2] };
         let extra1 = ((inner - chip_row_w(ui, row1)) / row1.len() as f32).max(0.0);
         let extra2 = ((inner - chip_row_w(ui, &DISPLAY_TOOL_CHIPS))
             / DISPLAY_TOOL_CHIPS.len() as f32)
@@ -3456,8 +3984,25 @@ impl SdroxideApp {
         // layer, and clicking it counts as "outside" and closes this one.
         crate::chrome::menu_caption(ui, "FFT size");
         ui.horizontal_wrapped(|ui| {
-            for n in [2048u32, 4096, 8192, 16384, 32768] {
-                if crate::chrome::chip(ui, self.view.fft_size == n, format!("{n}")).clicked() {
+            let cols = self.panadapter_bins();
+            for n in [2048u32, 4096, 8192, 16384, 32768, 65536, 131_072] {
+                // Past the panadapter's own width a bigger transform stops
+                // adding columns and starts sharpening the ones there are —
+                // each is the maximum of more bins, so a weak carrier stands
+                // further out of the noise. Worth saying, because "no more
+                // detail" is what it looks like otherwise.
+                let hint = if n <= cols {
+                    format!("{n} bins across the whole stream — one per column, or finer")
+                } else {
+                    format!(
+                        "{n} bins pooled into the panadapter's {cols} columns: \
+                         sharper signals, not more of them"
+                    )
+                };
+                if crate::chrome::chip(ui, self.view.fft_size == n, format!("{n}"))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
                     self.view.fft_size = n;
                 }
             }
@@ -3753,15 +4298,17 @@ const SYSTEM_CHIPS: [&str; 11] = [
 /// to be revisited together.
 const SYSTEM_SPLIT: usize = 6;
 
-/// The Display box's view-layer chips (top row); the last is drawn only for a
-/// front end with a full-band lane.
-const DISPLAY_VIEW_CHIPS: [&str; 4] = ["FIT", "PEAK", "SPEC", "WIDE"];
+/// The Display box's top row: the solar view, then the chips that choose what
+/// the panadapter draws — the last of those only on a front end with a
+/// full-band lane. Peak hold used to stand here too and now lives in SPEC's
+/// popup, beside the spectrum line it is drawn over. Visible to the app module
+/// because [`SdroxideApp::solar_button`], which draws its first chip, lives in
+/// `app::solar`.
+pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WIDE"];
 
-/// The Display box's tool chips (bottom row): the solar view, the skimmers,
-/// and the FFT/levels popup. Read by the measurement and by each chip's own
-/// draw site — [`SdroxideApp::solar_button`] included, which is why it is
-/// visible to the app module.
-pub(in crate::app) const DISPLAY_TOOL_CHIPS: [&str; 3] = ["☀ 3D", "SKIM", "FFT"];
+/// The Display box's bottom row: the level fit, the skimmers, and the
+/// FFT/levels popup. Read by the measurement and by each chip's own draw site.
+const DISPLAY_TOOL_CHIPS: [&str; 3] = ["FIT", "SKIM", "FFT"];
 
 /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
 /// labels, so the chips match and the level blocks beside them start on the
@@ -3792,14 +4339,27 @@ fn tx_rows_fixed_w(ui: &egui::Ui, keyer: bool) -> (f32, f32) {
 }
 
 /// The condensed TX box's natural width: the wider of its rows' fixed parts
-/// plus a rail at [`STRIP_RAIL_W`], the mic column and its padding, the box
+/// plus a rail at [`STRIP_RAIL_W`], the side column and its padding, the box
 /// margins, and a few points of rounding slack.
-fn tx_rows_w_for(ui: &egui::Ui, keyer: bool) -> f32 {
+///
+/// `side_col_w` is [`TX_MIC_COL_W`] or [`TX_LEVEL_COL_W`] — exactly one of the
+/// two rails is drawn, and they are not the same width.
+/// [`SdroxideApp::digi_tx_level_applies`] over the two things that decide it, so
+/// the rule can be tested without an application around it.
+fn digi_tx_level_applies_to(mode: Mode, caps: Option<&sdroxide_types::DeviceCaps>) -> bool {
+    let Some(caps) = caps else { return false };
+    if !(caps.audio_mode || caps.tx_audio) || !mode.takes_digi_tx_audio() {
+        return false;
+    }
+    mode != Mode::Cw || caps.cw_audio_keyed
+}
+
+fn tx_rows_w_for(ui: &egui::Ui, keyer: bool, side_col_w: f32) -> f32 {
     let (row1, row2) = tx_rows_fixed_w(ui, keyer);
     row1.max(row2)
         + STRIP_RAIL_W
         + TX_MIC_GAP
-        + TX_MIC_COL_W
+        + side_col_w
         + 2.0 * crate::chrome::MODULE_MARGIN_X
         + 4.0
 }
@@ -3880,6 +4440,28 @@ impl RxChip {
     fn width(self, ui: &egui::Ui) -> f32 {
         crate::chrome::chip_width(ui, self.width_label(), None)
     }
+}
+
+/// The width the DIV box wants: its two rows, whichever is wider.
+///
+/// A free function of nothing but the style, like [`tx_rows_fixed_w`], so
+/// `the_diversity_box_fits_its_rows` can price it without an app around it.
+/// The mode chip is measured at its longer label, because it cycles between
+/// the two and a box that shrank under the shorter one would move everything
+/// beside it every time the filter was switched.
+fn div_rows_w(ui: &egui::Ui) -> f32 {
+    let gap = MODULE_ROW_SPACING;
+    let top = crate::chrome::text_width(ui, "DIV", egui::FontId::proportional(11.0))
+        + gap
+        + crate::chrome::chip_width(ui, DIV_MODE_LABELS[1], None)
+        + gap
+        + crate::chrome::chip_width(ui, "HOLD", None)
+        + gap
+        + crate::chrome::chip_width(ui, "RESTART", None);
+    let bottom = crate::chrome::text_width(ui, "Adapt", egui::TextStyle::Body.resolve(ui.style()))
+        + gap
+        + STRIP_RAIL_W;
+    top.max(bottom) + 2.0 * crate::chrome::MODULE_MARGIN_X
 }
 
 /// The RX box's chip run in a mode: the six every mode carries, then whatever
@@ -3975,9 +4557,18 @@ fn rx_rows(ui: &egui::Ui, gain: bool, decim: bool, agc_off: bool, mode: Mode) ->
     }
 
     // Filter / noise: the squelch rail and its readout — the deepest threshold
-    // is the longest it reads, "off" at the bottom of the range being shorter.
+    // is the longest the dBFS one reads, "off" at the bottom of the range being
+    // shorter. Priced against the *radio's* readout as well, and always: which
+    // of the two rails is drawn is the front end's answer, and a front end can
+    // be swapped under a running window (`Engine::adopt_source`), so a box
+    // sized for one of them would change width when the operator applied a new
+    // interface.
     let sql_readout = format!("{:.0}", sdroxide_types::SQUELCH_OPEN_DB);
-    let noise = label("SQL") + g + rail + g + value_field_w(ui, &sql_readout);
+    let noise = label("SQL")
+        + g
+        + rail
+        + g
+        + value_field_w(ui, &sql_readout).max(value_field_w(ui, "100%"));
 
     // Then the run itself. Each chip is priced at its widest label, so the box
     // does not breathe as a decode comes and goes (see [`RxChip::width_label`])
@@ -4045,6 +4636,82 @@ fn readout_for(state: &RadioState, tx_on: bool) -> (f64, Option<Color32>, f64) {
         return (dial + offset, Some(crate::theme::ALERT()), offset);
     }
     (dial, None, 0.0)
+}
+
+/// One row of the SPEC popup: a caption naming the setting, then a chip per
+/// step of it. Chips rather than a `ComboBox` for the reason
+/// [`SdroxideApp::spectrum_controls`] gives — a combo opened inside a popup
+/// counts as a click outside it and closes it under the operator.
+///
+/// The caption carries the explanation, and each chip only what that step
+/// does: the caption is where an operator who does not yet know what the row
+/// is for will point, and a paragraph repeated on every chip is a paragraph
+/// nobody reads.
+fn speed_row(ui: &mut egui::Ui, caption: &str, value: &mut Speed, steps: &[Speed], hint: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(caption).size(10.0).color(crate::theme::CYAN_DIM()))
+            .on_hover_text(hint);
+        for step in steps {
+            if crate::chrome::chip(ui, value == step, step.label().to_uppercase()).clicked() {
+                *value = *step;
+            }
+        }
+    });
+}
+
+/// What a [`SpectrumDetail`] step is called on its chip: the column count it
+/// asks for, which is the whole of what it means. Read off `columns()` rather
+/// than written out again, so the chips can never disagree with the widths.
+fn detail_chip_label(d: SpectrumDetail) -> String {
+    match d.columns() {
+        Some(c) => c.to_string(),
+        None => "AUTO".to_string(),
+    }
+}
+
+/// The width both of the SPEC popup's boxes are drawn at: the widest row
+/// either of them holds, or as much of it as a popup may be wide. Priced
+/// rather than left to auto-size, so the two come out matching — a short box
+/// beside a long one reads as an unfinished one — and so their rows wrap
+/// against a width the layout knows. The rows are measured with one gap per
+/// chip rather than one between them, which leaves the margin that keeps the
+/// longest row off the edge.
+fn panadapter_group_w(ui: &egui::Ui) -> f32 {
+    let gap = ui.spacing().item_spacing.x;
+    let chips = |labels: &[&str]| -> f32 {
+        labels.iter().map(|l| crate::chrome::chip_width(ui, l, None) + gap).sum()
+    };
+    let caption =
+        |t: &str| crate::chrome::text_width(ui, t, egui::FontId::proportional(10.0)) + gap;
+    let speeds = |steps: &[Speed]| -> f32 {
+        steps
+            .iter()
+            .map(|s| crate::chrome::chip_width(ui, &s.label().to_uppercase(), None) + gap)
+            .sum()
+    };
+    let detail: f32 = SpectrumDetail::ALL
+        .iter()
+        .map(|d| crate::chrome::chip_width(ui, &detail_chip_label(*d), None) + gap)
+        .sum();
+    let widest = [
+        chips(&["SHOW SPECTRUM", "PEAK HOLD"]),
+        caption("reaction") + speeds(&Speed::ALL),
+        caption("scroll") + speeds(&Speed::WATERFALL),
+        caption("detail") + detail + caption("8192 columns"),
+    ]
+    .into_iter()
+    .fold(0.0f32, f32::max);
+    // Never wider than a menu's body, which is capped at the screen and at 430
+    // points whatever the screen (see `chrome::menu_popup`). The DISP menu
+    // inlines these boxes, and a box priced past its body would be *clipped*
+    // there rather than wrapped — on a phone, whose touch metrics make every
+    // chip roomier, the detail row is exactly the row that would go over.
+    // Taken from the screen rather than from `available_width`, which inside
+    // an auto-sizing popup is the width the popup came out as last frame: a
+    // box measured against that shrinks the popup, which shrinks the next
+    // measurement, and it never grows back.
+    let cap = (ui.ctx().content_rect().width() - 40.0).clamp(140.0, 414.0);
+    widest.min(cap)
 }
 
 /// The natural width of a row of chips inside a condensed box: each chip at
@@ -4200,8 +4867,11 @@ fn band_mode_menu(
             // DRM belongs with the analog modes rather than under "Digital"
             // below: that heading is the modes the digi engine decodes and
             // transmits, and DRM is a broadcast to listen to — a demodulator,
-            // like WFM beside it.
+            // like WFM beside it. ADS-B is here for the same reason: a
+            // receive-only signal to point the radio at, with no transmitter
+            // and nothing the digi engine touches.
             Mode::Drm,
+            Mode::Adsb,
             Mode::Digu,
             Mode::Digl,
             Mode::Dsb,
@@ -4899,7 +5569,7 @@ mod tests {
             let (ctx, input) = desktop_ctx();
             let _ = ctx.run_ui(input, |ui| {
                 let row1: &[&str] =
-                    if has_wide { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..3] };
+                    if has_wide { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..2] };
                 let room = chip_row_w(ui, row1).max(chip_row_w(ui, &DISPLAY_TOOL_CHIPS));
                 for row in [row1, &DISPLAY_TOOL_CHIPS[..]] {
                     ui.horizontal(|ui| {
@@ -4916,6 +5586,88 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// The DIV box's rows have to fit the width it reserved, at both of the
+    /// mode chip's labels — the box is planned once and the chip cycles under
+    /// it, so pricing the shorter one would push RESTART off the right-hand
+    /// edge every time the filter was switched to cancelling.
+    #[test]
+    fn the_diversity_box_fits_its_rows() {
+        let (ctx, input) = desktop_ctx();
+        let _ = ctx.run_ui(input, |ui| {
+            let room = div_rows_w(ui) - 2.0 * crate::chrome::MODULE_MARGIN_X;
+            for label in DIV_MODE_LABELS {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = MODULE_ROW_SPACING;
+                    ui.label(RichText::new("DIV").size(11.0).strong());
+                    crate::chrome::chip(ui, false, label);
+                    crate::chrome::chip(ui, false, "HOLD");
+                    crate::chrome::chip(ui, false, "RESTART");
+                    let took = ui.min_rect().width();
+                    assert!(took <= room + 0.5, "the {label} row took {took} of {room}");
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = MODULE_ROW_SPACING;
+                ui.spacing_mut().slider_width = STRIP_RAIL_W;
+                ui.label("Adapt");
+                let mut v = 0.5f32;
+                crate::chrome::slider(ui, Slider::new(&mut v, 0.0..=1.0).show_value(false));
+                let took = ui.min_rect().width();
+                assert!(took <= room + 0.5, "the adaptation row took {took} of {room}");
+            });
+        });
+    }
+
+    /// Which of the two rails the transmit box offers, and why each answer is
+    /// the one that does something (issue #186).
+    ///
+    /// The rail replaces the mic one, so getting this wrong does not merely add
+    /// a useless control — it takes away a working one, or leaves a dead one in
+    /// place of the control the operator went looking for.
+    #[test]
+    fn the_transmit_audio_rail_appears_where_it_does_something() {
+        use sdroxide_types::DeviceCaps;
+
+        // A CAT rig on its sound card: it modulates what we hand it.
+        let cat = DeviceCaps { tx_audio: true, ..DeviceCaps::default() };
+        // The same rig, with CW going out through its own keyer instead.
+        let cat_rig_keyer = DeviceCaps { tx_audio: true, ..DeviceCaps::default() };
+        let cat_mcw = DeviceCaps { tx_audio: true, cw_audio_keyed: true, ..DeviceCaps::default() };
+        // An SDR we modulate ourselves: the modulator and Drive own the level.
+        let sdr = DeviceCaps::default();
+
+        // The modes the report is about.
+        for mode in [Mode::Ft8, Mode::Rtty, Mode::Psk, Mode::Aprs, Mode::Rade] {
+            assert!(
+                digi_tx_level_applies_to(mode, Some(&cat)),
+                "{mode:?} transmits through this level and was not offered it"
+            );
+            assert!(
+                !digi_tx_level_applies_to(mode, Some(&sdr)),
+                "{mode:?} was offered a level that does nothing on an SDR"
+            );
+        }
+
+        // Voice and the receive-only modes never reach it.
+        for mode in [Mode::Usb, Mode::Lsb, Mode::Nfm, Mode::Am, Mode::Wefax, Mode::Drm] {
+            assert!(
+                !digi_tx_level_applies_to(mode, Some(&cat)),
+                "{mode:?} was offered a level it never uses"
+            );
+        }
+
+        // CW only where the sound card is in the path. With the rig's own keyer
+        // sending, CW leaves as text over the control port.
+        assert!(digi_tx_level_applies_to(Mode::Cw, Some(&cat_mcw)), "MCW was not offered a level");
+        assert!(
+            !digi_tx_level_applies_to(Mode::Cw, Some(&cat_rig_keyer)),
+            "a rig-keyed CW mode was offered an audio level it never touches"
+        );
+
+        // And before the capabilities have arrived, nothing is offered.
+        assert!(!digi_tx_level_applies_to(Mode::Ft8, None));
     }
 
     /// Lay the condensed TX box's rows and mic column out with real widgets at
@@ -5002,10 +5754,35 @@ mod tests {
                         ui.min_rect().width()
                     })
                     .inner;
+                // The other rail that can stand in that column (issue #186),
+                // measured at the widest caption it can show — its caption is
+                // its readout, so this is the figure `TX_LEVEL_COL_W` has to
+                // cover.
+                let mut db = sdroxide_types::TX_AUDIO_LEVEL_MIN_DB;
+                let level_w = ui
+                    .vertical(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(RichText::new(format!("{db:.0} dB")).size(10.5));
+                            ui.spacing_mut().slider_width = 45.0;
+                            crate::chrome::slider(
+                                ui,
+                                Slider::new(&mut db, sdroxide_types::TX_AUDIO_LEVEL_MIN_DB..=0.0)
+                                    .vertical()
+                                    .show_value(false),
+                            );
+                        });
+                        ui.min_rect().width()
+                    })
+                    .inner;
                 let (room1, room2) = (fixed1 + rail, fixed2 + rail);
                 assert!(row1 <= room1 + 0.5, "keyer={keyer}: row 1 took {row1} of {room1}");
                 assert!(row2 <= room2 + 0.5, "keyer={keyer}: row 2 took {row2} of {room2}");
                 assert!(mic_w <= TX_MIC_COL_W + 0.5, "the mic column took {mic_w}");
+                assert!(
+                    level_w <= TX_LEVEL_COL_W + 0.5,
+                    "the transmit-audio column took {level_w} of {TX_LEVEL_COL_W}"
+                );
             });
         }
     }
@@ -5172,7 +5949,11 @@ mod tests {
             + 4.0;
         let rx =
             rx_rows(ui, false, false, false, mode).w() + 2.0 * crate::chrome::MODULE_MARGIN_X + 4.0;
-        let tx = tx_rows_w_for(ui, mode.allows_voice_keyer());
+        // A CAT rig modulates our audio, so a digital mode there draws the
+        // transmit-audio rail rather than the mic one — and it is the wider of
+        // the two.
+        let side = if mode.takes_digi_tx_audio() { TX_LEVEL_COL_W } else { TX_MIC_COL_W };
+        let tx = tx_rows_w_for(ui, mode.allows_voice_keyer(), side);
         let display = chip_row_w(ui, &DISPLAY_VIEW_CHIPS).max(chip_row_w(ui, &DISPLAY_TOOL_CHIPS))
             + 2.0 * crate::chrome::MODULE_MARGIN_X;
         let system = system_rows_w(ui);

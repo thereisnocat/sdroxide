@@ -67,6 +67,17 @@ pub struct SpotManager {
     rep_freq: u64,
     rep_tx: bool,
     rep_visible: bool,
+
+    /// Whether this manager may hold the station's long-lived feeds.
+    ///
+    /// A station has one DX cluster login, one RBN reader and one FreeDV
+    /// Reporter session, not one per radio, so only the primary engine's
+    /// manager brings them up. The configuration is still applied everywhere —
+    /// callsign lookups and logbook uploads are per-request work any radio can
+    /// do, and they need the credentials — which is exactly why this cannot be
+    /// a matter of simply not calling [`SpotManager::set_config`]: settings
+    /// applied from a second radio's window have to reach it too.
+    station: bool,
 }
 
 impl SpotManager {
@@ -97,7 +108,18 @@ impl SpotManager {
             rep_freq: 0,
             rep_tx: false,
             rep_visible: false,
+            station: true,
         }
+    }
+
+    /// Declare that this manager does *not* run the station's feeds — the
+    /// engine that owns it is one of the extra radios, not the primary.
+    ///
+    /// Configuration still applies; only the long-lived logins and sockets stay
+    /// away. Call before the first [`SpotManager::set_config`]: anything already
+    /// running keeps running.
+    pub fn stand_down(&mut self) {
+        self.station = false;
     }
 
     /// Apply a new configuration, (re)starting only the feeds whose settings
@@ -397,6 +419,9 @@ impl SpotManager {
     }
 
     fn rebuild_cluster(&mut self) {
+        if !self.station {
+            return;
+        }
         self.cluster = None; // drop stops the thread
         self.by_kind.remove(&SpotKind::DxCluster);
         if self.cfg.cluster.enabled && !self.cfg.cluster.host.trim().is_empty() {
@@ -424,6 +449,9 @@ impl SpotManager {
     /// take back. Switching RBN off stops new evidence arriving and lets what
     /// is there decay, which is what switching off a source should do.
     fn rebuild_rbn(&mut self) {
+        if !self.station {
+            return;
+        }
         self.rbn = None; // drop stops the thread
         if !self.cfg.rbn.enabled || self.cfg.rbn.host.trim().is_empty() {
             return;
@@ -446,6 +474,9 @@ impl SpotManager {
     }
 
     fn rebuild_pota(&mut self) {
+        if !self.station {
+            return;
+        }
         self.pota = None;
         self.by_kind.remove(&SpotKind::Pota);
         if self.cfg.pota.enabled {
@@ -462,6 +493,9 @@ impl SpotManager {
     }
 
     fn rebuild_sota(&mut self) {
+        if !self.station {
+            return;
+        }
         self.sota = None;
         self.by_kind.remove(&SpotKind::Sota);
         if self.cfg.sota.enabled {
@@ -478,6 +512,9 @@ impl SpotManager {
     }
 
     fn rebuild_psk(&mut self) {
+        if !self.station {
+            return;
+        }
         self.psk = None;
         self.by_kind.remove(&SpotKind::PskReporter);
         if self.cfg.psk.enabled {
@@ -498,6 +535,9 @@ impl SpotManager {
     /// the operator identity: without a callsign there is no receiver to
     /// report, and without a grid the reports can't be placed on the map.
     fn rebuild_psk_upload(&mut self) {
+        if !self.station {
+            return;
+        }
         self.psk_upload = None; // drop flushes what's pending and stops the thread
         if !self.cfg.psk.report || self.op_call.is_empty() || self.op_grid.is_empty() {
             return;
@@ -519,6 +559,9 @@ impl SpotManager {
     /// to say and nobody to say it as, so neither half starts — silently, since
     /// a station that has not filled in its callsign yet is not an error.
     fn rebuild_wspr(&mut self) {
+        if !self.station {
+            return;
+        }
         // Dropping the uploader flushes what is pending first.
         self.wspr_upload = None;
         self.wspr_heard_us = None;
@@ -541,6 +584,9 @@ impl SpotManager {
     }
 
     fn rebuild_freedv(&mut self) {
+        if !self.station {
+            return;
+        }
         self.freedv = None; // drop stops the thread and closes the session
         self.by_kind.remove(&SpotKind::FreeDv);
         if !self.cfg.freedv_reporter.enabled {
@@ -612,5 +658,30 @@ mod tests {
         off.rbn.enabled = false;
         m.set_config(off);
         assert!(m.rbn.is_none(), "the reader outlived being switched off");
+    }
+
+    /// A station has one DX cluster login and one FreeDV Reporter session
+    /// however many radios it has — but every radio's manager still needs the
+    /// credentials, because a callsign lookup or a logbook upload is per-request
+    /// work whichever radio asks for it. Settings applied from the second
+    /// radio's window used to open a duplicate of every feed.
+    #[test]
+    fn a_stood_down_manager_takes_the_config_but_opens_no_sockets() {
+        let mut m = SpotManager::new();
+        m.stand_down();
+        m.set_operator("OE1TEST", "JN88");
+
+        let mut cfg = NetworkConfig::default();
+        cfg.cluster.enabled = true;
+        cfg.cluster.host = "cluster.example".into();
+        cfg.freedv_reporter.enabled = true;
+        cfg.qrz.user = "OE1TEST".into();
+        m.set_config(cfg);
+
+        assert!(m.rbn.is_none(), "a second radio must not open its own RBN reader");
+        assert!(m.cluster.is_none(), "nor a second DX cluster login");
+        assert!(m.freedv.is_none(), "nor a second FreeDV Reporter session");
+        assert_eq!(m.cfg.qrz.user, "OE1TEST", "but the credentials must still have landed");
+        assert!(m.cfg.cluster.enabled, "and the config is what a settings window reads back");
     }
 }

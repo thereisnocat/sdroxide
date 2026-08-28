@@ -130,3 +130,26 @@ fn the_other_digital_modes_stay_on_usb_everywhere() {
         filter_after(&[tune(7_074_000.0), Command::SetMode { rx: RxId::Main, mode: Mode::Ft8 }]);
     assert!(lo >= 0.0 && hi > 0.0, "FT8 on 40 m should stay USB, got {lo}..{hi} Hz");
 }
+
+/// The VHF twin has no sideband at all. `Mode::SstvFm` frequency-modulates the
+/// carrier, so its passband straddles the dial and nothing about it follows the
+/// band it is on (issue #192).
+///
+/// Driven across the very boundary that flips `Mode::Sstv` above — entered on
+/// 20 m, tuned down to 40 m — because that is the move a shared `is_sstv()`
+/// test would get wrong, and it is one engine rather than a band's worth.
+#[test]
+fn sstv_on_fm_keeps_its_channel_across_the_sideband_boundary() {
+    let want = Mode::SstvFm.default_filter();
+    assert!(want.0 < 0.0 && want.1 > 0.0, "an FM channel straddles the dial: {want:?}");
+
+    let sstv_fm = Command::SetMode { rx: RxId::Main, mode: Mode::SstvFm };
+    let (lo, hi) = filter_after(&[tune(SSTV_20M), sstv_fm, tune(SSTV_40M)]);
+    assert_eq!((lo, hi), want, "an FM channel followed a sideband rule");
+
+    // And the table underneath says the same on every band the sideband mode
+    // does mirror on, plus the VHF/UHF image channels it is actually for.
+    for dial in [1_890_000.0, SSTV_80M, SSTV_40M, 50_510_000.0, 144_500_000.0, 433_400_000.0] {
+        assert_eq!(Mode::SstvFm.default_filter_at(dial), want, "at {:.3} MHz", dial / 1e6);
+    }
+}

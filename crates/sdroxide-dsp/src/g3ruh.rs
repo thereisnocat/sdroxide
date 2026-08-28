@@ -152,7 +152,11 @@ impl G3ruhTx {
                 match self.bits.pop_front() {
                     Some(b) => {
                         self.level = if self.scram.scramble(b) { SYMBOL } else { -SYMBOL };
-                        self.left = self.spb;
+                        // Accumulated rather than assigned, for the reason
+                        // `AfskTx::next_block` gives at length: assigning
+                        // rounds every symbol up to a whole sample and puts the
+                        // over on the air at `rate / spb.ceil()` baud.
+                        self.left += self.spb;
                     }
                     None => {
                         self.scratch.push(0.0);
@@ -310,6 +314,33 @@ mod tests {
         assert!(peak <= G3RUH_TX_PEAK, "shaped baseband peaks at {peak}");
         // …and not so far inside it that the declaration is throwing power away.
         assert!(peak > G3RUH_TX_PEAK * 0.9, "declared {G3RUH_TX_PEAK}, measured only {peak}");
+    }
+
+    /// The 9600 baud half of issue #180's fault, and the same rule: the symbol
+    /// clock keeps its fractional remainder, because a software radio's channel
+    /// rate is rarely a whole number of samples a symbol. See
+    /// `AfskTx::next_block`.
+    #[test]
+    fn the_baud_rate_survives_a_rate_that_is_not_whole_samples_a_symbol() {
+        for rate in [48_000.0, 50_000.0, 44_642.857_142_857_145, 62_500.0] {
+            let mut tx = G3ruhTx::new(rate);
+            let bits = 4_000usize;
+            tx.push_bits(&vec![true; bits]);
+            let mut sent = 0usize;
+            loop {
+                let mut blk = [0.0f32; 480];
+                let n = tx.next_block(&mut blk);
+                if n == 0 {
+                    break;
+                }
+                sent += n;
+                if tx.idle() {
+                    break;
+                }
+            }
+            let got = rate / (sent as f64 / bits as f64);
+            assert!((got / BAUD - 1.0).abs() < 0.001, "{rate} Hz: {got:.1} baud against {BAUD}");
+        }
     }
 
     /// Scramble then descramble is the identity, once the register has filled.

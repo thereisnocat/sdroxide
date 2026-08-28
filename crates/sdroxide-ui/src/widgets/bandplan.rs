@@ -341,10 +341,14 @@ const PANEL_MAX_FRAC: f32 = 0.10;
 /// `panel_below` — a mode panel (FT8's decodes, JS8's chat, CW's keyboard …) is
 /// taking part of the height, so the strip has to fit in [`PANEL_MAX_FRAC`] of
 /// what is left or step aside.
-pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect, panel_below: bool) {
+///
+/// Returns how deep the strip ended up, so that whatever else annotates the
+/// same edge — the memory marks — can stack inwards from it instead of over
+/// it. Zero when it stood aside.
+pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect, panel_below: bool) -> f32 {
     let span = view.span();
     if span <= 0.0 || wf.height() < 24.0 {
-        return;
+        return 0.0;
     }
     let (lo, hi) = (view.view_lo_hz, view.view_hi_hz);
 
@@ -367,7 +371,7 @@ pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect, panel_below: bool) {
 
     let total_h = base_h + n_digi as f32 * digi_h;
     if panel_below && total_h > wf.height() * PANEL_MAX_FRAC {
-        return;
+        return 0.0;
     }
     // The allocation row sits outermost, on the waterfall's oldest edge, with
     // the digi rows stacked inwards from it.
@@ -407,4 +411,5 @@ pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect, panel_below: bool) {
         if flip { strip_bottom } else { strip_top },
         Stroke::new(1.0, theme::scope().line),
     );
+    total_h
 }

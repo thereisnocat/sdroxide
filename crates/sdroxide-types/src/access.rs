@@ -134,6 +134,32 @@ impl RemoteServer {
     }
 }
 
+/// What a station says when it turned an answer down: those credentials are
+/// not the ones it wants.
+///
+/// Deliberately the same sentence whether the username or the password was
+/// wrong — which one it was is exactly what an attacker with a list of
+/// callsigns wants told.
+pub const AUTH_REFUSED: &str = "username or password not accepted";
+
+/// What a station says when it did not judge an answer at all, because another
+/// one was already being judged.
+///
+/// A station allows one attempt at a time, so this is the ordinary answer to
+/// several radios of one station signing in together — and it is *not* a
+/// refusal: nothing was compared, and the same answer offered again a moment
+/// later is as good as it ever was. Named here rather than written out at each
+/// end so the client can tell the two apart by identity instead of by guessing
+/// at a sentence; a client that cannot (an older one, or a station that
+/// phrases it differently) falls back to asking the operator, which is what it
+/// did before.
+pub const AUTH_BUSY: &str = "another sign-in is being checked — try again";
+
+/// Whether a rejection reason is the "come back" above rather than a verdict.
+pub fn is_auth_busy(why: &str) -> bool {
+    why == AUTH_BUSY
+}
+
 /// Where a connection stands with the server's sign-in challenge.
 ///
 /// Reported by [`RadioController::auth_phase`](crate::RadioController::auth_phase)
@@ -186,6 +212,16 @@ mod tests {
         // ...and the empty username still has to match, so a client that sends
         // one cannot be treated as having sent none.
         assert!(!want.accepts("op", "hunter2"));
+    }
+
+    /// The two answers a station gives are not the same answer, and the client
+    /// acts on the difference: a refusal throws a stored password away, a
+    /// "come back" must not.
+    #[test]
+    fn a_busy_station_is_not_a_refusal() {
+        assert!(is_auth_busy(AUTH_BUSY));
+        assert!(!is_auth_busy(AUTH_REFUSED));
+        assert!(!is_auth_busy(""));
     }
 
     #[test]

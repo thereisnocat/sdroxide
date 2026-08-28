@@ -65,15 +65,17 @@ fn a_wrong_password_is_reported_as_such_rather_than_timing_out() {
 
 #[test]
 fn an_unknown_model_still_connects_but_gets_no_menu_writes() {
-    // An IC-9700's CI-V address, which is not in the table.
+    // An IC-7100's CI-V address. It has no network port at all, so it will
+    // never be in the table — unlike the IC-9700 that used to stand in here,
+    // which is now in it.
     let sim = Sim::start(SimOptions {
-        civ_address: 0xA2,
-        radio_name: "IC-9700".into(),
+        civ_address: 0x88,
+        radio_name: "IC-7100".into(),
         ..Default::default()
     })
     .unwrap();
     let dev = connect(&sim, |_| {}).expect("connect");
-    assert_eq!(dev.info().civ_address, 0xA2);
+    assert_eq!(dev.info().civ_address, 0x88);
     assert_eq!(dev.info().model.name, "Icom (LAN)");
     assert!(dev.info().model.lan_mod_input.is_none());
     assert!(dev.info().model.lan_afif_select.is_none());
@@ -200,6 +202,40 @@ fn the_scope_sweep_arrives_whole_the_way_a_lan_icom_sends_it() {
     let bins = &s[21..21 + 475];
     assert!(bins.iter().all(|&b| b <= 160), "the scale runs 0..160");
     assert!(bins.iter().any(|&b| b > 100), "the simulator plants a peak");
+}
+
+/// Issue #183. The IC-7760's CI-V reference gives its LAN sweep as a single
+/// 704-byte division — 689 points on a 0 ~ C8 scale — where the IC-7300
+/// generation sends 475 on 0 ~ A0. The byte count is the manufacturer's own,
+/// so asserting it pins every field ahead of the waveform data as well.
+#[test]
+fn an_ic7760_sends_the_704_byte_sweep_its_reference_guide_documents() {
+    let sim = Sim::start(SimOptions {
+        civ_address: 0xB2,
+        radio_name: "IC-7760".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let dev = connect(&sim, |_| {}).expect("connect");
+    dev.send_civ(vec![0xfe, 0xfe, 0xb2, 0xe0, 0x27, 0x11, 0x01, 0xfd]);
+
+    let mut sweep = None;
+    wait_for("a scope sweep", Duration::from_secs(3), || {
+        while let Ok(f) = dev.civ_frames().try_recv() {
+            if f.get(4) == Some(&0x27) && f.get(5) == Some(&0x00) {
+                sweep = Some(f);
+                return true;
+            }
+        }
+        false
+    });
+    let s = sweep.unwrap();
+    // FE FE E0 B2 27 00 | 704 bytes of payload | FD
+    assert_eq!(s.len(), 6 + 704 + 1);
+    assert_eq!(s[8], 0x01, "of 1 — over LAN the sweep is not fragmented");
+    let bins = &s[21..21 + 689];
+    assert!(bins.iter().all(|&b| b <= 200), "the scale runs 0..200");
+    assert!(bins.iter().any(|&b| b > 160), "and the peak goes above where an IC-705 tops out");
 }
 
 #[test]
@@ -356,11 +392,12 @@ fn test_connection_reports_the_radio_in_one_line() {
 
 #[test]
 fn an_unknown_model_says_the_operator_must_set_the_menu_item() {
-    // A radio whose `1A 05` numbering is not in the table — the IC-705's is,
-    // so it would no longer produce the note this test is about.
+    // A radio whose `1A 05` numbering is not in the table. It has to be one
+    // with no network port — every Icom that can actually reach this backend
+    // is now in the table, which is the point of the table.
     let sim = Sim::start(SimOptions {
-        civ_address: 0xA2,
-        radio_name: "IC-9700".into(),
+        civ_address: 0x88,
+        radio_name: "IC-7100".into(),
         ..Default::default()
     })
     .unwrap();

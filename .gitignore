@@ -10,3 +10,11 @@ crates/sdroxide-web/dist/index.html
 /compile_commands.json
 .cache/
 .vscode/
+
+# Building a vendored crate on its own — `cargo test --manifest-path
+# vendor/<crate>/Cargo.toml`, which is how the patches in there are checked —
+# leaves a target directory and a lock file of its own beside it. Neither is
+# part of the vendored source: the workspace resolves those crates through
+# `[patch.crates-io]` and its own `Cargo.lock`.
+/vendor/*/target
+/vendor/*/Cargo.lock

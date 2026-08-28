@@ -56,7 +56,9 @@ const FLOOR_EVERY: u32 = (FFT_SIZE / HOP) as u32;
 const PEAK_SPACING: usize = 8; // ~±390 Hz at 49 Hz/bin
 /// Bins within this of a track's center are "the same signal" (spawn tolerance).
 const TRACK_TOL: i64 = 3;
-/// Guard band around DC (the window center) to ignore, in bins.
+/// Guard band around the front end's DC spike to ignore, in bins. Where that
+/// lands in this window is [`CwSkimmer::dc_off_hz`] — the window centre only
+/// while the two coincide.
 const DC_GUARD: i64 = 3;
 /// Frames a track must be detected before it's reported (rejects noise blips;
 /// one dit at 20 WPM is ~12 frames at this hop).
@@ -195,6 +197,9 @@ pub struct CwSkimmer {
     /// The operator's visible waterfall window in absolute Hz, or `None` for
     /// the whole skim window. See [`CwSkimmer::set_view`].
     view: Option<(f64, f64)>,
+    /// Where the front end's own DC spike sits in this window, as an offset in
+    /// Hz from its centre. See [`CwSkimmer::set_dc_offset_hz`].
+    dc_off_hz: f64,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     inbuf: Vec<C32>,
@@ -260,6 +265,7 @@ impl CwSkimmer {
             skim_rate,
             skim_center_hz,
             view: None,
+            dc_off_hz: 0.0,
             fft,
             window,
             inbuf: Vec::with_capacity(FFT_SIZE * 4),
@@ -355,6 +361,25 @@ impl CwSkimmer {
         };
         self.tracks.retain(|t| visible(t.bin));
         self.prev_centers.retain(|&c| visible(c));
+    }
+
+    /// Where the front end's own DC spike falls in this window, as an offset in
+    /// Hz from the window centre.
+    ///
+    /// Zero while the window sits on the hardware centre, which is where it
+    /// starts. Once it is placed on the operator's view instead the spike is
+    /// somewhere else inside the window — and the guard has to travel with it,
+    /// or it blinds three bins in the middle of the screen, which on a
+    /// panadapter centred on the dial is exactly the signal being listened to.
+    pub fn set_dc_offset_hz(&mut self, off_hz: f64) {
+        self.dc_off_hz = off_hz;
+    }
+
+    /// Whether a bin offset from the skim center is on the front end's DC
+    /// spike. A spike outside this window simply never matches.
+    fn at_dc(&self, off: i64) -> bool {
+        let bin = (self.dc_off_hz / (self.skim_rate / FFT_SIZE as f64)).round() as i64;
+        (off - bin).abs() < DC_GUARD
     }
 
     /// Whether a bin offset from the skim center is on screen.
@@ -521,7 +546,7 @@ impl CwSkimmer {
         cands.clear();
         for k in 0..n {
             let off = self.offset_bin(k);
-            if off.abs() < DC_GUARD || !self.in_view(off) {
+            if self.at_dc(off) || !self.in_view(off) {
                 continue;
             }
             let p = self.power[k];
@@ -1060,6 +1085,48 @@ mod tests {
             let err = hit.freq_hz - (center + off);
             assert!(err.abs() < 60.0, "{call} spotted {err:+.0} Hz off");
         }
+    }
+
+    /// The blind spot belongs to the front end's DC spike, not to the middle of
+    /// the window.
+    ///
+    /// The two used to be the same place, because the window was pinned to the
+    /// hardware centre. Now that it follows the operator's waterfall they are
+    /// not — and a guard left in the middle of the window would blind three bins
+    /// in the middle of the screen, which on a panadapter centred on the dial is
+    /// exactly the signal being listened to.
+    #[test]
+    fn the_dc_guard_follows_the_front_end_not_the_window() {
+        let rate = 192_000.0;
+        let center = 14_030_000.0;
+        let iq = synth("CQ DE W1AW", 0.0, 20.0, rate, 0.02);
+        // Within a bin: the interpolated carrier lands sub-hertz from the centre,
+        // where the nearest track the notch can leave behind is three bins out.
+        let on_center = |s: &SkimmerSpot| (s.freq_hz - center).abs() < 50.0;
+
+        // The front end is 40 kHz down the window, so that is where the notch
+        // belongs and the station in the middle is read normally.
+        let mut sk = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        sk.set_dc_offset_hz(-40_000.0);
+        feed(&mut sk, &iq);
+        settle(&mut sk);
+        let spots = sk.spots();
+        assert!(
+            spots.iter().any(|s| on_center(s) && s.callsign.as_deref() == Some("W1AW")),
+            "the station on the window centre was not decoded: {spots:?}"
+        );
+
+        // ...and with the spike declared in the middle — a window still sitting
+        // on the hardware centre, which is where one with nobody watching stays
+        // — the same station is inside the notch and is not read at all.
+        let mut pinned = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        feed(&mut pinned, &iq);
+        settle(&mut pinned);
+        let spots = pinned.spots();
+        assert!(
+            !spots.iter().any(on_center),
+            "the guard did not notch the window centre at all: {spots:?}"
+        );
     }
 
     #[test]

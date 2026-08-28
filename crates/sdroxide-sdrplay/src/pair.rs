@@ -167,6 +167,17 @@ impl Pairer {
         self.stamped
     }
 
+    /// Throw both queues away and start pairing from the next blocks.
+    ///
+    /// What a radio letting go of the pair leaves behind: whatever was staged
+    /// belongs to a span nobody is listening to any more, and holding it would
+    /// only make the first block after the next attach a slip.
+    pub(crate) fn restart(&mut self) {
+        self.main.clear();
+        self.aux.clear();
+        self.stalled = false;
+    }
+
     /// Stage one block from one tuner.
     ///
     /// A block that does not continue where that tuner's last one ended means

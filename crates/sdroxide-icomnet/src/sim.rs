@@ -31,8 +31,9 @@ use crate::protocol::{self as proto, AudioCodec, Header, ctrl};
 #[derive(Debug, Clone)]
 pub struct SimOptions {
     pub radio_name: String,
-    /// `0xB6` gives an IC-7300MK2; anything else exercises the unknown-model
-    /// path.
+    /// `0xB6` gives an IC-7300MK2 and `0xB2` an IC-7760 — which is worth
+    /// reaching for, since it is the model whose scope is neither 475 bins nor
+    /// a 0..=160 scale. Anything else exercises the unknown-model path.
     pub civ_address: u8,
     pub username: String,
     pub password: String,
@@ -623,11 +624,19 @@ impl SimRadio {
         f.extend_from_slice(&bcd_freq(self.opts.freq_hz));
         f.extend_from_slice(&bcd_freq(50_000.0)); // ±50 kHz span
         f.push(0x00); // in range
+        // As many bins, on the scale, this model actually sweeps: an IC-7760
+        // sends 689 on a 0..=200 scale where the IC-7300 generation sends 475
+        // on 0..=160. A simulator that always sent the one shape would let a
+        // client hard-code it — see the note in `protocol::Model`.
+        let model = proto::model_for_radio(&self.opts.radio_name, addr);
+        let bins = model.scope_bins as i32;
+        let full = i32::from(model.scope_full_scale);
+        let peak = bins / 2;
         // A noise floor with a peak in the middle, so a client can tell it
         // apart from a flat buffer.
-        for i in 0..475i32 {
-            let v = if (i - 237).abs() < 4 { 150 } else { 20 + i % 7 };
-            f.push(v.clamp(0, 160) as u8);
+        for i in 0..bins {
+            let v = if (i - peak).abs() < 4 { full * 15 / 16 } else { 20 + i % 7 };
+            f.push(v.clamp(0, full) as u8);
         }
         f.push(0xfd);
         self.send_civ(f);

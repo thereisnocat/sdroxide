@@ -396,6 +396,25 @@ pub const SSTV_DIALS: &[(f64, &str, u8)] = &[
     (28_690_000.0, "secondary", mask::ALL),
 ];
 
+/// The VHF/UHF image channels, where analog SSTV rides an FM carrier
+/// ([`crate::Mode::SstvFm`]) rather than a sideband.
+///
+/// ⚠️ Sparse on purpose, like the repeater plan: only channels a published plan
+/// actually names are here. The three Region 1 entries are the IARU R1
+/// VHF/UHF bandplan's own — 50.510 "SSTV" and 144.500 "Image mode centre
+/// (SSTV, Fax…)" in all-mode segments, and 433.400 "SSTV (FM/AFSK)", which
+/// names the modulation outright. Region 2's plan designates no image channel
+/// at all: the ARRL 2 m plan calls 145.50–145.80 "miscellaneous and
+/// experimental modes", and 145.500 inside it is the frequency North American
+/// FM SSTV has settled on in practice rather than one the plan appoints.
+/// Region 3 names none, so none is offered.
+pub const SSTV_FM_DIALS: &[(f64, &str, u8)] = &[
+    (50_510_000.0, "", mask::R1),
+    (144_500_000.0, "", mask::R1),
+    (145_500_000.0, "common practice, not a plan entry", mask::R2),
+    (433_400_000.0, "", mask::R1),
+];
+
 /// The analog-SSTV frequencies in use in `region`, ascending — [`SSTV_DIALS`]
 /// with the region filter applied, for callers that want the frequencies rather
 /// than the picker's annotated channels.
@@ -741,7 +760,14 @@ fn wideband_by_design(mode: crate::Mode) -> bool {
     // VHF packet is a 25 kHz FM channel and belongs nowhere near a narrow-data
     // sub-segment. HF packet is the opposite — 300 baud in a few hundred hertz
     // is narrow data by any measure — so it is deliberately not listed.
-    matches!(mode, crate::Mode::Sstv | crate::Mode::Rifp | crate::Mode::Packet | crate::Mode::Aprs)
+    matches!(
+        mode,
+        crate::Mode::Sstv
+            | crate::Mode::SstvFm
+            | crate::Mode::Rifp
+            | crate::Mode::Packet
+            | crate::Mode::Aprs
+    )
 }
 
 /// The conventional dial frequencies for `mode` in the station's configured
@@ -788,6 +814,7 @@ pub fn digi_channels_for(mode: crate::Mode, region: Region) -> Vec<DigiChannel> 
         Mode::Rtty => tagged(RTTY_DIALS),
         Mode::Fsq => plain(FSQ_DIALS),
         Mode::Sstv => tagged(SSTV_DIALS),
+        Mode::SstvFm => tagged(SSTV_FM_DIALS),
         Mode::Rifp => plain(RIFP_CALLING),
         Mode::Aprs => tagged(APRS_DIALS),
         _ => Vec::new(),

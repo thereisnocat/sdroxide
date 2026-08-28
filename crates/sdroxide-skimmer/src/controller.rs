@@ -27,7 +27,14 @@ struct Iq(Vec<C32>);
 
 /// Control traffic, never dropped.
 enum Ctl {
-    Center(f64),
+    /// Where the skim window now sits, and where the front end's DC spike falls
+    /// inside it. One message rather than two because placing the window
+    /// settles both: the spike is at a fixed frequency, so moving the window
+    /// moves it within the window.
+    Window {
+        center_hz: f64,
+        dc_off_hz: f64,
+    },
     Config(SkimmerSettings),
     View(Option<(f64, f64)>),
     Stop,
@@ -41,7 +48,7 @@ pub struct SkimmerController {
 }
 
 impl SkimmerController {
-    pub fn new(skim_rate: f64, skim_center_hz: f64, cfg: SkimmerSettings) -> Self {
+    pub fn new(skim_rate: f64, skim_center_hz: f64, dc_off_hz: f64, cfg: SkimmerSettings) -> Self {
         let (iq_tx, iq_rx) = bounded::<Iq>(64);
         let (ctl_tx, ctl_rx) = unbounded::<Ctl>();
         let (res_tx, res_rx) = unbounded::<Vec<SkimmerSpot>>();
@@ -58,14 +65,20 @@ impl SkimmerController {
                 let mut cw = CwSkimmer::with_config(skim_rate, skim_center_hz, &cfg);
                 let mut psk = DigiSkimmer::new(SkimmerKind::Psk, skim_rate, skim_center_hz);
                 let mut rtty = DigiSkimmer::new(SkimmerKind::Rtty, skim_rate, skim_center_hz);
+                cw.set_dc_offset_hz(dc_off_hz);
+                psk.set_dc_offset_hz(dc_off_hz);
+                rtty.set_dc_offset_hz(dc_off_hz);
                 let mut since = 0usize;
                 loop {
                     select! {
                         recv(ctl_rx) -> msg => match msg {
-                            Ok(Ctl::Center(hz)) => {
-                                cw.set_center(hz);
-                                psk.set_center(hz);
-                                rtty.set_center(hz);
+                            Ok(Ctl::Window { center_hz, dc_off_hz }) => {
+                                cw.set_center(center_hz);
+                                psk.set_center(center_hz);
+                                rtty.set_center(center_hz);
+                                cw.set_dc_offset_hz(dc_off_hz);
+                                psk.set_dc_offset_hz(dc_off_hz);
+                                rtty.set_dc_offset_hz(dc_off_hz);
                             }
                             Ok(Ctl::Config(next)) => {
                                 // The CW skimmer has settings of its own beyond
@@ -139,9 +152,11 @@ impl SkimmerController {
         let _ = self.iq_tx.try_send(Iq(iq.to_vec()));
     }
 
-    /// Re-center the skim window (band/center change); clears tracks.
-    pub fn set_center(&self, center_hz: f64) {
-        let _ = self.ctl_tx.send(Ctl::Center(center_hz));
+    /// Re-place the skim window: its absolute centre, and where the front end's
+    /// DC spike now falls inside it. A centre that actually moved clears the
+    /// tracks — they were measured against the old axis.
+    pub fn set_window(&self, center_hz: f64, dc_off_hz: f64) {
+        let _ = self.ctl_tx.send(Ctl::Window { center_hz, dc_off_hz });
     }
 
     /// Apply new per-kind enables / squelches to the running worker.

@@ -537,6 +537,23 @@ impl R82xx {
         } else {
             Band::Uhf
         };
+
+        // Take the tracking filter out of circuit on HF. What reaches the tuner
+        // there is the upconverter's output, already filtered on the way in, so
+        // the R828D's own preselector can only add its insertion loss — and a
+        // loss ahead of the LNA comes straight off the noise figure, which is
+        // how a quiet band ends up reading as a wall of hiss. Bypass is
+        // `rf_mux_ploy = 0x40` with no tracking capacitor at all.
+        //
+        // Deliberately *above* the band-change guard below: `set_mux` rewrites
+        // 0x1a and 0x1b from the tracking-filter table on every single tune, so
+        // bypassing once at the band change would survive exactly until the next
+        // nudge of the dial.
+        if band == Band::Hf {
+            self.write_reg_mask(bus, 0x1a, 0x40, 0xc3)?;
+            self.write_reg(bus, 0x1b, 0x00)?;
+        }
+
         if self.band == Some(band) {
             return Ok(());
         }
@@ -767,5 +784,40 @@ mod tests {
         // demodulator's problem, via direct sampling.
         let plain = R82xx::new(Chip::R828D, false, 0);
         assert_eq!(plain.tuned_freq_hz(7_056_158.0), 7_056_158.0);
+    }
+
+    /// The register pair that carries the tracking filter, read out of the
+    /// shadow: `(rf_mux_ploy & 0xc3, tf_c)`. Bypass is `0x40` with no capacitor.
+    fn tracking_filter(t: &R82xx) -> (u8, u8) {
+        let ploy = t.regs[R82xx::shadow_index(0x1a).expect("0x1a is shadowed")] & 0xc3;
+        let tf_c = t.regs[R82xx::shadow_index(0x1b).expect("0x1b is shadowed")];
+        (ploy, tf_c)
+    }
+
+    /// On HF a V4 hears the upconverter's output, not the antenna, so the
+    /// R828D's preselector is pure insertion loss ahead of the LNA — and loss
+    /// there is noise figure, which is what "S9 of hiss with nothing connected"
+    /// is made of. It must be bypassed, and it must *stay* bypassed: `set_mux`
+    /// rewrites both registers from the tracking-filter table on every tune, so
+    /// a bypass applied only when the band changes lasts one dial nudge.
+    #[test]
+    fn a_blog_v4_bypasses_the_tracking_filter_on_every_hf_tune() {
+        let bus = MockBus::healthy();
+        let mut t = R82xx::new(Chip::R828D, true, 0);
+        t.init(&bus).expect("init");
+        t.set_bandwidth(&bus, 8_000_000.0).expect("bandwidth");
+
+        // First tune into HF — the band change.
+        t.set_freq(&bus, 7_056_158.0).expect("freq");
+        assert_eq!(tracking_filter(&t), (0x40, 0x00), "bypassed on entering HF");
+
+        // A second HF dial move, with no band change to trigger the switch.
+        t.set_freq(&bus, 14_236_000.0).expect("freq");
+        assert_eq!(tracking_filter(&t), (0x40, 0x00), "still bypassed after retuning");
+
+        // Above the crossover the tuner really is looking at the antenna
+        // through its own preselector, and the tracking filter belongs in.
+        t.set_freq(&bus, 145_000_000.0).expect("freq");
+        assert_ne!(tracking_filter(&t), (0x40, 0x00), "tracking filter back in circuit on VHF");
     }
 }

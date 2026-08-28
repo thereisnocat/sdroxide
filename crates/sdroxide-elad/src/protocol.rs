@@ -83,6 +83,26 @@ impl Model {
         self == Model::Duo
     }
 
+    /// Whether the host has to load this model's FPGA image before it can
+    /// stream.
+    ///
+    /// The samplers are two halves that come up very differently: the Cypress
+    /// bridge's firmware is in an EEPROM, so an untouched device already
+    /// enumerates, reports its serial and acknowledges the FIFO start — while
+    /// the FPGA behind it is SRAM-configured and empty, so there is no
+    /// down-converter in there to start and the bulk endpoint never produces a
+    /// byte. The FDM-DUO is a radio with its own controller and boots its own.
+    /// See [`crate::fpga`], and issue #178, which is what an unloaded sampler
+    /// looks like from the operator's chair.
+    ///
+    /// Confirmed on the FDM-S2, which is the model ELAD's Linux loader and
+    /// every third-party recipe for it name. The FDM-S1 is included by family —
+    /// same architecture, same bridge, same open sequence — and if it turns out
+    /// not to need one, the cost is a loader run that does nothing.
+    pub fn needs_fpga_load(self) -> bool {
+        matches!(self, Model::S1 | Model::S2)
+    }
+
     /// What this model can hear, in Hz.
     ///
     /// The published coverage rather than the Nyquist limit: an S2 will

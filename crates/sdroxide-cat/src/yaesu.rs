@@ -233,7 +233,8 @@ impl Yaesu {
             | Mode::Dsb
             | Mode::Rifp
             | Mode::Packet
-            | Mode::Aprs => (&[], None),
+            | Mode::Aprs
+            | Mode::SstvFm => (&[], None),
             _ => (self.caps.ssb_widths, narrow.map(|(_, ssb)| ssb)),
         }
     }
@@ -272,10 +273,13 @@ fn mode_digit(m: Mode) -> char {
     match m {
         Mode::Lsb => '1',
         Mode::Cw => '3',
-        Mode::Nfm | Mode::Wfm => '4',
+        // No rig has an ADS-B mode and none ever will: the dial is at
+        // 1090 MHz. Grouped with FM so nothing downstream has to special-case
+        // a mode a radio can neither be put into nor report back.
+        Mode::Nfm | Mode::Wfm | Mode::Adsb => '4',
         // RIFP keys the carrier itself and VHF packet frequency-modulates it:
         // data over FM (DATA-FM), not over a sideband.
-        Mode::Rifp | Mode::Packet | Mode::Aprs => 'A',
+        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm => 'A',
         Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => '5',
         Mode::Digl => '8',
         Mode::Digu

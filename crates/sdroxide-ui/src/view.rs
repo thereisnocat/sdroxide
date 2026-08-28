@@ -2,8 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::widgets::smeter::SmeterStyle;
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewState {
@@ -128,11 +126,6 @@ pub struct ViewState {
     /// the chart itself. User-draggable.
     #[serde(default = "wefax_gallery_default")]
     pub wefax_gallery_fraction: f32,
-    /// Which S-meter face is shown — needle (the default), bar or trace.
-    /// Cycled by clicking the meter. Replaces an older `smeter_analog` bool,
-    /// which a stored blob may still carry; serde drops it and everyone lands
-    /// back on the default face.
-    pub smeter_style: SmeterStyle,
     /// Hellschreiber raster appearance. Client-side rather than in `DigiConfig`
     /// because the panel keeps the raw grays: changing contrast repaints the
     /// whole scrollback, which engine-side shading could never do.
@@ -484,7 +477,6 @@ impl Default for ViewState {
             sstv_tx_fraction: 0.38,
             sstv_gallery_fraction: 0.4,
             wefax_gallery_fraction: wefax_gallery_default(),
-            smeter_style: SmeterStyle::default(),
             hell: HellView::default(),
             solar3d: Solar3dView::default(),
         }
@@ -661,8 +653,6 @@ mod tests {
         assert_eq!(v.view_lo_hz, 14_062_061.420876093, "the zoom survives the upgrade");
         assert_eq!(v.fft_size, 32_768);
         assert_eq!(v.pre_digi_view, None, "the new field falls back to its default");
-        // Everything the blob never mentioned comes from the defaults.
-        assert_eq!(v.smeter_style, ViewState::default().smeter_style);
         // Both of these default *on*, which is the whole point: an added filter
         // array that fell back to `[false; N]` would silently hide every spot
         // for everyone who upgrades, and it would look like the feeds broke.
@@ -672,6 +662,20 @@ mod tests {
         // The layer the SPEC popup added: a blob from before it must come back
         // with the waterfall shown, not hidden.
         assert!(v.waterfall_visible(), "upgrading hid the waterfall");
+    }
+
+    /// The other direction of the same trap: a blob written by a build that
+    /// *did* keep the S-meter face in the view carries a field this struct no
+    /// longer has. Serde must skip it — a hard error here would reset the
+    /// operator's zoom, levels and every panel divider on the version that
+    /// moved the face into `[ui]` (issue #185).
+    #[test]
+    fn a_view_that_still_carries_the_old_smeter_face_loads() {
+        let stored = "(view_lo_hz:14062061.420876093,view_hi_hz:14289352.162287109,\
+                      db_floor:-129.32353,db_ceil:-100.0,fft_size:32768,\
+                      spectrum_fraction:0.17981522,peak_hold:false,smeter_style:Trace)";
+        let v: ViewState = ron::from_str(stored).expect("a view with the old face must parse");
+        assert_eq!(v.fft_size, 32_768, "the rest of the view survived the field moving out");
     }
 
     /// The same trap as the spot filters above, one layer down: a propagation

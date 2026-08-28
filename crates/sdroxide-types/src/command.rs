@@ -708,4 +708,87 @@ pub enum Command {
         to: String,
         text: String,
     },
+
+    /// Packet: call a station in connected mode — a node, a BBS, a peer.
+    ///
+    /// `via` is the operator's string rather than a parsed list, because that
+    /// is what a TNC takes and what a node's own listing prints: callsigns
+    /// separated by commas or spaces, nearest hop first. Parsing it belongs
+    /// where the callsign validation is, engine-side, so a typo comes back as a
+    /// line in the terminal instead of a command that vanishes.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    PacketConnect {
+        call: String,
+        via: String,
+        /// Extended (mod-128) sequence numbers.
+        ext: bool,
+    },
+
+    /// Packet: send one line to the connected station.
+    ///
+    /// A line, not bytes: the terminator is the link's business, because a BBS
+    /// wants a CR and what the operator typed has neither.
+    PacketSend {
+        text: String,
+    },
+
+    /// Packet: hang up. A clean DISC, waited out — not a link dropped on the
+    /// floor for the far end to time out.
+    PacketDisconnect,
+
+    /// Packet: empty the terminal transcript. The link is untouched.
+    PacketTermClear,
+
+    /// Set one mode's transmit-audio level, on a radio that modulates what we
+    /// send it (issue #186). `level` is linear, clamped to
+    /// [`sdroxide_types::TX_AUDIO_LEVEL_MIN`]`..=1.0` engine-side.
+    ///
+    /// [`sdroxide_types::TX_AUDIO_LEVEL_MIN`]: crate::TX_AUDIO_LEVEL_MIN
+    ///
+    /// The mode travels rather than being read off the dial when this arrives,
+    /// even though the engine knows it: this control is a rail an operator
+    /// drags while transmitting, and a mode change landing between the drag and
+    /// the command would write one mode's level onto another's entry. That
+    /// failure is silent, persistent, and corrupts exactly the thing the
+    /// setting exists to hold.
+    ///
+    /// Its own command rather than a whole [`DigiConfig`](crate::DigiConfig)
+    /// through `SetDigiConfig` because a drag emits one of these per frame, and
+    /// the configuration is kilobytes — which a remote client would be sending
+    /// over the wire for the length of every adjustment. That also makes
+    /// `tx_audio_levels` a field with a write route outside `SetDigiConfig`,
+    /// which is what puts it in the engine's `keep_engine_owned`.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetDigiTxLevel {
+        mode: Mode,
+        level: f32,
+    },
+
+    /// Set the *radio's own* squelch threshold, as a `0..1` fraction of its
+    /// scale — `0` open, `1` closed (issue #192).
+    ///
+    /// Not [`Command::SetSquelch`], and the difference is which receiver is
+    /// being quietened. That one is sdroxide's gate on a passband sdroxide
+    /// demodulated, in dBFS. This is a level in the rig, and on a transceiver
+    /// that hands us audio it has already gated it is the only one that can
+    /// open: what reaches the sound card is what the radio let through.
+    ///
+    /// Ignored by a front end with no such control
+    /// ([`crate::DeviceCaps::commands_squelch`]), which is every SDR.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetRigSquelch {
+        frac: f32,
+    },
+
+    /// Set how the ADS-B decoder behaves (issue #160).
+    ///
+    /// The engine persists it to `adsb.json` and echoes it back in
+    /// [`crate::RadioState::adsb`], so there is no apply step and no way for
+    /// the panel's copy and the engine's to drift apart.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetAdsbConfig(crate::AdsbSettings),
 }

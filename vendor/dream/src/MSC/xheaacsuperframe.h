@@ -15,6 +15,9 @@ public:
     virtual unsigned getSuperFrameDurationMilliseconds();
     virtual void getFrame(std::vector<uint8_t>& frame, uint8_t& crc, unsigned i);
 private:
+    /* Drop everything buffered and start again at the next super frame. */
+    void reset();
+
     unsigned numChannels;
     unsigned superFrameSize;
     deque<uint8_t> payload;

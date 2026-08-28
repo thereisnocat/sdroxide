@@ -1,13 +1,28 @@
-//! The handle the rest of the program holds, and the accounting behind it.
+//! The handles the rest of the program holds, and the accounting behind them.
 //!
 //! Same shape as the RTL-SDR and RX-888 backends: a control thread owns the
 //! device session, control goes in over a crossbeam channel, samples come
 //! back out through an `rtrb` ring of interleaved `f32`. The one structural
 //! difference is that samples are not pulled off a USB endpoint here — the
 //! vendor service pushes them into a callback on a thread it owns.
+//!
+//! # One device, one or two streams
+//!
+//! An RSPduo running both tuners is one API session with two of everything
+//! downstream of the ADC, and the two can be separate radios on separate
+//! frequencies (issue #165). So the session and the stream are two objects:
+//! [`SdrPlayDevice`] owns the thread and the device, and each
+//! [`SdrPlayHandle`] is one tuner's stream on it — its own ring, its own
+//! dial, its own gains. The device stays open while any stream holds it and
+//! closes when the last one goes, which is what lets one radio be reopened
+//! (Settings → Apply) without disturbing the other.
+//!
+//! Every control therefore names a tuner. The exception is the handful the
+//! hardware has one of — the reference trim, and on an RSPdx the HDR path —
+//! which are marked where they appear.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -15,97 +30,131 @@ use crossbeam_channel::Sender;
 use rtrb::{Consumer, Producer, RingBuffer};
 use sdroxide_types::SdrPlayModel;
 
+use crate::error::{Error, Result};
+
 /// How often the callback emits a throughput line.
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A control message for the session thread.
-#[derive(Debug, Clone, PartialEq)]
+/// Which tuner a control is for: an index into the per-tuner arrays, 0 for
+/// tuner 1 (the API's tuner A) and 1 for tuner 2 (tuner B).
+pub(crate) type TunerIdx = usize;
+
+/// How many tuners any RSP has.
+pub(crate) const TUNERS: usize = 2;
+
+/// A control message for the session thread. Everything that belongs to one
+/// tuner carries its index; the rest is the device's.
+#[derive(Debug)]
 pub(crate) enum Ctrl {
-    Center(f64),
+    /// Start delivering this tuner's samples into `ring`, from `center_hz`.
+    Attach {
+        tuner: TunerIdx,
+        ring: Producer<f32>,
+        center_hz: f64,
+    },
+    /// Stop delivering them: the radio that was reading them has gone. The
+    /// tuner keeps running — the session may still be serving the other one,
+    /// and an RSPduo's tuners are only ever switched on together.
+    Detach(TunerIdx),
+    Center(TunerIdx, f64),
     /// IF gain reduction in dB (the RSP's native unit, 20..=59).
-    IfGr(i32),
-    Lna(u8),
-    /// The second tuner's gains, when both are running (issue #153). Separate
-    /// from the first tuner's because the two aerials are not the same aerial.
-    AuxIfGr(i32),
-    AuxLna(u8),
+    IfGr(TunerIdx, i32),
+    Lna(TunerIdx, u8),
     /// [`sdroxide_types::SdrPlayAgc::code`] value.
-    Agc(i32),
-    AgcSetpoint(i32),
+    Agc(TunerIdx, i32),
+    AgcSetpoint(TunerIdx, i32),
+    BiasTee(TunerIdx, bool),
+    RfNotch(TunerIdx, bool),
+    DabNotch(TunerIdx, bool),
+    Antenna(TunerIdx, String),
+    /// Reference trim: the device's own, not a tuner's.
     Ppm(f64),
-    BiasTee(bool),
-    RfNotch(bool),
-    DabNotch(bool),
+    /// The RSPdx's high-dynamic-range path, likewise device-wide.
     Hdr(bool),
-    Antenna(String),
     Shutdown,
+}
+
+/// One tuner's share of the control accumulated over a pass of the session
+/// loop.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct TunerPending {
+    pub center: Option<f64>,
+    pub if_gr: Option<i32>,
+    pub lna: Option<u8>,
+    pub agc: Option<i32>,
+    pub agc_setpoint: Option<i32>,
+    pub bias_tee: Option<bool>,
+    pub rf_notch: Option<bool>,
+    pub dab_notch: Option<bool>,
+    pub antenna: Option<String>,
 }
 
 /// Control messages accumulated over one pass of the session loop. Dragging
 /// the dial or a slider emits far more messages than `sdrplay_api_Update`
 /// round-trips per second; last value wins, which is the right semantics for
 /// every one of these.
-#[derive(Debug, Default, PartialEq)]
+///
+/// The stream attachments are the exception and are *not* coalesced: each one
+/// carries a ring the callbacks must be given, and a pass that saw two of them
+/// has two radios waiting.
+#[derive(Debug, Default)]
 pub(crate) struct Pending {
-    pub center: Option<f64>,
-    pub if_gr: Option<i32>,
-    pub lna: Option<u8>,
-    pub aux_if_gr: Option<i32>,
-    pub aux_lna: Option<u8>,
-    pub agc: Option<i32>,
-    pub agc_setpoint: Option<i32>,
+    pub t: [TunerPending; TUNERS],
+    pub attach: Vec<(TunerIdx, Producer<f32>, f64)>,
+    pub detach: [bool; TUNERS],
     pub ppm: Option<f64>,
-    pub bias_tee: Option<bool>,
-    pub rf_notch: Option<bool>,
-    pub dab_notch: Option<bool>,
     pub hdr: Option<bool>,
-    pub antenna: Option<String>,
     pub shutdown: bool,
 }
 
 impl Pending {
     pub(crate) fn absorb(&mut self, c: Ctrl) {
+        // A message for a tuner this device does not have is dropped rather
+        // than panicking an index: the sender is another thread, and a stale
+        // handle is not worth a crash.
+        let ok = |t: TunerIdx| t < TUNERS;
         match c {
-            Ctrl::Center(v) => self.center = Some(v),
-            Ctrl::IfGr(v) => self.if_gr = Some(v),
-            Ctrl::Lna(v) => self.lna = Some(v),
-            Ctrl::AuxIfGr(v) => self.aux_if_gr = Some(v),
-            Ctrl::AuxLna(v) => self.aux_lna = Some(v),
-            Ctrl::Agc(v) => self.agc = Some(v),
-            Ctrl::AgcSetpoint(v) => self.agc_setpoint = Some(v),
+            Ctrl::Attach { tuner, ring, center_hz } if ok(tuner) => {
+                self.detach[tuner] = false;
+                self.attach.push((tuner, ring, center_hz));
+            }
+            Ctrl::Detach(t) if ok(t) => {
+                self.attach.retain(|(i, _, _)| *i != t);
+                self.detach[t] = true;
+            }
+            Ctrl::Center(t, v) if ok(t) => self.t[t].center = Some(v),
+            Ctrl::IfGr(t, v) if ok(t) => self.t[t].if_gr = Some(v),
+            Ctrl::Lna(t, v) if ok(t) => self.t[t].lna = Some(v),
+            Ctrl::Agc(t, v) if ok(t) => self.t[t].agc = Some(v),
+            Ctrl::AgcSetpoint(t, v) if ok(t) => self.t[t].agc_setpoint = Some(v),
+            Ctrl::BiasTee(t, v) if ok(t) => self.t[t].bias_tee = Some(v),
+            Ctrl::RfNotch(t, v) if ok(t) => self.t[t].rf_notch = Some(v),
+            Ctrl::DabNotch(t, v) if ok(t) => self.t[t].dab_notch = Some(v),
+            Ctrl::Antenna(t, v) if ok(t) => self.t[t].antenna = Some(v),
             Ctrl::Ppm(v) => self.ppm = Some(v),
-            Ctrl::BiasTee(v) => self.bias_tee = Some(v),
-            Ctrl::RfNotch(v) => self.rf_notch = Some(v),
-            Ctrl::DabNotch(v) => self.dab_notch = Some(v),
             Ctrl::Hdr(v) => self.hdr = Some(v),
-            Ctrl::Antenna(v) => self.antenna = Some(v),
             Ctrl::Shutdown => self.shutdown = true,
+            _ => {}
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        *self == Pending::default()
+        self.t.iter().all(|t| *t == TunerPending::default())
+            && self.attach.is_empty()
+            && !self.detach.iter().any(|d| *d)
+            && self.ppm.is_none()
+            && self.hdr.is_none()
+            && !self.shutdown
     }
 }
 
-/// State the session thread and the API's callbacks publish for the handle.
-pub(crate) struct Shared {
-    pub alive: AtomicBool,
+/// What one tuner's callbacks and control publish for its handle.
+pub(crate) struct TunerShared {
     /// Timestamp of the newest samples, in ms since the session epoch — a
     /// timestamp, not an age; see [`SdrPlayHandle::silent_for`].
     pub last_rx_ms: AtomicU64,
     /// Samples the ring could not take because the consumer fell behind.
     pub dropped: AtomicU64,
-    /// The service said the ADC is overloaded (and has not yet said corrected).
-    pub overload: AtomicBool,
-    /// Which tuners have an overload message waiting for the mandatory
-    /// acknowledgement, which must come from the session thread rather than
-    /// the callback: bit 0 is tuner A, bit 1 is tuner B. A mask rather than a
-    /// flag because the acknowledgement names a tuner, and one sent for a
-    /// tuner that never reported an overload is one the service refuses.
-    pub overload_ack_pending: AtomicU8,
-    /// The device disappeared mid-session (unplug or service failure).
-    pub removed: AtomicBool,
     /// What the GainChange event last reported, `i64::MIN` for "not yet".
     /// Written by the event callback on every gain update — including the
     /// AGC's own — which is what keeps `current_gains()` honest while the
@@ -116,41 +165,64 @@ pub(crate) struct Shared {
     pub ev_curr_gain_milli_db: AtomicI64,
     /// The LNA state actually programmed, after any per-band clamp.
     pub lna_state: AtomicU8,
-    /// The same for the second tuner, when both are running.
-    pub aux_lna_state: AtomicU8,
+    /// Set while the engine reading this tuner is transmitting and therefore
+    /// not reading it — see `IqSource::set_rx_paused`. Read by the stream
+    /// thread on every block so a ring that fills during an over is accounted
+    /// for as the cost of transmitting rather than as an overrun. Per tuner
+    /// because the two can be different radios, and only one of them is keyed.
+    pub rx_paused: AtomicBool,
+}
+
+impl TunerShared {
+    fn new() -> TunerShared {
+        TunerShared {
+            last_rx_ms: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            ev_gr_db: AtomicI64::new(i64::MIN),
+            ev_lna_gr_db: AtomicI64::new(i64::MIN),
+            ev_curr_gain_milli_db: AtomicI64::new(i64::MIN),
+            lna_state: AtomicU8::new(0),
+            rx_paused: AtomicBool::new(false),
+        }
+    }
+}
+
+/// State the session thread and the API's callbacks publish for the handles.
+pub(crate) struct Shared {
+    pub alive: AtomicBool,
+    /// The service said the ADC is overloaded (and has not yet said corrected).
+    pub overload: AtomicBool,
+    /// Which tuners have an overload message waiting for the mandatory
+    /// acknowledgement, which must come from the session thread rather than
+    /// the callback: bit 0 is tuner A, bit 1 is tuner B. A mask rather than a
+    /// flag because the acknowledgement names a tuner, and one sent for a
+    /// tuner that never reported an overload is one the service refuses.
+    pub overload_ack_pending: AtomicU8,
+    /// The device disappeared mid-session (unplug or service failure).
+    pub removed: AtomicBool,
+    /// Per tuner, in tuner order: A then B.
+    pub t: [TunerShared; TUNERS],
     /// The second tuner has stopped delivering and the first is going through
-    /// unpaired — see [`crate::pair`].
+    /// unpaired — see [`crate::pair`]. Diversity only.
     pub aux_stalled: AtomicBool,
     /// How many times the two tuners had to be paired up again from scratch.
     pub pair_slips: AtomicU64,
     /// Whether the service fills in the sample numbers the pairing prefers, or
     /// the pairing has fallen back to arrival order.
     pub pair_stamped: AtomicBool,
-    /// Set while the engine is transmitting and therefore not reading this
-    /// receiver — see `IqSource::set_rx_paused`. Read by the stream thread on
-    /// every block so a ring that fills during an over is accounted for as the
-    /// cost of transmitting rather than as an overrun.
-    pub rx_paused: AtomicBool,
 }
 
 impl Shared {
     pub(crate) fn new() -> Shared {
         Shared {
             alive: AtomicBool::new(true),
-            last_rx_ms: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
             overload: AtomicBool::new(false),
             overload_ack_pending: AtomicU8::new(0),
             removed: AtomicBool::new(false),
-            ev_gr_db: AtomicI64::new(i64::MIN),
-            ev_lna_gr_db: AtomicI64::new(i64::MIN),
-            ev_curr_gain_milli_db: AtomicI64::new(i64::MIN),
-            lna_state: AtomicU8::new(0),
-            aux_lna_state: AtomicU8::new(0),
+            t: [TunerShared::new(), TunerShared::new()],
             aux_stalled: AtomicBool::new(false),
             pair_slips: AtomicU64::new(0),
             pair_stamped: AtomicBool::new(true),
-            rx_paused: AtomicBool::new(false),
         }
     }
 }
@@ -209,16 +281,26 @@ impl RxStats {
         )
     }
 
-    pub(crate) fn tick(&mut self) {
+    /// The nominal rate this was opened against, so a re-attached stream can
+    /// start its accounting again without being told the rate twice.
+    pub(crate) fn nominal_hz(&self) -> f64 {
+        self.nominal_hz
+    }
+
+    /// `named` says the board is running two tuners as separate radios, where
+    /// a line that did not say which one would be half the diagnosis.
+    pub(crate) fn tick(&mut self, tuner: usize, named: bool) {
         let elapsed = self.since.elapsed();
         if elapsed < STATS_INTERVAL {
             return;
         }
+        let who =
+            if named { format!("SDRplay tuner {}", tuner + 1) } else { "SDRplay".to_string() };
         let secs = elapsed.as_secs_f64();
         let rate = self.win_samples as f64 / secs;
         if self.win_dropped > 0 {
             tracing::warn!(
-                "SDRplay: {:.3} Msps ({:.1}% of nominal), {} samples dropped{}",
+                "{who}: {:.3} Msps ({:.1}% of nominal), {} samples dropped{}",
                 rate / 1e6,
                 100.0 * rate / self.nominal_hz,
                 self.win_dropped,
@@ -226,7 +308,7 @@ impl RxStats {
             );
         } else {
             tracing::debug!(
-                "SDRplay: {:.3} Msps ({:.1}% of nominal)",
+                "{who}: {:.3} Msps ({:.1}% of nominal)",
                 rate / 1e6,
                 100.0 * rate / self.nominal_hz
             );
@@ -297,71 +379,74 @@ pub(crate) fn ring_for(rate: f64, stride: usize) -> (Producer<f32>, Consumer<f32
     RingBuffer::new(slots)
 }
 
-/// A running RSP.
-pub struct SdrPlayHandle {
-    rx: Consumer<f32>,
+/// A running RSP: one API session, one thread, and the one or two tuner
+/// streams hung off it.
+///
+/// Held by an `Arc` per stream, and by the binary's device registry as a
+/// `Weak` — so the session lives exactly as long as some radio is reading it
+/// and closes when the last one lets go. See [`Self::attach`].
+pub struct SdrPlayDevice {
     ctrl: Sender<Ctrl>,
     shared: Arc<Shared>,
-    join: Option<JoinHandle<()>>,
-    label: String,
+    join: Mutex<Option<JoinHandle<()>>>,
+    /// Which tuners already have a stream. A tuner is one radio's or nobody's.
+    taken: Mutex<[bool; TUNERS]>,
     serial: String,
     model: SdrPlayModel,
+    /// The tuner the session was opened for, and — with both running — the one
+    /// carrying the main aerial.
+    main: TunerIdx,
+    /// Whether both tuners are running, and if so what for.
+    duo: DuoMode,
+    /// Delivered complex rate. One number, not two: both tuners come off one
+    /// ADC clock through one decimator setting, so whichever radio opened the
+    /// session set it and the other adopts it.
     out_rate_hz: f64,
     analog_bw_hz: f64,
-    /// Whether the ring carries both of an RSPduo's tuners, interleaved as
-    /// quadruples — see [`SdrPlayHandle::read_pair`].
-    dual: bool,
     /// The low IF the API's downconverter worked from, in kHz, or zero for
     /// plain zero-IF. Dual-tuner operation forces a low IF, which is what
     /// spares it the DC spike the zero-IF path needs an LO offset to dodge.
     low_if_khz: i32,
-    opened_at: Instant,
-    released: bool,
 }
 
-impl SdrPlayHandle {
-    /// Tell the stream thread that the engine has stopped reading for an over,
-    /// and then that it has started again — see `IqSource::set_rx_paused`. The
-    /// receiver itself is left running: the samples keep arriving and keep
-    /// being offered, this only decides whether the ones that no longer fit are
-    /// reported as a fault.
-    pub fn set_rx_paused(&self, paused: bool) {
-        self.shared.rx_paused.store(paused, Ordering::Relaxed);
-    }
+/// What a session is doing with the second tuner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuoMode {
+    /// Only one tuner is running.
+    Single,
+    /// Both, combined into the main tuner's stream: diversity (issue #153).
+    Paired,
+    /// Both, as two independent radios (issue #165).
+    Split,
+}
 
+impl SdrPlayDevice {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
-        rx: Consumer<f32>,
         ctrl: Sender<Ctrl>,
         shared: Arc<Shared>,
         join: JoinHandle<()>,
-        label: String,
         serial: String,
         model: SdrPlayModel,
+        main: TunerIdx,
+        duo: DuoMode,
         out_rate_hz: f64,
         analog_bw_hz: f64,
-        dual: bool,
         low_if_khz: i32,
-    ) -> SdrPlayHandle {
-        SdrPlayHandle {
-            rx,
+    ) -> SdrPlayDevice {
+        SdrPlayDevice {
             ctrl,
             shared,
-            join: Some(join),
-            label,
+            join: Mutex::new(Some(join)),
+            taken: Mutex::new([false; TUNERS]),
             serial,
             model,
+            main,
+            duo,
             out_rate_hz,
             analog_bw_hz,
-            dual,
             low_if_khz,
-            opened_at: Instant::now(),
-            released: false,
         }
-    }
-
-    pub fn label(&self) -> &str {
-        &self.label
     }
 
     pub fn serial(&self) -> &str {
@@ -372,81 +457,250 @@ impl SdrPlayHandle {
         self.model
     }
 
+    pub fn duo_mode(&self) -> DuoMode {
+        self.duo
+    }
+
+    /// The tuner this session opened for — the only one running unless
+    /// [`Self::duo_mode`] says both are.
+    pub fn main_tuner(&self) -> TunerIdx {
+        self.main
+    }
+
     /// The effective complex rate delivered, after any decimation.
     pub fn out_rate_hz(&self) -> f64 {
         self.out_rate_hz
     }
 
-    /// The programmed analog IF bandwidth, for the LO-offset calculation.
-    pub fn analog_bw_hz(&self) -> f64 {
-        self.analog_bw_hz
+    /// Whether the session thread is still running.
+    pub fn is_alive(&self) -> bool {
+        self.shared.alive.load(Ordering::Relaxed)
     }
 
-    /// Whether both of an RSPduo's tuners are running and being paired.
+    /// Claim `tuner`'s stream, tuned to `center_hz`.
+    ///
+    /// Fails rather than sharing: a tuner belongs to one radio at a time, and
+    /// two engines reading one ring would each get half the samples. The
+    /// message says which case it is, because all three are things an operator
+    /// can act on — pick the other tuner, turn the second radio off, or stop
+    /// asking a single-tuner session for a tuner it never opened.
+    pub fn attach(self: &Arc<Self>, tuner: TunerIdx, center_hz: f64) -> Result<SdrPlayHandle> {
+        if tuner >= TUNERS {
+            return Err(Error::NotFound(format!("tuner {} does not exist", tuner + 1)));
+        }
+        match self.duo {
+            DuoMode::Split => {}
+            DuoMode::Single if tuner == self.main => {}
+            DuoMode::Paired if tuner == self.main => {}
+            DuoMode::Paired => {
+                return Err(Error::InUse(format!(
+                    "the RSPduo's tuner {} is being combined into tuner {}'s stream for \
+                     diversity — set that radio's second tuner to \"a second radio\" to run \
+                     them apart",
+                    tuner + 1,
+                    self.main + 1
+                )));
+            }
+            DuoMode::Single => {
+                return Err(Error::InUse(format!(
+                    "the receiver is open on tuner {} alone — both radios have to be set to \
+                     run both tuners before either can have one",
+                    self.main + 1
+                )));
+            }
+        }
+        {
+            let mut taken = self.taken.lock().expect("sdrplay taken lock");
+            if taken[tuner] {
+                return Err(Error::InUse(format!(
+                    "tuner {} is already running as another radio",
+                    tuner + 1
+                )));
+            }
+            taken[tuner] = true;
+        }
+        let stride = if self.duo == DuoMode::Paired { crate::pair::QUAD } else { 2 };
+        let (prod, cons) = ring_for(self.out_rate_hz, stride);
+        if self.ctrl.send(Ctrl::Attach { tuner, ring: prod, center_hz }).is_err() {
+            self.taken.lock().expect("sdrplay taken lock")[tuner] = false;
+            return Err(Error::Api {
+                call: "attach",
+                text: "the SDRplay session has stopped".into(),
+            });
+        }
+        Ok(SdrPlayHandle {
+            rx: cons,
+            dev: Arc::clone(self),
+            tuner,
+            center: center_hz,
+            opened_at: Instant::now(),
+            released: false,
+        })
+    }
+
+    /// Stop the session and hand the device back to the service.
+    ///
+    /// Idempotent. Called when the last stream is given back, and again from
+    /// `Drop`: a session nobody is reading is one whose *configuration* has
+    /// stopped being true — the rate, the bandwidth and the tuner arrangement
+    /// are all fixed when the board is opened, so a radio that comes back
+    /// after an Apply has to find a closed session and open a fresh one rather
+    /// than silently adopt the old shape.
+    pub(crate) fn shutdown(&self) {
+        let _ = self.ctrl.send(Ctrl::Shutdown);
+        if let Some(j) = self.join.lock().expect("sdrplay join lock").take() {
+            let _ = j.join();
+        }
+        self.shared.alive.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for SdrPlayDevice {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// One tuner's stream: what a radio reads and drives.
+pub struct SdrPlayHandle {
+    rx: Consumer<f32>,
+    dev: Arc<SdrPlayDevice>,
+    tuner: TunerIdx,
+    center: f64,
+    opened_at: Instant,
+    released: bool,
+}
+
+impl SdrPlayHandle {
+    fn shared(&self) -> &TunerShared {
+        &self.dev.shared.t[self.tuner]
+    }
+
+    /// Tell the stream thread that the engine has stopped reading for an over,
+    /// and then that it has started again — see `IqSource::set_rx_paused`. The
+    /// receiver itself is left running: the samples keep arriving and keep
+    /// being offered, this only decides whether the ones that no longer fit are
+    /// reported as a fault.
+    pub fn set_rx_paused(&self, paused: bool) {
+        self.shared().rx_paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// The session this stream belongs to, which may be serving another radio
+    /// as well.
+    pub fn device(&self) -> &Arc<SdrPlayDevice> {
+        &self.dev
+    }
+
+    /// Which tuner this stream is, counted from zero.
+    pub fn tuner(&self) -> TunerIdx {
+        self.tuner
+    }
+
+    /// A label for this stream: the model, the serial, the rate, and — when
+    /// the board is running both tuners — which one this is.
+    pub fn label(&self) -> String {
+        let mut s = format!(
+            "SDRplay {} (serial {}) @ {:.3} Msps",
+            self.dev.model.label(),
+            self.dev.serial,
+            self.dev.out_rate_hz / 1e6
+        );
+        match self.dev.duo {
+            DuoMode::Single => {}
+            DuoMode::Paired => s.push_str(", both tuners"),
+            DuoMode::Split => s.push_str(&format!(", tuner {}", self.tuner + 1)),
+        }
+        s
+    }
+
+    pub fn serial(&self) -> &str {
+        &self.dev.serial
+    }
+
+    pub fn model(&self) -> SdrPlayModel {
+        self.dev.model
+    }
+
+    /// The effective complex rate delivered, after any decimation.
+    pub fn out_rate_hz(&self) -> f64 {
+        self.dev.out_rate_hz
+    }
+
+    /// The programmed analog IF bandwidth, for the LO-offset calculation.
+    pub fn analog_bw_hz(&self) -> f64 {
+        self.dev.analog_bw_hz
+    }
+
+    /// Whether this stream carries both tuners, combined.
     pub fn dual_tuner(&self) -> bool {
-        self.dual
+        self.dev.duo == DuoMode::Paired
+    }
+
+    /// Whether the session is running both tuners as separate radios.
+    pub fn split_tuner(&self) -> bool {
+        self.dev.duo == DuoMode::Split
     }
 
     /// The low IF the service downconverted from, in kHz — zero for the
     /// ordinary zero-IF path. A low IF puts the converter's DC offset outside
     /// the span by construction, so the source needs no LO offset to hide it.
     pub fn low_if_khz(&self) -> i32 {
-        self.low_if_khz
+        self.dev.low_if_khz
     }
 
     /// The second tuner has stopped delivering, so blocks are going through
     /// unpaired and the diversity filter has nothing to work with.
     pub fn aux_stalled(&self) -> bool {
-        self.shared.aux_stalled.load(Ordering::Relaxed)
+        self.dev.shared.aux_stalled.load(Ordering::Relaxed)
     }
 
     /// How many times the two tuners had to be paired up again from scratch.
     pub fn pair_slips(&self) -> u64 {
-        self.shared.pair_slips.load(Ordering::Relaxed)
+        self.dev.shared.pair_slips.load(Ordering::Relaxed)
     }
 
     /// Whether the pairing is working from the service's sample numbers, or
     /// has fallen back to arrival order because they do not advance.
     pub fn pair_stamped(&self) -> bool {
-        self.shared.pair_stamped.load(Ordering::Relaxed)
+        self.dev.shared.pair_stamped.load(Ordering::Relaxed)
     }
 
     /// The second tuner's LNA state, after any per-band clamp.
     pub fn aux_lna_state(&self) -> u8 {
-        self.shared.aux_lna_state.load(Ordering::Relaxed)
+        self.dev.shared.t[1 - self.tuner].lna_state.load(Ordering::Relaxed)
     }
 
     /// Whether the session thread is still running.
     pub fn is_alive(&self) -> bool {
-        !self.released && self.shared.alive.load(Ordering::Relaxed)
+        !self.released && self.dev.is_alive()
     }
 
     /// The service reported the device gone (unplugged, or the service died).
     pub fn removed(&self) -> bool {
-        self.shared.removed.load(Ordering::Relaxed)
+        self.dev.shared.removed.load(Ordering::Relaxed)
     }
 
     /// The ADC is currently overloaded — gain is set too high for the input.
     pub fn overloaded(&self) -> bool {
-        self.shared.overload.load(Ordering::Relaxed)
+        self.dev.shared.overload.load(Ordering::Relaxed)
     }
 
     pub fn dropped(&self) -> u64 {
-        self.shared.dropped.load(Ordering::Relaxed)
+        self.shared().dropped.load(Ordering::Relaxed)
     }
 
     /// How long the receiver has delivered nothing. `last_rx_ms` is a
     /// timestamp from the session epoch, not an age — subtract, don't read.
     pub fn silent_for(&self) -> Duration {
         let since_open = self.opened_at.elapsed();
-        let last = Duration::from_millis(self.shared.last_rx_ms.load(Ordering::Relaxed));
+        let last = Duration::from_millis(self.shared().last_rx_ms.load(Ordering::Relaxed));
         since_open.saturating_sub(last)
     }
 
     /// IF gain reduction the hardware last reported, if it has reported one.
     /// Under AGC this moves on its own, and it is the honest answer.
     pub fn effective_if_gr_db(&self) -> Option<i32> {
-        match self.shared.ev_gr_db.load(Ordering::Relaxed) {
+        match self.shared().ev_gr_db.load(Ordering::Relaxed) {
             i64::MIN => None,
             v => Some(v as i32),
         }
@@ -454,12 +708,12 @@ impl SdrPlayHandle {
 
     /// The LNA state actually programmed, after any per-band clamp.
     pub fn lna_state(&self) -> u8 {
-        self.shared.lna_state.load(Ordering::Relaxed)
+        self.shared().lna_state.load(Ordering::Relaxed)
     }
 
     /// Read interleaved complex samples. Returns how many `f32` were taken.
     ///
-    /// With both tuners running the ring holds quadruples rather than pairs,
+    /// With both tuners combined the ring holds quadruples rather than pairs,
     /// so this is the wrong door — use [`Self::read_pair`], which is what the
     /// source calls either way.
     pub fn read(&mut self, out: &mut [f32]) -> usize {
@@ -485,7 +739,7 @@ impl SdrPlayHandle {
 
     /// Floats per sample in the ring: I and Q, or both tuners' I and Q.
     fn stride(&self) -> usize {
-        if self.dual { crate::pair::QUAD } else { 2 }
+        if self.dual_tuner() { crate::pair::QUAD } else { 2 }
     }
 
     /// Read both tuners at once, as interleaved complex samples, and return
@@ -493,11 +747,11 @@ impl SdrPlayHandle {
     ///
     /// The pair is sample-aligned by construction: the two tuners are put
     /// together in the callbacks and travel through one ring, so there is no
-    /// way for them to come apart on the way here — see [`crate::pair`]. With
-    /// one tuner running `aux` is left untouched and this is the ordinary
-    /// read.
+    /// way for them to come apart on the way here — see [`crate::pair`]. Where
+    /// this stream carries one tuner `aux` is left untouched and this is the
+    /// ordinary read.
     pub fn read_pair(&mut self, main: &mut [f32], aux: &mut [f32]) -> usize {
-        if !self.dual {
+        if !self.dual_tuner() {
             return self.read(main) / 2;
         }
         let quad = crate::pair::QUAD;
@@ -522,74 +776,117 @@ impl SdrPlayHandle {
         want
     }
 
-    pub fn set_center_hz(&self, hz: f64) {
-        let _ = self.ctrl.send(Ctrl::Center(hz));
+    fn send(&self, c: Ctrl) {
+        let _ = self.dev.ctrl.send(c);
+    }
+
+    pub fn center_hz(&self) -> f64 {
+        self.center
+    }
+
+    pub fn set_center_hz(&mut self, hz: f64) {
+        self.center = hz;
+        self.send(Ctrl::Center(self.tuner, hz));
     }
 
     pub fn set_if_gr_db(&self, gr: i32) {
-        let _ = self.ctrl.send(Ctrl::IfGr(gr));
+        self.send(Ctrl::IfGr(self.tuner, gr));
     }
 
     pub fn set_lna_state(&self, state: u8) {
-        let _ = self.ctrl.send(Ctrl::Lna(state));
+        self.send(Ctrl::Lna(self.tuner, state));
     }
 
-    /// The second tuner's gains, when both are running.
+    /// The *other* tuner's gains, which one radio owns only while it is
+    /// combining the pair: in diversity the second aerial has no radio of its
+    /// own to set them from.
     pub fn set_aux_if_gr_db(&self, gr: i32) {
-        let _ = self.ctrl.send(Ctrl::AuxIfGr(gr));
+        self.send(Ctrl::IfGr(1 - self.tuner, gr));
     }
 
     pub fn set_aux_lna_state(&self, state: u8) {
-        let _ = self.ctrl.send(Ctrl::AuxLna(state));
+        self.send(Ctrl::Lna(1 - self.tuner, state));
     }
 
     pub fn set_agc(&self, code: i32) {
-        let _ = self.ctrl.send(Ctrl::Agc(code));
+        self.send(Ctrl::Agc(self.tuner, code));
+        // A diversity pair wants both branches gained the same way, or the
+        // filter spends its time chasing one AGC against the other.
+        if self.dual_tuner() {
+            self.send(Ctrl::Agc(1 - self.tuner, code));
+        }
     }
 
     pub fn set_agc_setpoint(&self, dbfs: i32) {
-        let _ = self.ctrl.send(Ctrl::AgcSetpoint(dbfs));
+        self.send(Ctrl::AgcSetpoint(self.tuner, dbfs));
+        if self.dual_tuner() {
+            self.send(Ctrl::AgcSetpoint(1 - self.tuner, dbfs));
+        }
     }
 
+    /// The reference trim, which belongs to the board rather than to a tuner:
+    /// on a split RSPduo either radio's setting moves both.
     pub fn set_ppm(&self, ppm: f64) {
-        let _ = self.ctrl.send(Ctrl::Ppm(ppm));
+        self.send(Ctrl::Ppm(ppm));
     }
 
     pub fn set_bias_tee(&self, on: bool) {
-        let _ = self.ctrl.send(Ctrl::BiasTee(on));
+        self.send(Ctrl::BiasTee(self.tuner, on));
     }
 
     pub fn set_rf_notch(&self, on: bool) {
-        let _ = self.ctrl.send(Ctrl::RfNotch(on));
+        self.send(Ctrl::RfNotch(self.tuner, on));
+        // Both branches of a diversity pair through the same filters, for the
+        // same reason as the AGC.
+        if self.dual_tuner() {
+            self.send(Ctrl::RfNotch(1 - self.tuner, on));
+        }
     }
 
     pub fn set_dab_notch(&self, on: bool) {
-        let _ = self.ctrl.send(Ctrl::DabNotch(on));
+        self.send(Ctrl::DabNotch(self.tuner, on));
+        if self.dual_tuner() {
+            self.send(Ctrl::DabNotch(1 - self.tuner, on));
+        }
     }
 
+    /// The RSPdx's HDR path — a device-wide switch, and a model that has no
+    /// second tuner anyway.
     pub fn set_hdr(&self, on: bool) {
-        let _ = self.ctrl.send(Ctrl::Hdr(on));
+        self.send(Ctrl::Hdr(on));
     }
 
     pub fn set_antenna(&self, name: &str) {
-        let _ = self.ctrl.send(Ctrl::Antenna(name.to_string()));
+        self.send(Ctrl::Antenna(self.tuner, name.to_string()));
     }
 
-    /// Stop the session and hand the device back to the service.
+    /// Give this tuner's stream back.
     ///
     /// Idempotent, and leaves the handle callable but inert — the engine's
     /// reopen path requires exactly that, because a replacement is built only
     /// after the outgoing source has stood down.
+    ///
+    /// The *session* stays open while another radio still holds a tuner on it,
+    /// which is what lets one radio be reopened without interrupting the
+    /// other. The last stream to go closes it, rather than leaving it for the
+    /// next open to adopt: everything the session's shape is made of — the
+    /// rate, the bandwidth, which tuners run and what for — is chosen when the
+    /// board is opened, so a live session outliving its last radio would make
+    /// an Apply that changes any of them do nothing at all.
     pub fn release(&mut self) {
         if self.released {
             return;
         }
         self.released = true;
-        let _ = self.ctrl.send(Ctrl::Shutdown);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
+        self.send(Ctrl::Detach(self.tuner));
+        let last = {
+            let mut taken = self.dev.taken.lock().expect("sdrplay taken lock");
+            taken[self.tuner] = false;
+            !taken.iter().any(|t| *t)
+        };
+        if last {
+            self.dev.shutdown();
         }
-        self.shared.alive.store(false, Ordering::Relaxed);
     }
 }
 
@@ -607,23 +904,57 @@ mod tests {
     fn pending_keeps_only_the_last_value_per_field() {
         let mut p = Pending::default();
         assert!(p.is_empty());
-        p.absorb(Ctrl::Center(7_000_000.0));
-        p.absorb(Ctrl::Center(14_000_000.0));
-        p.absorb(Ctrl::IfGr(30));
-        p.absorb(Ctrl::Antenna("Antenna A".into()));
-        p.absorb(Ctrl::Antenna("Antenna B".into()));
-        assert_eq!(p.center, Some(14_000_000.0));
-        assert_eq!(p.if_gr, Some(30));
-        assert_eq!(p.antenna.as_deref(), Some("Antenna B"));
-        assert_eq!(p.lna, None);
+        p.absorb(Ctrl::Center(0, 7_000_000.0));
+        p.absorb(Ctrl::Center(0, 14_000_000.0));
+        p.absorb(Ctrl::IfGr(0, 30));
+        p.absorb(Ctrl::Antenna(0, "Antenna A".into()));
+        p.absorb(Ctrl::Antenna(0, "Antenna B".into()));
+        assert_eq!(p.t[0].center, Some(14_000_000.0));
+        assert_eq!(p.t[0].if_gr, Some(30));
+        assert_eq!(p.t[0].antenna.as_deref(), Some("Antenna B"));
+        assert_eq!(p.t[0].lna, None);
         assert!(!p.is_empty());
+    }
+
+    /// Two radios on one board are two dials, two gain sets and two antenna
+    /// choices — and a control for one of them must never land on the other.
+    #[test]
+    fn each_tuner_keeps_its_own_control() {
+        let mut p = Pending::default();
+        p.absorb(Ctrl::Center(0, 7_100_000.0));
+        p.absorb(Ctrl::Center(1, 145_500_000.0));
+        p.absorb(Ctrl::Lna(1, 3));
+        assert_eq!(p.t[0].center, Some(7_100_000.0));
+        assert_eq!(p.t[1].center, Some(145_500_000.0));
+        assert_eq!(p.t[0].lna, None);
+        assert_eq!(p.t[1].lna, Some(3));
+        // A message naming a tuner no RSP has is dropped, not indexed.
+        p.absorb(Ctrl::Center(9, 1.0));
+        assert_eq!(p.t[0].center, Some(7_100_000.0));
+    }
+
+    /// A detach cancels an attach the same pass brought, and the other way
+    /// round: what a radio last said is what it meant.
+    #[test]
+    fn attach_and_detach_cancel_each_other_out() {
+        let mut p = Pending::default();
+        let (prod, _cons) = RingBuffer::<f32>::new(16);
+        p.absorb(Ctrl::Attach { tuner: 1, ring: prod, center_hz: 1.0 });
+        assert_eq!(p.attach.len(), 1);
+        p.absorb(Ctrl::Detach(1));
+        assert!(p.attach.is_empty(), "the ring goes with the radio that asked for it");
+        assert!(p.detach[1]);
+        let (prod, _cons) = RingBuffer::<f32>::new(16);
+        p.absorb(Ctrl::Attach { tuner: 1, ring: prod, center_hz: 2.0 });
+        assert!(!p.detach[1], "re-attaching cancels the detach");
+        assert_eq!(p.attach.len(), 1);
     }
 
     #[test]
     fn shutdown_survives_later_messages() {
         let mut p = Pending::default();
         p.absorb(Ctrl::Shutdown);
-        p.absorb(Ctrl::Center(1.0));
+        p.absorb(Ctrl::Center(0, 1.0));
         assert!(p.shutdown, "a shutdown must not be forgotten by a later retune");
     }
 
@@ -638,24 +969,33 @@ mod tests {
     }
 
     fn test_handle(cons: Consumer<f32>) -> SdrPlayHandle {
-        test_handle_with(cons, false)
+        test_handle_with(cons, DuoMode::Single, 0)
     }
 
-    fn test_handle_with(cons: Consumer<f32>, dual: bool) -> SdrPlayHandle {
+    /// A stream on a session with no thread behind it: everything but the
+    /// device itself, which is what the accounting and the reads are made of.
+    fn test_handle_with(cons: Consumer<f32>, duo: DuoMode, tuner: TunerIdx) -> SdrPlayHandle {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        SdrPlayHandle::from_parts(
-            cons,
+        let dev = Arc::new(SdrPlayDevice::from_parts(
             tx,
             Arc::new(Shared::new()),
             std::thread::spawn(|| {}),
-            "test".into(),
             "0000000000".into(),
-            if dual { SdrPlayModel::RspDuo } else { SdrPlayModel::Rsp1b },
+            if duo == DuoMode::Single { SdrPlayModel::Rsp1b } else { SdrPlayModel::RspDuo },
+            0,
+            duo,
             2_000_000.0,
             1_536_000.0,
-            dual,
-            if dual { 1620 } else { 0 },
-        )
+            if duo == DuoMode::Single { 0 } else { 1620 },
+        ));
+        SdrPlayHandle {
+            rx: cons,
+            dev,
+            tuner,
+            center: 14_100_000.0,
+            opened_at: Instant::now(),
+            released: false,
+        }
     }
 
     #[test]
@@ -678,7 +1018,7 @@ mod tests {
         let (_p, cons) = RingBuffer::<f32>::new(16);
         let mut h = test_handle(cons);
         let age = h.opened_at.elapsed();
-        h.shared.last_rx_ms.store(age.as_millis() as u64, Ordering::Relaxed);
+        h.shared().last_rx_ms.store(age.as_millis() as u64, Ordering::Relaxed);
         assert!(h.silent_for() < Duration::from_millis(50), "{:?}", h.silent_for());
         h.released = true;
     }
@@ -688,7 +1028,7 @@ mod tests {
         let (_p, cons) = RingBuffer::<f32>::new(16);
         let mut h = test_handle(cons);
         assert_eq!(h.effective_if_gr_db(), None);
-        h.shared.ev_gr_db.store(42, Ordering::Relaxed);
+        h.shared().ev_gr_db.store(42, Ordering::Relaxed);
         assert_eq!(h.effective_if_gr_db(), Some(42));
         h.released = true;
     }
@@ -719,7 +1059,7 @@ mod tests {
         let mut stats = RxStats::new(2.0e6);
         // Two samples: main (1,2) then (5,6); aux (3,4) then (7,8).
         push_iq(&mut prod, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &mut stats, false, 4);
-        let mut h = test_handle_with(cons, true);
+        let mut h = test_handle_with(cons, DuoMode::Paired, 0);
         let (mut main, mut aux) = ([0f32; 8], [0f32; 8]);
         let n = h.read_pair(&mut main, &mut aux);
         assert_eq!(n, 2, "two complex samples per tuner");

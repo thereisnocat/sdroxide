@@ -205,7 +205,16 @@ fn mode_digit(m: Mode) -> char {
         // hang off SSB — so plain FM is as close as the rig gets, and which
         // input it transmits is then the rig's MIC/LINE menu rather than
         // anything CAT can say.
-        Mode::Nfm | Mode::Wfm | Mode::Rifp | Mode::Packet | Mode::Aprs => '4',
+        // No rig has an ADS-B mode and none ever will: the dial is at
+        // 1090 MHz. Grouped with FM so nothing downstream has to special-case
+        // a mode a radio can neither be put into nor report back.
+        Mode::Nfm
+        | Mode::Wfm
+        | Mode::Rifp
+        | Mode::Packet
+        | Mode::Aprs
+        | Mode::SstvFm
+        | Mode::Adsb => '4',
         Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => '5',
         Mode::Digl => '9',
         Mode::Digu

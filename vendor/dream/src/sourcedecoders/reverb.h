@@ -10,7 +10,9 @@ class Reverb
 public:
     Reverb();
     void Init(int outputSampleRate, bool bUse);
-    ETypeRxStatus apply(bool bCurBlockOK, bool bCurBlockFaulty, CVector<_REAL> CurLeft, CVector<_REAL> CurRight);
+    /* By reference: the mute and the fades this computes are written back into
+       these buffers, and taking them by value threw all of it away. */
+    ETypeRxStatus apply(bool bCurBlockOK, bool bCurBlockFaulty, CVector<_REAL>& CurLeft, CVector<_REAL>& CurRight);
 private:
     bool bAudioWasOK, bUseReverbEffect;
     CVector<_REAL> OldLeft;

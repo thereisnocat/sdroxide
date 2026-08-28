@@ -129,14 +129,85 @@ impl SdroxideApp {
                         });
                         ui.end_row();
 
+                        ui.label("Packet length");
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut cfg.packet_paclen)
+                                        .range(16..=256)
+                                        .suffix(" bytes"),
+                                )
+                                .on_hover_text(
+                                    "The most a single frame carries. Shorter frames survive a \
+                                     marginal path — only the frame that was hit is resent — and \
+                                     cost more overhead. 128 on HF, 256 where the path is solid.",
+                                )
+                                .changed();
+                            ui.label(RichText::new("window").weak());
+                            let window_max = if cfg.packet_ext_seq { 127 } else { 7 };
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut cfg.packet_maxframe)
+                                        .range(1..=window_max),
+                                )
+                                .on_hover_text(
+                                    "Frames sent before waiting for an acknowledgement. More \
+                                     fills a good path; on a bad one it is more to resend.",
+                                )
+                                .changed();
+                        });
+                        ui.end_row();
+
+                        ui.label("Extended");
+                        changed |= ui
+                            .checkbox(&mut cfg.packet_ext_seq, "Ask for mod-128")
+                            .on_hover_text(
+                                "Extended sequence numbers, for a window bigger than seven. Many \
+                                 nodes refuse the request with a DM, which looks exactly like a \
+                                 station that would not talk to you — so leave it off unless you \
+                                 know the far end wants it.",
+                            )
+                            .changed();
+                        ui.end_row();
+
                         ui.label("Answer calls");
                         changed |= ui
                             .checkbox(&mut cfg.packet_accept_incoming, "Accept connections")
                             .on_hover_text(
                                 "Off for a Winlink client, which dials out and has no reason to \
-                                 answer. On to be reachable as a mailbox or a peer.",
+                                 answer. On to be reachable as a peer: a call arrives in the \
+                                 terminal pane and you talk to whoever made it. A station whose \
+                                 link is already busy with a Winlink session refuses calls until \
+                                 that finishes.",
                             )
                             .changed();
+                        ui.end_row();
+
+                        ui.label("Connect text");
+                        changed |= crate::chrome::field(
+                            ui,
+                            egui::TextEdit::singleline(&mut cfg.packet_connect_text)
+                                .hint_text("what a caller is greeted with"),
+                        )
+                        .on_hover_text(
+                            "Sent to a station that connects to us, once the link is up. Empty \
+                             sends nothing — which looks broken to whoever called.",
+                        )
+                        .changed();
+                        ui.end_row();
+
+                        ui.label("Default via");
+                        changed |= crate::chrome::field(
+                            ui,
+                            egui::TextEdit::singleline(&mut cfg.packet_connect_via)
+                                .hint_text("OE3XLR-1,OE3XMS-1"),
+                        )
+                        .on_hover_text(
+                            "The digipeater path the terminal starts with. The path to your \
+                             local node is the same every time, and retyping it is how a hop \
+                             gets left off.",
+                        )
+                        .changed();
                         ui.end_row();
 
                         ui.label("Beacon");
@@ -476,30 +547,6 @@ impl SdroxideApp {
                         });
                         ui.end_row();
 
-                        ui.label("TX audio");
-                        ui.horizontal(|ui| {
-                            let mut pct = (cfg.tx_audio_level * 100.0).round();
-                            if ui
-                                .add(egui::DragValue::new(&mut pct).range(5.0..=100.0).suffix(" %"))
-                                .on_hover_text(
-                                    "How loud the burst is handed to a radio that modulates it \
-                                     itself — and on FM that is the deviation, because an FM \
-                                     transmitter turns audio level into frequency swing and has \
-                                     no ALC to catch it. 1200 baud packet wants about 3 kHz \
-                                     where voice wants 5, so full scale into a data input set \
-                                     for voice over-deviates — which sounds completely normal \
-                                     to a listener and decodes for nobody. Turn it down until \
-                                     other stations report you, or set the level at the radio.",
-                                )
-                                .changed()
-                            {
-                                cfg.tx_audio_level = (pct as f32 / 100.0).clamp(0.05, 1.0);
-                                changed = true;
-                            }
-                            ui.label(RichText::new("deviation, on FM").size(9.5).weak());
-                        });
-                        ui.end_row();
-
                         ui.label("Keep stations");
                         changed |= ui
                             .add(
@@ -735,6 +782,70 @@ impl SdroxideApp {
                             ui.end_row();
                         }
                     }
+
+                    // Last, and for every digital mode: the level into a radio
+                    // that modulates what we send it. This mode's own — the
+                    // carrier caption below says what it inherited from if it
+                    // has never been set. It used to live inside the APRS
+                    // block, where an operator setting FM deviation could not
+                    // see that they were also turning down their FT8.
+                    //
+                    // Written straight out as `SetDigiTxLevel` rather than
+                    // through this window's `changed` flag: the map is one of
+                    // the fields the engine keeps against a stale client copy
+                    // (`keep_engine_owned`), so a `SetDigiConfig` carrying it
+                    // would be ignored. One write route, and the rail on the
+                    // transmit strip is the other end of it.
+                    let fm = mode.is_fm_carrier();
+                    ui.label("TX audio");
+                    ui.horizontal(|ui| {
+                        let mut db = sdroxide_types::tx_level_db(cfg.tx_level_for(mode)).round();
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut db)
+                                    .range(sdroxide_types::TX_AUDIO_LEVEL_MIN_DB..=0.0)
+                                    .suffix(" dB"),
+                            )
+                            .on_hover_text(if fm {
+                                "How loud this mode's burst is handed to a radio that \
+                                 modulates it itself — and on FM that is the deviation, \
+                                 because an FM transmitter turns audio level into frequency \
+                                 swing and has no ALC to catch it. 1200 baud packet wants \
+                                 about 3 kHz where voice wants 5, so full scale into a data \
+                                 input set for voice over-deviates — which sounds completely \
+                                 normal to a listener and decodes for nobody. Turn it down \
+                                 until other stations report you, or set the level at the \
+                                 radio.\n\nThis level belongs to this mode alone. A mode you \
+                                 have never set starts from the FM figure, and the sideband \
+                                 modes start from their own — so a deviation set for 1200 \
+                                 baud never lands on FT8."
+                            } else {
+                                "How loud this mode's over is handed to a radio that \
+                                 modulates it itself — a CAT rig on its sound card, a FLEX, \
+                                 an Icom on its network port. On sideband this is drive into \
+                                 the modulator: bring it down until the rig's ALC is barely \
+                                 moving and set the power at the radio, because ALC riding \
+                                 on a constant-envelope mode is what splatters. Drive \
+                                 reaches the rig's power register here, not its audio, so \
+                                 this is the level.\n\nThis level belongs to this mode \
+                                 alone: FT8, RTTY, PSK and MCW each keep their own, because \
+                                 they do not load a modulator the same way. The same rail is \
+                                 on the transmit strip, where you can reach it while you are \
+                                 transmitting."
+                            })
+                            .changed()
+                        {
+                            let level = sdroxide_types::tx_level_from_db(db);
+                            cfg.set_tx_level(mode, level);
+                            cmds.push(Command::SetDigiTxLevel { mode, level });
+                        }
+                        ui.label(
+                            RichText::new(if fm { "deviation, on FM" } else { "drive, on SSB" })
+                                .size(9.5)
+                                .weak(),
+                        );
+                    });
+                    ui.end_row();
                 });
                 if !mode.is_aprs() {
                     ui.separator();

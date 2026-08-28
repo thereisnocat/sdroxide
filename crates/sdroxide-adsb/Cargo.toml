@@ -1,0 +1,29 @@
+[package]
+name = "sdroxide-adsb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Native-only: the 1090 MHz ADS-B / Mode S decoder. Not linked by the wasm
+# client — it runs server-side in the engine, off the raw I/Q, like the skimmers
+# and the ISM decoder. The types the panel draws live in `sdroxide-types`.
+#
+# No third-party ADS-B crate. `rsadsb`'s `adsb_deku` was the intended
+# dependency and does not build: its last release (0.8.0, May 2025) was written
+# against deku 0.19.0, the 0.19.1 patch made `#[repr]` mandatory on the enums it
+# derives, and 0.19.0 is yanked. So the message layer here is written from the
+# published standard like every other decoder in this tree — ICAO Annex 10
+# Volume IV (3.1.2 for the formats and the check sequence) and RTCA DO-260B
+# Appendix A (the extended-squitter payloads), with the CPR algorithms from ICAO
+# Doc 9871 D.2.4.7. Sources are cited per module.
+#
+# Cross-checked against `dump1090`'s behaviour and against the frames published
+# with the standards, but no code came from it: `dump1090` is GPL-2.0 and a port
+# would have been a licence event needing a PROVENANCE.md.
+
+[dependencies]
+sdroxide-types.workspace = true
+sdroxide-dsp.workspace = true
+num-complex.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true

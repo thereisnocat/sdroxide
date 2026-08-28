@@ -10,7 +10,7 @@
 //! again. See [`sdroxide_types::RdsStandard`].
 
 use eframe::egui::{self, Color32, RichText};
-use sdroxide_types::{RdsData, RdsGroupLog, RdsStandard, pi_callsign, pty_name, rt_plus_class};
+use sdroxide_types::{RdsData, RdsGroupLog, RdsStandard, pty_name, rt_plus_class};
 
 use crate::app::SdroxideApp;
 use crate::chrome::StyledCombo;
@@ -94,6 +94,9 @@ impl SdroxideApp {
 
     fn rds_body(&mut self, ui: &mut egui::Ui) {
         let standard = self.rds_standard();
+        // Read before the selector can change it, so the page below and the
+        // combo above agree about the same frame.
+        let chosen = self.view.rds_standard;
 
         crate::chrome::tab_bar(ui, |ui, bar| {
             for (tab, label) in [(RdsTab::Station, "STATION"), (RdsTab::Diagnostics, "DIAGNOSTICS")]
@@ -107,7 +110,6 @@ impl SdroxideApp {
 
             // The standard selector. A display choice, not a command: the raw
             // codes are already here, so this re-labels everything at once.
-            let chosen = self.view.rds_standard;
             egui::ComboBox::from_id_salt("rds-standard")
                 .selected_text(if chosen == RdsStandard::Auto {
                     format!("Auto ({})", standard.label())
@@ -123,7 +125,10 @@ impl SdroxideApp {
                 .on_hover_text(
                     "Which programme-type table to read this station against. RDS is used \
                      everywhere outside North America; RBDS adds the call sign a US station's \
-                     identity code spells out. Auto follows the country code the station sends.",
+                     identity code spells out. Auto follows the extended country code the \
+                     station sends, and until one arrives it will not spell out a call sign — \
+                     the identity ranges it would read are shared with nine countries' RDS \
+                     codes, so select RBDS to name a station that sends no country code.",
                 );
         });
         // No separator: the strip's own baseline is the line between the tabs
@@ -131,12 +136,15 @@ impl SdroxideApp {
         ui.add_space(8.0);
 
         match self.rds_tab {
-            RdsTab::Station => self.rds_station(ui, standard),
+            RdsTab::Station => self.rds_station(ui, standard, chosen),
             RdsTab::Diagnostics => self.rds_diagnostics(ui),
         }
     }
 
-    fn rds_station(&mut self, ui: &mut egui::Ui, standard: RdsStandard) {
+    /// `standard` is the resolved one, which every code is read against.
+    /// `chosen` is what the operator actually selected, and is only consulted
+    /// about the call sign — see [`RdsStandard::names_from_pi`].
+    fn rds_station(&mut self, ui: &mut egui::Ui, standard: RdsStandard, chosen: RdsStandard) {
         let dim = |s: &str| RichText::new(s).size(9.5).color(dim_ink());
         let Some(d) = self.rds.as_ref() else {
             ui.label(dim("waiting for the receiver…"));
@@ -155,7 +163,7 @@ impl SdroxideApp {
 
         // The station's name, big, with what it is playing under it.
         ui.horizontal(|ui| {
-            let title = d.title(standard).unwrap_or_else(|| "—".to_string());
+            let title = d.title(chosen).unwrap_or_else(|| "—".to_string());
             ui.label(RichText::new(title).size(22.0).strong());
             if !d.sync {
                 ui.label(RichText::new("HOLDING").size(9.5).color(crate::theme::ALERT()))
@@ -187,9 +195,7 @@ impl SdroxideApp {
 
                     if let Some(pi) = d.pi {
                         let mut v = format!("{pi:04X}");
-                        if standard == RdsStandard::Rbds
-                            && let Some(call) = pi_callsign(pi)
-                        {
+                        if let Some(call) = d.call_sign(chosen) {
                             v = format!("{pi:04X}  ({call})");
                         }
                         row(ui, "IDENTITY", v);
@@ -275,6 +281,30 @@ impl SdroxideApp {
             "{} clean · {} corrected · {} lost",
             stats.blocks_ok, stats.blocks_corrected, stats.blocks_bad
         )));
+
+        // The cause, when it is this one. A block error rate is a symptom, and
+        // the symptom on its own sends the operator hunting for a better aerial
+        // — which is the wrong direction, because the station is already too
+        // strong. Nothing they can hear will tell them: the data subcarrier
+        // sits 28-34 dB below peak deviation up at 57 kHz, where FM's noise is
+        // some 15 dB worse than down where the programme lives, so it goes
+        // while the audio is still clean and the pilot still locked.
+        if self.meters.is_some_and(|m| m.adc_overloaded()) {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("FRONT END OVERLOADING")
+                    .size(10.5)
+                    .strong()
+                    .color(crate::theme::ALERT()),
+            )
+            .on_hover_text(
+                "The converter is clipping, which puts distortion right across the \
+                 multiplex — including on the 57 kHz data subcarrier. Turn the RF gain \
+                 down, or switch in an attenuator: RDS goes about a decibel before \
+                 anything is audible, so a station that sounds perfect can still be far \
+                 too strong for its data to survive.",
+            );
+        }
         ui.add_space(6.0);
 
         // Which group types this station actually sends. Empty columns are as

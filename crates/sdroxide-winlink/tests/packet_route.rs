@@ -237,3 +237,36 @@ fn a_vanished_controller_fails_the_read() {
     let e = t.read(&mut buf).expect_err("a vanished controller must not read as EOF");
     assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
 }
+
+/// One radio, one link. When the operator's terminal has it, a forwarding
+/// session must be refused rather than interleaving on it.
+#[test]
+fn the_transport_is_refused_when_the_controller_holds_the_lease() {
+    let (handle, endpoint) = link();
+    // What `PacketController` does when the operator presses CONNECT.
+    let _theirs = endpoint.try_claim().expect("the link was already claimed");
+    let e = Ax25Transport::connect(handle, "OE1XAB-8", &[], Duration::from_secs(2), quiet())
+        .expect_err("a session took a link the operator is using");
+    assert!(format!("{e}").contains("already in use"), "the refusal did not say why: {e}");
+}
+
+/// `PortEndpoint::emit` no longer blocks, so a session that stops reading loses
+/// events instead of stalling the audio thread. Losing them silently is the
+/// worse failure of the two: B2F would carry on against a stream with a hole
+/// in it and not find out until the CRC at the end of the whole message. The
+/// link has to die loudly instead.
+#[test]
+fn a_full_event_queue_is_refused_rather_than_blocking_the_link() {
+    let (handle, endpoint) = link();
+    let _lease = handle.try_claim().expect("the link was already claimed");
+    // Nobody reads `handle`, so the queue fills and stays full.
+    let mut refused = 0;
+    let start = std::time::Instant::now();
+    for _ in 0..500 {
+        if !endpoint.emit(PortEvent::Data(vec![0; 32])) {
+            refused += 1;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "emit blocked the caller");
+    }
+    assert!(refused > 0, "a bounded queue accepted five hundred events");
+}

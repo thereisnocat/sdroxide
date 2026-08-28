@@ -3,7 +3,9 @@
 
 use anyhow::Result;
 use sdroxide_config::Settings;
-use sdroxide_radio::{AudioParams, EngineConfig, IqSource, StoreSync, TxGate, start_engine};
+use sdroxide_radio::{
+    AudioParams, EngineConfig, IqSource, RadeWatch, StoreSync, TxGate, start_engine,
+};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -21,6 +23,7 @@ fn build_controller(
     primary: bool,
     gate: &Arc<TxGate>,
     sync: &Arc<StoreSync>,
+    rade: &Arc<RadeWatch>,
 ) -> LocalController {
     let (audio_out, audio_params) =
         match sdroxide_audio::start_output(settings.audio_output.as_deref(), 48_000) {
@@ -61,6 +64,7 @@ fn build_controller(
         primary,
         tx_gate: Some(gate.clone()),
         store_sync: Some(sync.clone()),
+        rade_watch: Some(rade.clone()),
         record_iq: boot.record_iq.clone(),
     };
     let handles = start_engine(boot.source, boot.caps, cfg);
@@ -86,13 +90,14 @@ pub fn run_multi(
 ) -> Result<()> {
     let gate = Arc::new(TxGate::new());
     let sync = Arc::new(StoreSync::new());
+    let rade = Arc::new(RadeWatch::new());
 
     let mut tabs = Vec::new();
     for (i, boot) in radios.into_iter().enumerate() {
         let id = boot.id;
         let name = boot.name.clone();
         let enabled = boot.enabled;
-        let ctrl = build_controller(boot, settings, tx_ham_only, i == 0, &gate, &sync);
+        let ctrl = build_controller(boot, settings, tx_ham_only, i == 0, &gate, &sync, &rade);
         tabs.push(sdroxide_ui::RadioTab { id, name, enabled, ctrl: Box::new(ctrl) });
     }
 
@@ -101,6 +106,7 @@ pub fn run_multi(
     // the open fails by design and the tab starts at Settings → Radio.
     let factory_gate = gate.clone();
     let factory_sync = sync.clone();
+    let factory_rade = rade.clone();
     let factory: sdroxide_ui::RadioFactory = Box::new(move || {
         let slot = sdroxide_config::create_radio("").map_err(|e| e.to_string())?;
         let settings = Settings::load();
@@ -133,8 +139,15 @@ pub fn run_multi(
             // names one file, and two bands interleaved into it are neither.
             record_iq: None,
         };
-        let ctrl =
-            build_controller(boot, &settings, tx_ham_only, false, &factory_gate, &factory_sync);
+        let ctrl = build_controller(
+            boot,
+            &settings,
+            tx_ham_only,
+            false,
+            &factory_gate,
+            &factory_sync,
+            &factory_rade,
+        );
         Ok(sdroxide_ui::RadioTab {
             id: slot.id,
             name: slot.name,

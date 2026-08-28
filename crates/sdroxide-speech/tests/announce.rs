@@ -41,6 +41,7 @@ fn meters(swr: Option<f32>, fwd: Option<f32>, keyed: bool) -> Meters {
     Meters {
         s_dbm: -100.0,
         adc_peak_dbfs: -30.0,
+        adc_clip: 0.0,
         tx: keyed.then_some(TxMeters { fwd_w: fwd, swr, alc: 0.0, po: None }),
         stereo: false,
         tone: None,

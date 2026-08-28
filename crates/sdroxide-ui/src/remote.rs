@@ -129,6 +129,10 @@ pub struct RemoteController {
     /// did. See [`RADIO_CFG_COALESCE_S`].
     radio_cfg_dirty: bool,
     radio_cfg_sent: f64,
+    /// A front-end centre waiting to go out, and the wall-clock second the last
+    /// one did. See [`CENTER_COALESCE_S`].
+    center_pending: Option<f64>,
+    center_sent: f64,
     /// Answers to the settings dialog's device questions, in the order the
     /// server ran them. Drained by [`RadioController::poll_probe`].
     probe_answers: VecDeque<sdroxide_types::ProbeAnswer>,
@@ -160,6 +164,36 @@ pub struct RemoteController {
 /// already reached the hardware through `Command::SetGain` as it moved, and
 /// this is only the copy that survives a restart. Apply skips the wait.
 const RADIO_CFG_COALESCE_S: f64 = 0.25;
+
+/// How long a commanded front-end centre is held before it goes out.
+///
+/// A panadapter drag that has run out of view to slide moves the *window*
+/// instead, so the operator's gesture produces one of these a frame for as long
+/// as their hand is down (issue #133). Locally that is a retune the hardware
+/// keeps up with; at the far end of a network it is also a message, a retune, a
+/// skimmer restart and a state broadcast to every other client on the station —
+/// sixty times a second, on a Pi that is already carrying the radio. What comes
+/// back is then a picture whose centre is a round trip behind the view it is
+/// drawn in, which is what issue #188 saw as the waterfall tearing under a drag.
+///
+/// A tenth of a second: fast enough that the window follows the hand — the view
+/// itself already moves every frame, and this only decides how often the
+/// capture catches up — and slow enough to cost the far end six retunes a
+/// second rather than sixty.
+const CENTER_COALESCE_S: f64 = 0.1;
+
+/// Whether `window` seconds have passed since something was last sent at
+/// `sent`, on a *wall* clock.
+///
+/// The second test is what makes it a wall clock rather than a stopwatch: an
+/// NTP step backwards would otherwise leave `sent` in the future and hold the
+/// queued value there until the clock caught up — which for the last nudge of a
+/// panadapter drag means the window simply never arrives where the operator put
+/// it. A `now` that is behind `sent` is nonsense, and the safe reading of
+/// nonsense here is "send it".
+fn window_elapsed(now: f64, sent: f64, window: f64) -> bool {
+    now < sent || now - sent >= window
+}
 
 /// The address of one of a station's radios, built from the address a
 /// connection is already on: everything up to the endpoint, then the radio's
@@ -201,6 +235,8 @@ impl RemoteController {
             radio_cfg: None,
             radio_cfg_dirty: false,
             radio_cfg_sent: 0.0,
+            center_pending: None,
+            center_sent: 0.0,
             probe_answers: VecDeque::new(),
             muted: false,
             peers: None,
@@ -295,6 +331,7 @@ impl RemoteController {
             ServerMsg::Drm(d) => self.pending.push_back(RadioEvent::Drm(d)),
             ServerMsg::IsmReports(r) => self.pending.push_back(RadioEvent::IsmReports(r)),
             ServerMsg::IsmStatus(s) => self.pending.push_back(RadioEvent::IsmStatus(s)),
+            ServerMsg::AdsbStatus(s) => self.pending.push_back(RadioEvent::AdsbStatus(s)),
             ServerMsg::RifpRows { image_id, y, w, h, rows } => {
                 self.pending.push_back(RadioEvent::RifpRows { image_id, y, w, h, rows })
             }
@@ -388,17 +425,26 @@ impl RemoteController {
             return;
         }
         let now = crate::time::now_unix_f64();
-        // `>=` as well as the window, because this is a wall clock: an NTP step
-        // backwards would otherwise park the deadline in the future and strand
-        // the edit there.
-        if !reopen && now >= self.radio_cfg_sent && now - self.radio_cfg_sent < RADIO_CFG_COALESCE_S
-        {
+        if !reopen && !window_elapsed(now, self.radio_cfg_sent, RADIO_CFG_COALESCE_S) {
             return;
         }
         let Some(cfg) = self.radio_cfg.clone() else { return };
         self.radio_cfg_dirty = false;
         self.radio_cfg_sent = now;
         self.send_msg(ClientMsg::Command(Command::SetRadioConfig { cfg: Box::new(cfg), reopen }));
+    }
+
+    /// Send the queued front-end centre, if the window has passed. See
+    /// [`CENTER_COALESCE_S`].
+    fn flush_center(&mut self) {
+        let Some(hz) = self.center_pending else { return };
+        let now = crate::time::now_unix_f64();
+        if !window_elapsed(now, self.center_sent, CENTER_COALESCE_S) {
+            return;
+        }
+        self.center_pending = None;
+        self.center_sent = now;
+        self.send_msg(ClientMsg::Command(Command::SetCenter(hz)));
     }
 
     fn pump_mic(&mut self) {
@@ -427,6 +473,15 @@ impl RemoteController {
 
 impl RadioController for RemoteController {
     fn send(&mut self, cmd: Command) {
+        // The one command a gesture produces once a frame for as long as it
+        // lasts, and the most expensive one to act on at the far end — held to
+        // a rate the network and the radio can carry, latest value wins. See
+        // [`CENTER_COALESCE_S`]; `flush_center` releases it.
+        if let Command::SetCenter(hz) = cmd {
+            self.center_pending = Some(hz);
+            self.flush_center();
+            return;
+        }
         self.send_msg(ClientMsg::Command(cmd));
     }
 
@@ -461,6 +516,7 @@ impl RadioController for RemoteController {
         }
         self.pump_mic();
         self.flush_radio_config(false);
+        self.flush_center();
         self.pending.pop_front()
     }
 
@@ -468,8 +524,12 @@ impl RadioController for RemoteController {
         // A queued interface edit counts: it is released by the clock rather
         // than by anything arriving, so without a frame to release it on, the
         // last nudge of a slider would sit here until something else woke the
-        // app up.
-        !self.pending.is_empty() || self.radio_cfg_dirty || !self.probe_answers.is_empty()
+        // app up. A queued centre is the same bargain — and there the value
+        // left behind would be the window the drag ended on.
+        !self.pending.is_empty()
+            || self.radio_cfg_dirty
+            || self.center_pending.is_some()
+            || !self.probe_answers.is_empty()
     }
 
     fn can_reconnect(&self) -> bool {
@@ -598,6 +658,10 @@ impl RadioController for RemoteController {
         // must not be applied to it. The fresh session announces its own.
         self.radio_cfg = None;
         self.radio_cfg_dirty = false;
+        // Likewise a centre queued against the dead session: the fresh one
+        // announces the window its own front end is on, and the view is fitted
+        // to that.
+        self.center_pending = None;
         // And an answer from the dead session: it describes a machine this
         // socket may not even be reaching any more.
         self.probe_answers.clear();
@@ -677,12 +741,56 @@ mod tests {
     fn first_frame_cfg() -> ClientMsg {
         ClientMsg::Command(Command::SetSpectrumCfg(SpectrumConfig {
             fft_size: 32768,
+            display_bins: 4096,
+            rows_per_sec: 56,
             fps: 60,
             avg_tc: 0.0,
             db_floor: -120.0,
             db_ceil: -20.0,
             viewport: Some((14_584_000.0, 14_968_000.0)),
         }))
+    }
+
+    /// The rate limiter both flushes are built on. The wall-clock guard is the
+    /// half worth pinning: without it a clock stepping backwards parks the
+    /// deadline in the future, and the value waiting behind it is the window a
+    /// panadapter drag has just been let go on.
+    #[test]
+    fn a_coalescing_window_survives_a_clock_that_steps_back() {
+        // Inside the window: held.
+        assert!(!window_elapsed(1000.05, 1000.0, 0.1));
+        // On the boundary and past it: sent.
+        assert!(window_elapsed(1000.1, 1000.0, 0.1));
+        assert!(window_elapsed(1001.0, 1000.0, 0.1));
+        // Behind what was stamped — an NTP correction — is sent, not stranded.
+        assert!(window_elapsed(999.0, 1000.0, 0.1));
+    }
+
+    /// What a drag costs the far end: the view still moves every frame, but the
+    /// wire carries the centre about ten times a second. Sixty retunes a second
+    /// is what issue #188's station was being asked for.
+    ///
+    /// A range rather than a count, because a frame clock and a tenth of a
+    /// second do not divide evenly and a send lands on the first frame at or
+    /// past the window — six frames sometimes, seven others. What the rule
+    /// promises is a rate, not a fencepost.
+    #[test]
+    fn a_drag_is_held_to_the_window() {
+        const SECS: u32 = 4;
+        const FPS: u32 = 60;
+        let (mut sent_at, mut sent) = (0.0_f64, 0);
+        for frame in 0..SECS * FPS {
+            let now = f64::from(frame) / f64::from(FPS);
+            if window_elapsed(now, sent_at, CENTER_COALESCE_S) {
+                sent_at = now;
+                sent += 1;
+            }
+        }
+        let per_sec = f64::from(sent) / f64::from(SECS);
+        assert!(
+            (8.0..=11.0).contains(&per_sec),
+            "a drag asked the far end for {per_sec} retunes a second"
+        );
     }
 
     /// The regression: on a link with real latency the UI issues commands

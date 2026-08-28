@@ -198,7 +198,16 @@ fn mode_digit(m: Mode) -> char {
         // for than a sideband — which at least leaves the sound card in the
         // transmit path. What actually goes out on one is then whatever the
         // engine modulated, through an SSB transmitter.
-        Mode::Nfm | Mode::Wfm | Mode::Rifp | Mode::Packet | Mode::Aprs => '2',
+        // No rig has an ADS-B mode and none ever will: the dial is at
+        // 1090 MHz. Grouped with FM so nothing downstream has to special-case
+        // a mode a radio can neither be put into nor report back.
+        Mode::Nfm
+        | Mode::Wfm
+        | Mode::Rifp
+        | Mode::Packet
+        | Mode::Aprs
+        | Mode::SstvFm
+        | Mode::Adsb => '2',
         Mode::Usb | Mode::Spec | Mode::Sstv | Mode::Wefax | Mode::RfPaint => '2',
     }
 }

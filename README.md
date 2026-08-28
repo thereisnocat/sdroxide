@@ -67,8 +67,10 @@ One binary, three ways to run it:
   raster), image **SSTV** (Scottie, Martin, Robot), image **RIFP**
   (draft-dulaunoy-rifp-00 — packetised, checksummed pictures over a 4800-baud
   CPFSK modem), receive-only **weather fax** (WEFAX/radiofax charts with a
-  station picker, phasing and slant correction), and transmit-only **RF Paint**
-  (spectrum painting of text and images onto the waterfall).
+  station picker, phasing and slant correction), transmit-only **RF Paint**
+  (spectrum painting of text and images onto the waterfall), and receive-only
+  **ADS-B** — the aircraft overhead on 1090 MHz, on a radar display with history
+  dots, speed vectors and data blocks.
 - **Receiver** — hang AGC, draggable passband filter edges (on the spectrum and
   the waterfall), noise blanker, auto-notch, **four noise-reduction engines**
   (RNNoise, DeepFilterNet3, a libspecbleach port and the built-in spectral NR,
@@ -572,13 +574,15 @@ starting sdroxide before the rig is fine:
   RSPdx HDR mode are available on the Radio tab, and only the rows the selected
   model actually supports are shown.
 
-  **An RSPduo can run both of its tuners at once**, which turns it into two
-  aerials on one clock — the same arrangement the LimeSDR's second receive
-  chain gives, and combined by the same adaptive filter: *cancel* to null a
-  local noise source, or *combine* for diversity reception that fills in HF
-  fades. The second tuner keeps its own LNA state and IF gain, since the two
-  aerials are rarely the same aerial. The API fixes the ADC clock in this mode,
-  so the widest span with both tuners running is 2 Msps.
+  **An RSPduo can run both of its tuners at once**, and there are two things to
+  do with the second one. Combined, it is two aerials on one clock — the same
+  arrangement the LimeSDR's second receive chain gives, and the same adaptive
+  filter: *cancel* to null a local noise source, or *combine* for diversity
+  reception that fills in HF fades, with the controls you actually use while
+  listening on the main strip. Left apart, it is simply a second radio: the
+  tuners tune separately, so one board can be an HF radio in one tab and a VHF
+  radio in another. The API fixes the ADC clock either way, so the widest span
+  with both tuners running is 2 Msps.
 
 - **ELAD FDM-DUO / FDM-S (USB)** — an ELAD FDM-DUO, FDM-DUOr, FDM-S2 or FDM-S1,
   driven directly over USB by a pure-Rust driver — no libusb, no gr-elad, no
@@ -595,17 +599,30 @@ starting sdroxide before the rig is fine:
   answer from the radio is what you give up. CW is keyed by the radio's own key
   or paddle: the FDM-DUO has no command that accepts text.
 
-  **The sample rate cannot be commanded.** The DDC delivers 192, 384, 768, 1536,
-  3072 or 6144 kHz and no request this driver knows selects between them — ELAD's
-  own GNU Radio module does not set it either, and the radio has no menu for it.
-  The device arrives in whatever mode it was left in (192 kHz on a fresh DUO) and
-  the Sample rate setting says how the stream is *read*; sdroxide measures the
-  real throughput a couple of seconds in and tells you on screen if the two
-  disagree. See "ELAD permissions" under Building for the Linux udev rule.
+  **An FDM-S1 or FDM-S2 needs its FPGA loaded before it will send anything.**
+  These are bus-powered front ends: the USB bridge runs from an EEPROM, so an
+  untouched one enumerates, reports its serial and acknowledges the start of the
+  stream — while the FPGA behind it comes up empty and no sample ever arrives.
+  Install ELAD's own `elad-firmware` loader (their Linux download area) as
+  `/usr/local/bin/elad-firmware` and sdroxide runs it for you at every open,
+  choosing the image for the Sample rate you picked; the six rates *are* six
+  images, which is why nothing in the vendor protocol selects between them. Take
+  the "intel" build — the newer "ubuntu-32" one is 32-bit and on a 64-bit machine
+  exits silently having done nothing.
+  Without the loader sdroxide says so on screen rather than sitting on "waiting
+  for spectrum" for ever.
+
+  **On an FDM-DUO the sample rate cannot be commanded.** The radio boots its own
+  FPGA, has no menu for the rate, and arrives in whatever mode it was left in
+  (192 kHz on a fresh one); there the Sample rate setting says how the stream is
+  *read*, and sdroxide measures the real throughput a couple of seconds in and
+  tells you on screen if the two disagree. See "ELAD permissions" under Building
+  for the Linux udev rule.
 
   **Not verified against hardware.** The whole backend is written from ELAD's own
-  [gr-elad](https://github.com/ELADIT/gr-elad) and the FDM-DUO manual's CAT
-  chapter. **Copy diagnostic report** on the Radio tab dumps every command
+  [gr-elad](https://github.com/ELADIT/gr-elad), the FDM-DUO manual's CAT chapter
+  and — for the FPGA load, which `gr-elad` does not do at all —
+  [SoapyELAD](https://github.com/DisagioDigitale/SoapyELAD). **Copy diagnostic report** on the Radio tab dumps every command
   exchanged with the device, and `cargo run -p sdroxide-elad --example probe`
   does the same from a terminal.
 
@@ -722,9 +739,10 @@ starting sdroxide before the rig is fine:
   audio transmit.
 
 - **Icom LAN** — an Icom on its own Ethernet/WiFi port (IC-7300MK2, IC-705,
-  IC-9700, IC-7610, IC-905, IC-R8600), speaking the same IP-remote protocol as
-  RS-BA1 — no RS-BA1 licence and no PC at the radio. Control, audio and the
-  radio's own 475-point spectrum scope over one connection. There is no I/Q on
+  IC-7610, IC-7760, IC-7851, IC-9700, IC-905, IC-R8600), speaking the same
+  IP-remote protocol as RS-BA1 — no RS-BA1 licence and no PC at the radio.
+  Control, audio and the radio's own spectrum scope — 475 points, or 689 on an
+  IC-7610 or IC-7760 — over one connection. There is no I/Q on
   any Icom; the audio stream carries either demodulated AF or the 12 kHz DRM IF,
   and sdroxide can demodulate the latter itself over about ±12 kHz. Not yet
   hardware-verified.
@@ -921,6 +939,15 @@ brew install pkg-config cmake autoconf automake libtool opus
   build: RADE's model weights are ~110 MB of generated C.
 - **libopus** is strictly optional, but installing it avoids a CMake 4 problem —
   see below.
+- **libfdk-aac** is optional and is a *runtime* dependency, not a build one:
+  nothing needs it to compile. It is what decodes **xHE-AAC**, the codec most
+  surviving DRM shortwave broadcasters now use, and the DRM window says so when
+  it is missing. It cannot be built in — its licence carries restrictions the
+  GPL does not permit, which is why Debian ships it in `non-free` — so sdroxide
+  looks for it at startup and uses it if it is there. `libfdk-aac2` on
+  Debian/Ubuntu, `libfdk-aac` on Arch, `brew install fdk-aac` on macOS, or
+  `libfdk-aac-2.dll` beside the executable on Windows. See
+  `vendor/fdk-aac/PROVENANCE.md`.
 
 For the **SoapySDR** backend you need its development libraries and the driver
 module(s) for your radio (e.g. `soapysdr`, `soapysdr-module-hackrf`,
@@ -1308,7 +1335,7 @@ way.
 | `--freq <HZ>` | Center frequency in Hz (default: where the last session was left; `14200000` on a first run). |
 | `--rate <HZ>` | Sample rate in Hz (default: from config). |
 | `--gain <DB>` | Overall RX gain in dB (default: hardware AGC / moderate). |
-| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB SPEC FT8 FT4 FT2 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP WEFAX RFPAINT RADE`. Default: the mode the last session was left in. |
+| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB SPEC FT8 FT4 FT2 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP WEFAX RFPAINT RADE ADS-B`. Default: the mode the last session was left in. |
 | `--antenna <NAME>` | RX antenna port, as the device names it (`LNAH`, `TX/RX`; see `--probe`). Default: the port the last session was left on. |
 | `--tx-antenna <NAME>` | TX antenna port, likewise (`BAND1`, `BAND2`). |
 | `--server` | Run as a server: HTTP web client + WebSocket streaming backend. |

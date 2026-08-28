@@ -180,6 +180,10 @@ pub enum CatUpdate {
     /// maximum. Read once when the port opens, so the panel's Drive slider ends
     /// up where the radio's own power control already is.
     Power(f32),
+    /// The squelch threshold the rig is set to, as a `0..1` fraction of its
+    /// own scale. Read once when the port opens, and adopted for the same
+    /// reason [`Self::Power`] is: the operator set it at the radio.
+    Squelch(f32),
     /// Which antenna socket the rig says it is receiving on, by the name that
     /// family gives the port (see [`Protocol::antennas`]).
     ///
@@ -295,6 +299,21 @@ trait Protocol: Send {
         Vec::new()
     }
 
+    /// Frames that put the rig's own *repeater shift* back to simplex, sent
+    /// whenever the dial moves to another band.
+    ///
+    /// The fourth thing that moves a transmit frequency, and the one that
+    /// [`Protocol::clear_offsets`] cannot cover: RIT, XIT and split stay where
+    /// they are put, but a radio with band stacking registers restores the
+    /// duplex setting the band was last left on as soon as the dial crosses
+    /// into it. On an IC-9700 that means 70 cm and 23 cm come up on DUP−, and
+    /// an operator who wanted simplex had no way to say so — sdroxide carries
+    /// the shift on the dial itself, so the radio's own would be added to it
+    /// (issue #192). Empty for families with no such command.
+    fn clear_duplex(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// Longest run of CW text this rig's keyer takes in one go, or 0 when it
     /// cannot be keyed from text at all. The caller sends no more than this per
     /// [`Protocol::send_cw`], so nothing has to be truncated on the way out.
@@ -356,6 +375,28 @@ trait Protocol: Send {
     }
     /// Whether [`Protocol::set_power`] reaches this family at all.
     fn commands_power(&self) -> bool {
+        false
+    }
+
+    /// Set the receiver's squelch threshold, as a `0..1` fraction of the rig's
+    /// own scale — `0` open, `1` closed, the way the front-panel knob reads.
+    ///
+    /// On a rig that hands us demodulated audio this is the *only* squelch
+    /// there is. What reaches the sound card has already been through the
+    /// radio's gate, so a threshold applied on this side can close further on
+    /// what got through but can never open what was shut out (issue #192).
+    /// Empty for families with no such command.
+    fn set_squelch(&mut self, _frac: f32) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    /// Frames asking where the rig's squelch is set, sent once when the port
+    /// opens so the control *adopts* the radio's own level — the same shape,
+    /// and the same reasoning, as [`Protocol::read_power`].
+    fn read_squelch(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    /// Whether [`Protocol::set_squelch`] reaches this family at all.
+    fn commands_squelch(&self) -> bool {
         false
     }
 
@@ -598,6 +639,9 @@ impl Protocol for Civ {
     fn clear_offsets(&self) -> Vec<Vec<u8>> {
         civ::clear_offsets_frames(self.radio)
     }
+    fn clear_duplex(&self) -> Vec<Vec<u8>> {
+        vec![civ::simplex_frame(self.radio)]
+    }
     fn cw_chunk_len(&self) -> usize {
         civ::CW_MAX
     }
@@ -623,6 +667,15 @@ impl Protocol for Civ {
         vec![civ::read_power_frame(self.radio)]
     }
     fn commands_power(&self) -> bool {
+        true
+    }
+    fn set_squelch(&mut self, frac: f32) -> Vec<Vec<u8>> {
+        vec![civ::set_squelch_frame(self.radio, frac)]
+    }
+    fn read_squelch(&self) -> Vec<Vec<u8>> {
+        vec![civ::read_squelch_frame(self.radio)]
+    }
+    fn commands_squelch(&self) -> bool {
         true
     }
     /// The same enable sequence the LAN backend sends, because it is the same
@@ -700,11 +753,16 @@ impl Protocol for Civ {
                         }
                     }
                 }
-                // Level read (0x14): only the transmit power (0x0A) is asked
-                // for, and only when the port opens.
+                // Level read (0x14): the transmit power (0x0A) and the
+                // squelch (0x03), both asked for only when the port opens. The
+                // sub-command byte in the reply is the only thing that says
+                // which arrived, which is why each parser checks it and answers
+                // None otherwise — the same shape as the meters below.
                 0x14 => {
                     if let Some(frac) = civ::parse_power_reply(&reply.data) {
                         out.push(CatUpdate::Power(frac));
+                    } else if let Some(frac) = civ::parse_squelch_reply(&reply.data) {
+                        out.push(CatUpdate::Squelch(frac));
                     }
                 }
                 // Meter read (0x15): while transmitting the SWR sub-meter
@@ -872,6 +930,8 @@ enum CatCmd {
     CwWpm(f32),
     /// Output power as a 0..1 fraction of the rig's maximum.
     Power(f32),
+    /// Squelch threshold as a 0..1 fraction of the rig's own scale.
+    Squelch(f32),
     /// The rig's own receive filter: the mode it applies to, and the audio-band
     /// edges in Hz.
     Filter(Mode, f32, f32),
@@ -894,6 +954,7 @@ pub struct CatHandle {
     cw_chunk_len: usize,
     commands_power: bool,
     commands_filter: bool,
+    commands_squelch: bool,
     antennas: &'static [&'static str],
 }
 
@@ -942,6 +1003,19 @@ impl CatHandle {
     /// Whether [`Self::set_power`] reaches this rig.
     pub fn commands_power(&self) -> bool {
         self.commands_power
+    }
+    /// Set the receiver's squelch threshold, as a `0..1` fraction of the rig's
+    /// own scale (`0` open, `1` closed). Silently ignored on a family with no
+    /// such command.
+    pub fn set_squelch(&self, frac: f32) {
+        if !self.commands_squelch {
+            return;
+        }
+        let _ = self.cmd_tx.send(CatCmd::Squelch(frac));
+    }
+    /// Whether [`Self::set_squelch`] reaches this rig.
+    pub fn commands_squelch(&self) -> bool {
+        self.commands_squelch
     }
     /// Set the rig's own receive filter to the passband the operator chose,
     /// as audio-band edges in Hz. Silently ignored on a family — or a model —
@@ -1052,14 +1126,15 @@ pub fn query_once(cfg: &CatConfig) -> Option<(Option<f64>, Option<Mode>)> {
             match u {
                 CatUpdate::Freq(hz) => freq = Some(hz),
                 CatUpdate::Mode(m) => mode = Some(m),
-                // No meter, the power, or the transmit state is requested
-                // during the startup query.
+                // No meter, the power, the squelch, or the transmit state is
+                // requested during the startup query.
                 CatUpdate::Swr(_)
                 | CatUpdate::Alc(_)
                 | CatUpdate::Po(_)
                 | CatUpdate::FwdW(_)
                 | CatUpdate::Signal(_)
                 | CatUpdate::Power(_)
+                | CatUpdate::Squelch(_)
                 | CatUpdate::Antenna(_)
                 | CatUpdate::Ptt(_) => {}
             }
@@ -1122,6 +1197,7 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
     // before it commands anything.
     let commands_power = make_protocol(&cfg).commands_power();
     let commands_filter = make_protocol(&cfg).commands_filter();
+    let commands_squelch = make_protocol(&cfg).commands_squelch();
     // And the same again for the antenna sockets: the caps this device
     // publishes are built before a single frame has gone out, so the list has
     // to come from the framing rather than from the rig.
@@ -1141,6 +1217,7 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
         cw_chunk_len,
         commands_power,
         commands_filter,
+        commands_squelch,
         antennas,
     }
 }
@@ -1195,6 +1272,12 @@ const POWER_GAP: Duration = Duration::from_millis(100);
 /// filter edge is dragged rather than nudged, several frames can go out per
 /// change on some families, and nothing about a receive filter is urgent.
 const FILTER_GAP: Duration = Duration::from_millis(250);
+
+/// Shortest gap between two squelch writes. The power's rather than the
+/// filter's: a squelch is set by ear against the noise it is muting, and a
+/// threshold that arrives a quarter of a second after the rail moved is one the
+/// operator cannot hear themselves setting.
+const SQUELCH_GAP: Duration = Duration::from_millis(100);
 
 /// What has been read from the link but not yet acted on: bytes still short of
 /// a whole reply, and the updates the whole ones yielded.
@@ -1356,6 +1439,27 @@ fn write_frame_within(
     protocol.wrote(frame);
     *last_write = Instant::now();
     failed
+}
+
+/// Whether the rig's own repeater shift needs putting back to simplex, given
+/// the dial this end believes it is on and the band that was last asserted for.
+///
+/// True once per band: the first dial a fresh connection learns, and every
+/// crossing after that. `asserted` is updated in place, so a caller that acts
+/// on the answer will not be told again until the dial moves somewhere else.
+///
+/// A dial outside every amateur band is [`sdroxide_types::Band::Gen`], and two
+/// such frequencies are the same "band" here — a radio whose duplex is
+/// re-stacked between two out-of-band frequencies is not one this can see, and
+/// there is nothing to transmit there anyway.
+fn needs_simplex(dial_hz: Option<f64>, asserted: &mut Option<sdroxide_types::Band>) -> bool {
+    let Some(hz) = dial_hz else { return false };
+    let band = sdroxide_types::Band::containing(hz);
+    if *asserted == Some(band) {
+        return false;
+    }
+    *asserted = Some(band);
+    true
 }
 
 /// Write an output-power level, unless it is the one the rig was last given.
@@ -1748,6 +1852,16 @@ fn serial_thread(
                     break 'opening true;
                 }
             }
+            // And where the squelch is set, adopted the same way and for the
+            // same reason. On a rig sending demodulated audio this is the gate
+            // the operator actually hears, so the control has to start on the
+            // radio's own level rather than somewhere the audio would not
+            // match.
+            for f in protocol.read_squelch() {
+                if write_frame(&mut *port, &mut *protocol, &f, &mut last_write, &mut io) {
+                    break 'opening true;
+                }
+            }
             // Which socket the receiver is on, asked the same
             // once-per-connection way and adopted the same way. The rig
             // remembers it across power cycles, so this is the only moment the
@@ -1834,6 +1948,12 @@ fn serial_thread(
         let mut pending_filter: Option<(Mode, f32, f32)> = None;
         let mut last_sent_filter: Option<(Mode, f32, f32)> = None;
         let mut filter_deadline = Instant::now();
+        // The squelch, on the same rate limit and the same only-on-change rule
+        // as the filter, and skipped during an over for the same reason: it is
+        // a receive setting, and the bus belongs to the meters while keyed.
+        let mut pending_squelch: Option<f32> = None;
+        let mut last_sent_squelch: Option<f32> = None;
+        let mut squelch_deadline = Instant::now();
         // The socket this end has put the receiver on since the port opened, so
         // the opening read's answer can be told from the truth (see where it is
         // parsed). `None` until something is commanded, which is where a rig
@@ -1843,6 +1963,12 @@ fn serial_thread(
         // Only forward genuine changes so the engine isn't re-notified every poll.
         let mut emit_freq: Option<f64> = None;
         let mut emit_mode: Option<Mode> = None;
+        // The band this end has already put the rig's own repeater shift back
+        // to simplex for (see [`Protocol::clear_duplex`]). `None` on a fresh
+        // connection, so the first dial the rig reports — the opening poll's
+        // answer, a round trip after the port opens — asserts it once, and
+        // every band change after that re-asserts it.
+        let mut simplex_band: Option<sdroxide_types::Band> = None;
         // The rig's own transmit state as last reported upwards, and when its
         // last answer arrived. `None` = never answered, which is where a family
         // with no such read stays for good.
@@ -2033,6 +2159,8 @@ fn serial_thread(
                     // handed hundreds of them.
                     Ok(CatCmd::Filter(m, lo, hi)) => pending_filter = Some((m, lo, hi)),
                     Ok(CatCmd::Power(frac)) => pending_power = Some(frac), // coalesce
+                    // Coalesced like the power: this one is a slider too.
+                    Ok(CatCmd::Squelch(frac)) => pending_squelch = Some(frac),
                     // Not coalesced and not rate limited: an antenna is a click
                     // on a two-entry list, not a slider being dragged, and it
                     // is one frame either way.
@@ -2114,6 +2242,33 @@ fn serial_thread(
                 }
             }
 
+            // Rate-limited squelch write, on the same terms as the filter above.
+            if let Some(frac) = pending_squelch
+                && !ptt
+            {
+                let now = Instant::now();
+                if now >= squelch_deadline {
+                    pending_squelch = None;
+                    squelch_deadline = now + SQUELCH_GAP;
+                    if last_sent_squelch != Some(frac) {
+                        let mut failed = false;
+                        for frame in protocol.set_squelch(frac) {
+                            failed |= write_frame(
+                                &mut *port,
+                                &mut *protocol,
+                                &frame,
+                                &mut last_write,
+                                &mut io,
+                            );
+                        }
+                        if failed {
+                            break 'io true;
+                        }
+                        last_sent_squelch = Some(frac);
+                    }
+                }
+            }
+
             // Debounced frequency write (rate-limit to ~50 ms, only on change).
             if let Some(hz) = pending_freq {
                 let now = Instant::now();
@@ -2126,6 +2281,29 @@ fn serial_thread(
                     emit_freq = Some(hz); // suppress the poll echo of our own set
                     pending_freq = None;
                     freq_deadline = now + Duration::from_millis(50);
+                }
+            }
+
+            // The rig's own repeater shift, put back to simplex whenever the
+            // dial has moved to another band — because that is exactly when a
+            // radio with band stacking registers puts it back on (issue #192).
+            //
+            // Driven off `emit_freq` rather than off the write above, so it
+            // covers a band changed at the radio's own front panel as well as
+            // one commanded from here: that variable is the dial this end has
+            // reason to believe the rig is on, however it got there.
+            //
+            // Never while keyed. Nothing about a shift matters mid-over — the
+            // transmit frequency went out with the key-down — and the one
+            // moment the bus must not carry a receive setting is the one the
+            // meters are being read in.
+            if !ptt && needs_simplex(emit_freq, &mut simplex_band) {
+                let mut failed = false;
+                for f in protocol.clear_duplex() {
+                    failed |= write_frame(&mut *port, &mut *protocol, &f, &mut last_write, &mut io);
+                }
+                if failed {
+                    break 'io true;
                 }
             }
 
@@ -2358,6 +2536,18 @@ fn serial_thread(
                     let _ = event_tx.send(u);
                     continue;
                 }
+                // The squelch the rig reports, asked for once per connection.
+                // Suppressed once this end has set one: the only answer that
+                // can arrive after that is the opening read crossing the
+                // command on the wire, and adopting it would drag the slider
+                // back to where the radio was before the operator moved it.
+                if let CatUpdate::Squelch(frac) = u {
+                    if last_sent_squelch.is_none() {
+                        last_sent_squelch = Some(frac);
+                        let _ = event_tx.send(u);
+                    }
+                    continue;
+                }
                 // The socket the rig says it is on. Forwarded whole — it is asked for once per
                 // connection, so there are no repeats to dedup — unless it disagrees with a socket
                 // this end has already commanded on this connection, in which case it is the answer
@@ -2396,13 +2586,15 @@ fn serial_thread(
                         }
                         c
                     }
-                    // The meters, the power and the transmit state are handled above.
+                    // The meters, the power, the squelch and the transmit state are
+                    // handled above.
                     CatUpdate::Swr(_)
                     | CatUpdate::Alc(_)
                     | CatUpdate::Po(_)
                     | CatUpdate::FwdW(_)
                     | CatUpdate::Signal(_)
                     | CatUpdate::Power(_)
+                    | CatUpdate::Squelch(_)
                     | CatUpdate::Antenna(_)
                     | CatUpdate::Ptt(_) => false,
                 };
@@ -2429,6 +2621,33 @@ fn serial_thread(
 mod tests {
     use super::*;
     use sdroxide_types::CatFamily;
+
+    /// The rig's own repeater shift is put back to simplex once per band, not
+    /// once per connection: an IC-9700 keeps a band stacking register per band
+    /// and restores that band's duplex the moment the dial crosses into it,
+    /// which is what left 70 cm and 23 cm stuck on DUP− (issue #192).
+    #[test]
+    fn the_duplex_is_re_asserted_on_every_band_change() {
+        use sdroxide_types::Band;
+        let mut asserted: Option<Band> = None;
+        // Nothing is claimed about a rig that has not said where it is.
+        assert!(!needs_simplex(None, &mut asserted));
+        assert_eq!(asserted, None);
+        // The first dial a fresh connection learns arms it once…
+        assert!(needs_simplex(Some(145_500_000.0), &mut asserted));
+        assert_eq!(asserted, Some(Band::M2));
+        // …and only once: a dial that moves inside the band changes nothing,
+        // and neither does the same frequency arriving on every poll.
+        assert!(!needs_simplex(Some(145_500_000.0), &mut asserted));
+        assert!(!needs_simplex(Some(144_500_000.0), &mut asserted));
+        // 70 cm and 23 cm are where the IC-9700 puts DUP− back.
+        assert!(needs_simplex(Some(432_500_000.0), &mut asserted));
+        assert_eq!(asserted, Some(Band::M70));
+        assert!(needs_simplex(Some(1_297_000_000.0), &mut asserted));
+        assert_eq!(asserted, Some(Band::Cm23));
+        // And back again — a band already visited is still a band change.
+        assert!(needs_simplex(Some(145_500_000.0), &mut asserted));
+    }
 
     /// `FE FE 00 94 00 …` — the rig telling the bus its dial has moved.
     fn broadcast_freq(hz: f64) -> Vec<u8> {
@@ -2636,6 +2855,34 @@ mod tests {
             let cfg = CatConfig { cw_keying: k, digi_mode: DigiMode::Data, ..CatConfig::default() };
             assert_eq!(commanded_mode(&cfg, Mode::Ft8), Some(Mode::Digu), "{k:?}");
         }
+    }
+
+    /// SSTV on VHF rides an FM carrier, so the rig has to be put in FM — not on
+    /// the digital modes' sideband, whatever `digi_mode` says.
+    ///
+    /// This is the whole of the "2 m SSTV in FM" complaint: SSTV commanded USB
+    /// on every band, and there was no way to ask for FM at all (issue #192).
+    /// [`Mode::SstvFm`] is a mode of its own for exactly this reason — every
+    /// family's map has to answer differently for it, and none of them has a
+    /// dial frequency to work the answer out from.
+    #[test]
+    fn sstv_on_fm_is_commanded_as_fm_and_not_on_the_digi_sideband() {
+        for digi in [DigiMode::Radio, DigiMode::Usb, DigiMode::Data] {
+            let cfg = CatConfig { digi_mode: digi, ..CatConfig::default() };
+            assert_eq!(commanded_mode(&cfg, Mode::SstvFm), Some(Mode::SstvFm), "{digi:?}");
+            // Its HF twin is the one that rides a sideband, and still does.
+            assert_eq!(commanded_mode(&cfg, Mode::Sstv), Some(Mode::Sstv), "{digi:?}");
+        }
+        // And what each family actually writes for it is FM: an Icom's own
+        // mode byte, and the data-over-FM spelling everywhere the family has
+        // one. The two SSTV modes must not land on the same byte.
+        assert_eq!(civ::mode_to_civ(Mode::SstvFm), civ::mode_to_civ(Mode::Nfm));
+        assert_ne!(civ::mode_to_civ(Mode::SstvFm), civ::mode_to_civ(Mode::Sstv));
+        // `Mode control: Radio` still means hands off, as it does for every
+        // other mode — an operator who has said not to touch the rig's mode is
+        // not overruled by the picture they chose.
+        let hands_off = CatConfig { mode_control: ModeControl::Radio, ..CatConfig::default() };
+        assert_eq!(commanded_mode(&hands_off, Mode::SstvFm), None);
     }
 
     /// `PC` is watts, and the families' documented floor is 5 W — a rig cannot

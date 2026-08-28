@@ -34,6 +34,9 @@ pub fn run(mut source: Box<dyn IqSource>, opts: Options) -> anyhow::Result<()> {
     );
 
     let mut analyzer = SpectrumAnalyzer::new(opts.fft_size, rate, 0.3);
+    // The dBFS column beside every line is this front end's alone, and the scan
+    // that feeds it is off unless something asks — see `set_peak_track`.
+    analyzer.set_peak_track(true);
     let mut buf = vec![Complex32::default(); 16_384];
     let period = Duration::from_secs_f64(1.0 / opts.fps as f64);
     let mut next_line = Instant::now() + period;

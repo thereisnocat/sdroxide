@@ -427,3 +427,141 @@ fn applying_a_settings_change_keeps_the_operating_position() {
         let _ = t.join();
     }
 }
+
+/// The stand-in for a radio the operator has switched off: no samples, and —
+/// unlike [`Offline`] — it does not ask to be reopened. A radio that is off is
+/// not one waiting to come back.
+struct SwitchedOff;
+
+impl IqSource for SwitchedOff {
+    fn sample_rate(&self) -> f64 {
+        RATE
+    }
+    fn center_hz(&self) -> f64 {
+        CENTER
+    }
+    fn set_center_hz(&mut self, _hz: f64) -> Result<()> {
+        Ok(())
+    }
+    fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+        std::thread::sleep(Duration::from_millis(5));
+        Ok(0)
+    }
+    fn describe(&self) -> String {
+        "switched off".into()
+    }
+    fn open_status(&self) -> Option<String> {
+        Some("this radio is switched off".into())
+    }
+    fn needs_reopen(&self) -> bool {
+        false
+    }
+}
+
+/// The rig, with a witness for having been stood down again.
+struct Tracked {
+    released: Arc<AtomicBool>,
+}
+
+impl IqSource for Tracked {
+    fn sample_rate(&self) -> f64 {
+        RATE
+    }
+    fn center_hz(&self) -> f64 {
+        CENTER
+    }
+    fn set_center_hz(&mut self, _hz: f64) -> Result<()> {
+        Ok(())
+    }
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        std::thread::sleep(Duration::from_millis(5));
+        let n = buf.len().min(256);
+        buf[..n].fill(Complex32::new(0.0, 0.0));
+        Ok(n)
+    }
+    fn describe(&self) -> String {
+        "live rig".into()
+    }
+    fn release(&mut self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Switching a radio off while it is reconnecting must switch it off.
+///
+/// The engine's background reconnect can be halfway through opening a rig when
+/// the operator throws the power switch — which is exactly when they throw it,
+/// a radio that has just dropped its link being the one you reach for. The
+/// attempt then finishes and answers with a live interface for a radio nobody
+/// wants opened any more: adopting it would claim the device again, put the
+/// LAN session back up and leave the switch reading OFF over a radio that is
+/// on. The operator's own change is the later word and must be the last one.
+#[test]
+fn switching_off_mid_reconnect_is_not_undone_by_the_attempt_in_flight() {
+    // Held by the factory's first (background) call until the test lets go, so
+    // the switch is thrown with an attempt genuinely in flight.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let entered = Arc::clone(&in_flight);
+    let switched_off = Arc::new(AtomicBool::new(false));
+    let is_off = Arc::clone(&switched_off);
+    let released = Arc::new(AtomicBool::new(false));
+    let witness = Arc::clone(&released);
+
+    let reopen: sdroxide_radio::ReopenFn = Box::new(move |_center: f64| {
+        // What the binary's factory does: the roster is the authority, and a
+        // radio that is off is answered with the quiet stand-in rather than a
+        // refusal.
+        if is_off.load(Ordering::SeqCst) {
+            return Ok((Box::new(SwitchedOff) as Box<dyn IqSource>, caps("off")));
+        }
+        entered.store(true, Ordering::SeqCst);
+        // A network rig that takes its time to answer.
+        let _ = release_rx.recv();
+        Ok((
+            Box::new(Tracked { released: Arc::clone(&witness) }) as Box<dyn IqSource>,
+            caps("live"),
+        ))
+    });
+
+    let cfg = EngineConfig { reopen: Some(reopen), ..Default::default() };
+    let mut h = start_engine(Box::new(Offline), caps("offline"), cfg);
+    let thread = h.thread.take();
+
+    // Wait for the reconnect worker to be inside the open (~1 s in).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !in_flight.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(in_flight.load(Ordering::SeqCst), "the reconnect attempt never started");
+
+    // The power switch: the roster is written, then the engine is asked to
+    // build its front end again from it.
+    switched_off.store(true, Ordering::SeqCst);
+    h.swap_tx.send(EngineSwap::ReopenSource).expect("engine is running");
+    // ...and only now does the attempt already in flight answer.
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = release_tx.send(());
+
+    // The engine settles on the stand-in, and stays there: the late answer is
+    // let go of rather than adopted on top of the operator's change. Long
+    // enough to cover both the swap and the first reconnect tick that would
+    // have collected the attempt (~1 s).
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut driver = String::new();
+    while Instant::now() < until {
+        while let Ok(ev) = h.event_rx.try_recv() {
+            if let RadioEvent::Capabilities(c) = ev {
+                driver = c.driver;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(driver, "off", "a radio switched off must stay off");
+    assert!(released.load(Ordering::SeqCst), "the abandoned attempt's device was never let go");
+
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+}

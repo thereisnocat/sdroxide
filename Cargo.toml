@@ -2,10 +2,20 @@
 resolver = "3"
 members = ["crates/*"]
 default-members = [".", "crates/sdroxide-types", "crates/sdroxide-proto", "crates/sdroxide-dsp", "crates/sdroxide-radio", "crates/sdroxide-config"]
-# The vendored `soapysdr` is reached through `[patch.crates-io]`, not as a
-# member: it is upstream's crate under upstream's licence, not ours to lint or
+# The vendored crates are reached through `[patch.crates-io]`, not as members:
+# they are upstream's code under upstream's licences, not ours to lint or
 # version with the rest.
-exclude = ["vendor/soapysdr"]
+exclude = ["vendor/soapysdr", "vendor/ewebsock"]
+
+[patch.crates-io]
+
+# `ewebsock` 0.8.0 with one error classifier widened. On Windows a blocking
+# read whose timeout expires may be answered with `ERROR_IO_PENDING` (997)
+# rather than with a timeout, and upstream treats anything that is not
+# `WouldBlock`/`TimedOut` as a dead connection — so a remote client lost its
+# session every twenty minutes or so and had to be reconnected by hand.
+# See vendor/ewebsock/PROVENANCE.md; this stays until upstream carries it.
+ewebsock = { path = "vendor/ewebsock" }
 
 # `soapysdr` 0.5.1 with one method added: `Device::setting_info`, the call that
 # says which settings a driver has. Upstream wraps `readSetting`/`writeSetting`
@@ -13,11 +23,10 @@ exclude = ["vendor/soapysdr"]
 # crate — so a host can set a driver setting it already knows the name of, but
 # cannot discover one. That is what the SoapySDR settings panel is built on.
 # See vendor/soapysdr/PROVENANCE.md; this stays until the method is upstream.
-[patch.crates-io]
 soapysdr = { path = "vendor/soapysdr" }
 
 [workspace.package]
-version = "1.5.1"
+version = "1.5.4"
 edition = "2024"
 # The native binary links mfsk-core (GPL-3.0-or-later) for FT8/FT4 and the
 # DeepCW model (AGPL-3.0-only) for CW, so the built binary carries both. AGPL is
@@ -48,6 +57,12 @@ opt-level = 2
 # The ISM burst gate measures the power of every sample on every channel in the
 # plan; unoptimized that alone outweighs the rest of the receive chain.
 [profile.dev.package.sdroxide-ism]
+opt-level = 2
+
+# The ADS-B preamble correlator touches every sample of a 2.4 Msps stream and
+# then slices 112 bits per candidate; unoptimized it costs more than everything
+# else in the receive chain put together.
+[profile.dev.package.sdroxide-adsb]
 opt-level = 2
 
 # RADE's per-frame buffer shuffling sits between two C libraries that are
@@ -103,6 +118,7 @@ sdroxide-kiss = { path = "crates/sdroxide-kiss" }
 sdroxide-deepcw = { path = "crates/sdroxide-deepcw" }
 sdroxide-ism = { path = "crates/sdroxide-ism" }
 sdroxide-aprs = { path = "crates/sdroxide-aprs" }
+sdroxide-adsb = { path = "crates/sdroxide-adsb" }
 
 serde = { version = "1", features = ["derive"] }
 num-complex = "0.4"

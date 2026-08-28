@@ -62,6 +62,33 @@ pub struct SimConfig {
     pub noise: f32,
     /// Refuse GUI registration, to exercise the client's error path.
     pub refuse_gui: bool,
+    /// GUI clients already registered when ours arrives, as
+    /// `(client_id, station)`. A `client gui` naming one of these ids evicts it
+    /// and says so, exactly as a radio does — which is the fault a client that
+    /// derives its id from a default station name walks into every time.
+    pub existing_clients: Vec<(String, String)>,
+    /// Refuse the TCP `client udpport` command and learn the client's UDP
+    /// endpoint only from a datagram it sends us.
+    ///
+    /// Not a hypothetical: the v1.4.0.0 protocol a FLEX-6600 speaks may answer
+    /// `client udpport` with "command not supported", leaving the registration
+    /// datagram as the only thing that tells the radio where to stream. A
+    /// simulator that always honours `client udpport` cannot fail that way, and
+    /// so cannot catch a client that never sends the datagram.
+    pub require_udp_register: bool,
+    /// Swallow the first `display pan set … daxiq_channel=`, as a radio does
+    /// when the panadapter it names was created a moment ago and is not ready to
+    /// be configured yet.
+    ///
+    /// It is acknowledged and it does nothing, so the DAX IQ stream comes up
+    /// bound to no panadapter: created, accepting a rate, reporting itself
+    /// active, and carrying nothing at all. The silent half of "connects fine,
+    /// no spectrum", and the reason a client has to read `pan=` back instead of
+    /// assuming the bind landed.
+    pub unbound_dax_iq: bool,
+    /// Evict this client for a duplicate client id once it has been registered
+    /// for this long, as a radio does when a second client claims its id.
+    pub evict_after: Option<Duration>,
 }
 
 impl Default for SimConfig {
@@ -87,6 +114,10 @@ impl Default for SimConfig {
             ],
             noise: 0.002,
             refuse_gui: false,
+            existing_clients: Vec::new(),
+            require_udp_register: false,
+            unbound_dax_iq: false,
+            evict_after: None,
         }
     }
 }
@@ -287,6 +318,17 @@ struct Session {
     /// its DAX TX audio arrives on.
     udp: Option<UdpSocket>,
     gui_registered: bool,
+    /// When [`SimConfig::evict_after`] starts counting.
+    registered_at: Option<Instant>,
+    /// Whether the eviction notice has already gone out.
+    evicted: bool,
+    /// Other GUI clients the radio believes are connected, as
+    /// `(handle, client_id, station)`.
+    others: Vec<(u32, String, String)>,
+    /// Whether a panadapter is bound to our DAX IQ channel.
+    iq_pan_bound: bool,
+    /// Whether [`SimConfig::unbound_dax_iq`] has already eaten a bind.
+    swallowed_bind: bool,
     iq_stream: Option<u32>,
     iq_channel: u32,
     iq_rate: u32,
@@ -318,6 +360,13 @@ impl Session {
     ) -> Session {
         let phases = vec![0.0; cfg.carriers.len()];
         let slice_hz = cfg.start_freq_hz;
+        // Handles for the pre-existing clients, kept clear of ours.
+        let others: Vec<(u32, String, String)> = cfg
+            .existing_clients
+            .iter()
+            .enumerate()
+            .map(|(i, (id, station))| (0x1000_0000 + i as u32, id.clone(), station.clone()))
+            .collect();
         Session {
             sock,
             cfg,
@@ -327,6 +376,11 @@ impl Session {
             client_udp: None,
             udp: None,
             gui_registered: false,
+            registered_at: None,
+            evicted: false,
+            others,
+            iq_pan_bound: false,
+            swallowed_bind: false,
             iq_stream: None,
             iq_channel: 0,
             iq_rate: 48_000,
@@ -390,6 +444,7 @@ impl Session {
                 Err(_) => break,
             }
 
+            self.maybe_evict();
             self.pump_iq();
             self.pump_meters();
             self.drain_client_udp(&mut rx_buf);
@@ -437,14 +492,38 @@ impl Session {
                     self.reply(seq, 0xF300_0001, "in use");
                     return;
                 }
+                // A radio does not refuse a duplicate client id — it hands the
+                // session to the newcomer and throws the incumbent off. That
+                // silence is the whole problem: nothing in the reply says
+                // somebody was just disconnected on our behalf.
+                let wanted = rest.get(1).copied().unwrap_or("");
+                if let Some(pos) =
+                    self.others.iter().position(|(_, id, _)| id.eq_ignore_ascii_case(wanted))
+                {
+                    let (handle, _, _) = self.others.remove(pos);
+                    self.status(&format!(
+                        "client 0x{handle:08X} disconnected forced=0                          wan_validation_failed=0 duplicate_client_id=1"
+                    ));
+                }
                 self.gui_registered = true;
-                self.reply(seq, 0, rest.get(1).copied().unwrap_or(""));
+                self.registered_at = Some(Instant::now());
+                self.reply(seq, 0, wanted);
+                let h = self.handle;
+                self.status(&format!(
+                    "client 0x{h:08X} connected local_ptt=1 client_id={wanted} program=sdroxide"
+                ));
                 self.send_radio_status();
                 self.send_meter_defs();
                 self.send_slice_status();
                 self.send_transmit_status();
             }
             ("client", Some("station")) => self.reply(seq, 0, ""),
+            ("client", Some("udpport")) if self.cfg.require_udp_register => {
+                // What a v1.4.0.0 radio can answer. The client must fall back to
+                // teaching us its address with a datagram of its own.
+                self.reply(seq, 0x5000_1000, "command not supported");
+            }
+            ("client", Some("set")) => self.reply(seq, 0, ""),
             ("client", Some("udpport")) => {
                 match rest.get(1).and_then(|p| p.parse::<u16>().ok()) {
                     Some(port) => {
@@ -458,19 +537,27 @@ impl Session {
                 }
             }
             ("sub", _) => {
-                self.reply(seq, 0, "");
                 // Subscribing is what makes a radio dump the current state of
                 // that topic — the burst *is* the subscription's payload, and a
                 // client that only ever sees future changes never learns which
                 // slice it owns.
+                //
+                // The burst goes out BEFORE the reply, which is the order a real
+                // radio uses (a field trace shows every `S…|slice` arriving
+                // ahead of its `R6|0|`). Replying first looks equivalent and is
+                // not: a client that reads up to the reply and then acts on what
+                // it collected sees an empty burst, which is how a duplicate
+                // client-id check passed against a radio that had one.
                 match rest.first().copied() {
                     Some("slice") => self.send_slice_status(),
                     Some("pan") => self.send_pan_status(),
                     Some("tx") => self.send_transmit_status(),
                     Some("meter") => self.send_meter_defs(),
                     Some("radio") => self.send_radio_status(),
+                    Some("client") => self.send_client_status(),
                     _ => {}
                 }
+                self.reply(seq, 0, "");
             }
             ("keepalive", _) | ("ping", _) => self.reply(seq, 0, ""),
             ("display", Some("panafall")) => match rest.get(1).copied() {
@@ -494,7 +581,17 @@ impl Session {
                     self.pan_bw_hz = b * 1e6;
                 }
                 if let Some(ch) = kvs.get("daxiq_channel").and_then(|v| v.parse::<u32>().ok()) {
+                    if self.cfg.unbound_dax_iq && !self.swallowed_bind {
+                        // Acknowledged, and dropped on the floor.
+                        self.swallowed_bind = true;
+                        self.reply(seq, 0, "");
+                        return;
+                    }
                     self.iq_channel = ch;
+                    self.iq_pan_bound = true;
+                    // The binding is what an IQ stream needs to carry anything,
+                    // so report it — the client is entitled to read `pan=` back.
+                    self.send_iq_stream_status();
                 }
                 self.reply(seq, 0, "");
                 self.send_pan_status();
@@ -679,15 +776,27 @@ impl Session {
         ));
     }
 
+    /// The connected-client list, which is what `sub client all` is for: a
+    /// client can only avoid stealing an id it can see somebody else holding.
+    fn send_client_status(&mut self) {
+        for (handle, id, station) in self.others.clone() {
+            self.status(&format!(
+                "client 0x{handle:08X} connected local_ptt=1 client_id={id} \
+                 program=SmartSDR station={station}"
+            ));
+        }
+    }
+
     fn send_iq_stream_status(&mut self) {
         let Some(id) = self.iq_stream else { return };
         let h = self.handle;
         let (ch, rate) = (self.iq_channel, self.iq_rate);
+        let bound = self.iq_pan_bound || !self.cfg.unbound_dax_iq;
+        let pan = if bound { p::hex_id(PAN_ID) } else { "0x0".to_string() };
         self.status(&format!(
-            "stream {} type=dax_iq daxiq_channel={ch} pan={} daxiq_rate={rate} \
+            "stream {} type=dax_iq daxiq_channel={ch} pan={pan} daxiq_rate={rate} \
              client_handle=0x{h:08X} active=1",
             p::hex_id(id),
-            p::hex_id(PAN_ID),
         ));
     }
 
@@ -697,6 +806,12 @@ impl Session {
     /// call, so the stream runs at its declared rate rather than as fast as the
     /// loop spins.
     fn pump_iq(&mut self) {
+        // A stream bound to no panadapter has no baseband to carry. It exists,
+        // it answers commands, and it is silent.
+        if self.cfg.unbound_dax_iq && !self.iq_pan_bound {
+            self.last_tick = Instant::now();
+            return;
+        }
         let (Some(stream), Some(dest)) = (self.iq_stream, self.client_udp) else {
             // Nothing to send yet: reset the clock so the first packet after the
             // stream comes up isn't a burst covering the whole setup handshake.
@@ -811,7 +926,14 @@ impl Session {
     /// datagram it opens with.
     fn drain_client_udp(&mut self, buf: &mut [u8]) {
         let Some(udp) = self.udp.as_ref() else { return };
-        while let Ok((n, _from)) = udp.recv_from(buf) {
+        while let Ok((n, from)) = udp.recv_from(buf) {
+            // Any datagram from the client teaches us its return address. On a
+            // radio that never answered `client udpport` this is the only thing
+            // that does — which is why it is learned from *every* datagram and
+            // not only from a registration one.
+            if self.client_udp != Some(from) {
+                self.client_udp = Some(from);
+            }
             let Some(h) = p::parse_vita_header(&buf[..n]) else { continue };
             if h.class_code != p::pcc::IF_NARROW || Some(h.stream_id) != self.tx_stream {
                 continue;
@@ -829,6 +951,31 @@ impl Session {
             let micro = (peak * 1e6) as u64;
             self.stats.tx_peak_micro.fetch_max(micro, Ordering::Relaxed);
         }
+    }
+
+    /// Throw this client off for a duplicate client id, once
+    /// [`SimConfig::evict_after`] has elapsed since it registered.
+    ///
+    /// The notice and the socket close are both the radio's: a client that only
+    /// notices the TCP close learns nothing about *why*, and reconnects into the
+    /// same fight.
+    fn maybe_evict(&mut self) {
+        if self.evicted {
+            return;
+        }
+        let Some(after) = self.cfg.evict_after else { return };
+        if self.registered_at.is_none_or(|t| t.elapsed() < after) {
+            return;
+        }
+        self.evicted = true;
+        let h = self.handle;
+        self.status(&format!(
+            "client 0x{h:08X} disconnected forced=0 wan_validation_failed=0 \
+             duplicate_client_id=1"
+        ));
+        // Let the notice reach the client before the socket goes.
+        std::thread::sleep(Duration::from_millis(50));
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     /// xorshift64* — deterministic, and good enough for a noise floor.

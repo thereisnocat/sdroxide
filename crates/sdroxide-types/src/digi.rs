@@ -51,6 +51,48 @@ pub struct Decode {
     pub rr73_to: Option<String>,
 }
 
+/// How the FT8/FT4 decode list orders the stations — within each turn, or
+/// across the whole list when the single-list view is on.
+///
+/// A view preference and nothing more, like [`crate::MemorySort`]: the decodes
+/// arrive in the order they were decoded and every screen draws them the way
+/// its own operator asked for. Persisted in `[ui]` with the rest of this
+/// screen's preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DecodeSort {
+    /// Strongest signal first.
+    Signal,
+    /// Farthest (DX) first.
+    Distance,
+    /// Grouped by DXCC entity, alphabetically — what a band opening looks like
+    /// when you are counting countries rather than reading callsigns.
+    Country,
+    /// As received (no reordering).
+    ///
+    /// Declared last and `#[serde(other)]` for the reason [`crate::MemorySort`]
+    /// is: a typo in a hand-edited `config.toml` costs the operator this one
+    /// preference rather than throwing the whole `[ui]` table — theme, fonts,
+    /// layout and all — away.
+    #[default]
+    #[serde(other)]
+    None,
+}
+
+impl DecodeSort {
+    /// Every order, as the chips offer them.
+    pub const ALL: [DecodeSort; 4] =
+        [DecodeSort::None, DecodeSort::Signal, DecodeSort::Distance, DecodeSort::Country];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DecodeSort::None => "None",
+            DecodeSort::Signal => "SNR",
+            DecodeSort::Distance => "Dist",
+            DecodeSort::Country => "Country",
+        }
+    }
+}
+
 /// How far away a station has to be to count as DX when the DXCC entity can't
 /// be resolved from either callsign — a rough stand-in for "another country".
 const DX_FALLBACK_KM: f64 = 3000.0;
@@ -502,6 +544,69 @@ pub struct PacketHeard {
     pub sent: bool,
 }
 
+/// Where one line of the terminal came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PacketTermKind {
+    /// The far end said it.
+    #[default]
+    Rx,
+    /// We sent it.
+    Tx,
+    /// sdroxide said it: the link came up, the call was refused, the far end
+    /// gave up. Not traffic, and coloured differently so it cannot be mistaken
+    /// for something a BBS printed.
+    Note,
+}
+
+/// One line of a connected-mode session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PacketTermLine {
+    /// Seconds since the Unix epoch.
+    pub at: i64,
+    pub kind: PacketTermKind,
+    pub text: String,
+}
+
+/// Who is driving the connected-mode link.
+///
+/// There is one link and one radio, so this is also the answer to "why was I
+/// refused" — a question an operator otherwise has to guess at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PacketLinkOwner {
+    /// Nobody. The link is free for either.
+    #[default]
+    Idle,
+    /// The operator, from the packet panel.
+    Terminal,
+    /// A Winlink forwarding session, from the MAIL window.
+    Session,
+}
+
+/// The connected-mode link, as the panel needs to see it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PacketLink {
+    /// The state machine's own name for where it is: `Disconnected`,
+    /// `AwaitingConnection`, `Connected`, `TimerRecovery`, `AwaitingRelease`.
+    /// Its word rather than a translation, so a transcript and a debug log
+    /// describe the same thing.
+    pub state: String,
+    /// Who is at the far end, once there is a far end.
+    pub peer: Option<String>,
+    /// The digipeater path in use, in order. Empty for a direct link.
+    pub via: Vec<String>,
+    /// Extended (mod-128) sequence numbers.
+    pub ext: bool,
+    /// I frames sent and not yet acknowledged.
+    pub unacked: u16,
+    /// Bytes handed to the link that have not been made into frames yet.
+    pub pending: u32,
+    /// Retries used against N2. A count climbing while `unacked` stays put is
+    /// what a fading path looks like from this side, and the only warning
+    /// before the link gives up.
+    pub retries: u8,
+    pub owner: PacketLinkOwner,
+}
+
 /// What a packet station is doing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PacketStatus {
@@ -517,12 +622,35 @@ pub struct PacketStatus {
     /// against a steady `heard` is what a marginal path looks like.
     pub bad_frames: u32,
     /// The connected-mode link, when there is one.
-    pub link: Option<String>,
+    pub link: Option<PacketLink>,
+    /// The terminal session, oldest first, capped.
+    #[serde(default)]
+    pub term: Vec<PacketTermLine>,
+    /// The tail of a line that has arrived without its terminator.
+    ///
+    /// Carried apart from `term` because it is the most important thing on the
+    /// screen: a BBS prompt has no CR after it, so a terminal that printed only
+    /// whole lines would sit there showing nothing while the far end waited for
+    /// an answer to a question the operator never saw.
+    #[serde(default)]
+    pub term_partial: String,
 }
 
 /// Most frames kept for the monitor pane. A busy VHF channel produces a few a
 /// second, and the pane is a rolling view rather than a log.
 pub const PACKET_HEARD_MAX: usize = 200;
+
+/// Most lines kept in the terminal.
+///
+/// The whole status is cloned into every `DigiStatus` five times a second and
+/// crosses the wire to remote clients, so the transcript is a rolling view like
+/// the monitor above it rather than a session log. Lines are cut to
+/// [`PACKET_TERM_LINE_MAX`] for the same reason.
+pub const PACKET_TERM_MAX: usize = 200;
+
+/// Longest terminal line kept. A BBS wraps at 80; a station sending more than
+/// this without a terminator is not sending text a person is reading.
+pub const PACKET_TERM_LINE_MAX: usize = 256;
 
 /// One station on the FSQ heard list.
 ///
@@ -1218,6 +1346,27 @@ pub struct DigiConfig {
     /// Text sent as a periodic UNPROTO beacon. Empty disables it.
     #[serde(default)]
     pub packet_beacon_text: String,
+    /// Sent to a station that connects to us, once the link is up.
+    ///
+    /// The TNC world calls this CTEXT. Empty sends nothing, which is right for
+    /// a station that only ever dials out — and a station that answers calls
+    /// but says nothing looks broken to whoever called it.
+    #[serde(default = "default_packet_connect_text")]
+    pub packet_connect_text: String,
+    /// The digipeater path a terminal connect uses when the operator leaves the
+    /// via box empty — `OE3XLR-1,OE3XMS-1`, the way `c CALL v A,B` writes it.
+    ///
+    /// Worth having as a setting because the path to a local node is the same
+    /// every time, and retyping it is how a hop gets left off.
+    #[serde(default)]
+    pub packet_connect_via: String,
+    /// Ask for extended (mod-128) sequence numbers when dialling out.
+    ///
+    /// Off. A window of 128 frames is only useful on a fast, clean path, and
+    /// many nodes answer a SABME with a DM — which an operator reads as "that
+    /// station refused me" with no way to tell it was the frame they sent.
+    #[serde(default)]
+    pub packet_ext_seq: bool,
     /// Minutes between beacons; zero disables.
     #[serde(default)]
     pub packet_beacon_minutes: u32,
@@ -1290,24 +1439,78 @@ pub struct DigiConfig {
     #[serde(default = "default_aprs_ttl")]
     pub aprs_station_ttl_min: u32,
 
-    /// How loud the digital modes' transmit audio is handed to a radio that
-    /// modulates it itself — a CAT rig on a sound card, an Icom on its network
-    /// port. 0.05 to 1.0, and 1.0 is what a radio we modulate ourselves always
-    /// gets.
+    /// How loud a digital mode's transmit audio is handed to a radio that
+    /// modulates it itself — a CAT rig on a sound card, a FLEX, an Icom on its
+    /// network port — for a mode with no entry of its own in
+    /// [`tx_audio_levels`](Self::tx_audio_levels). [`TX_AUDIO_LEVEL_MIN`] to
+    /// 1.0, and 1.0 is what a radio we modulate ourselves always gets, where
+    /// the modulator and Drive own the level instead.
     ///
-    /// **On FM this is the deviation.** A sideband rig turns audio level into
-    /// power and its own ALC catches the rest, which is why full scale is right
-    /// there (issue #131). An FM rig turns it into frequency swing, and there
-    /// is no ALC: 1200 baud packet wants about 3 kHz where voice wants 5, so a
-    /// full-scale burst into a data input set for voice over-deviates, and a
-    /// signal that over-deviates sounds completely normal to a listener and
-    /// decodes for nobody.
+    /// **Two of them, because the number does two unrelated jobs.** They were
+    /// one until an operator set 40 % for FM packet and quietly took 8 dB off
+    /// their FT8 as well — the same complaint as issue #131, arriving by
+    /// another road.
     ///
-    /// Full scale by default, which is what every digital mode did before this
-    /// existed. The radio's own input level is the other half of it and only
-    /// the operator can set that.
+    /// `_fm` **is the deviation**: an FM transmitter turns audio level into
+    /// frequency swing and has no ALC to catch it, and 1200 baud packet wants
+    /// about 3 kHz where voice wants 5. A full-scale burst into a data input
+    /// set for voice over-deviates — which sounds completely normal to a
+    /// listener and decodes for nobody.
+    ///
+    /// `_ssb` is **drive into the modulator**, and what keeps a data signal
+    /// clean: the usual adjustment is to bring it down until the rig's ALC is
+    /// barely moving, then set the power at the radio. On these backends it is
+    /// the only level sdroxide has — `TxState::drive` reaches the rig's *power*
+    /// register there, not its audio — so this is the knob that stands between
+    /// a constant-envelope mode and a splattery signal.
+    ///
+    /// Which one applies follows the carrier the mode goes out on, not which
+    /// panel set it: FM for VHF packet, APRS and RIFP, sideband for everything
+    /// else, HF packet included.
+    ///
+    /// Both full scale by default, which is what every digital mode did before
+    /// either existed. The radio's own input level is the other half of it and
+    /// only the operator can set that.
     #[serde(default = "one")]
-    pub tx_audio_level: f32,
+    pub tx_audio_level_fm: f32,
+    /// Drive into a sideband rig's modulator; see [`DigiConfig::tx_audio_level_fm`],
+    /// which this is the other half of.
+    #[serde(default = "one")]
+    pub tx_audio_level_ssb: f32,
+    /// The transmit-audio level the operator set for a particular mode, which
+    /// overrides the carrier default above (issue #186).
+    ///
+    /// Per mode because the carrier pair is still one number for every mode
+    /// riding that carrier, and an operator reported the obvious consequence:
+    /// FT8, RTTY, MCW and PSK each want a different figure into the same rig.
+    /// What is being set is where the waveform sits against the radio's ALC,
+    /// and that is a property of the waveform — a constant-envelope FT8 tone
+    /// and RTTY's two-tone shift do not load a modulator the same way.
+    ///
+    /// **An override, not a replacement.** A mode with no entry takes its
+    /// carrier's figure, which is what keeps this honest across an upgrade in
+    /// both directions: nobody's signal changes level when the map arrives,
+    /// because an empty map is exactly the old behaviour, and a mode appended
+    /// in a later release (as most of [`Mode`](crate::Mode)'s have been)
+    /// inherits the level the operator actually runs instead of springing back
+    /// to full scale the first time they select it. Materialising an entry per
+    /// mode would have got that second one wrong, which is issue #131's
+    /// symptom by a third road.
+    ///
+    /// The same override-over-default shape as
+    /// [`tx_audio_hz`](Self::tx_audio_hz), which falls back to the mode's usual
+    /// 1500 Hz, and [`js8_call`](Self::js8_call), which falls back to
+    /// [`my_call`](Self::my_call).
+    ///
+    /// `HashMap` rather than `BTreeMap` for [`tx_audio_hz`]'s reason, which
+    /// applies to [`Mode`](crate::Mode) exactly as it does to
+    /// [`Band`](crate::Band): declaration order is a postcard wire index with
+    /// later variants appended out of place, so a derived ordering would read
+    /// as something meaningful without being it.
+    ///
+    /// [`tx_audio_hz`]: Self::tx_audio_hz
+    #[serde(default)]
+    pub tx_audio_levels: std::collections::HashMap<crate::Mode, f32>,
 
     // ── WSPR ──
     /// WSPR: percentage of two-minute slots to transmit in, 0–100.
@@ -1477,6 +1680,9 @@ impl Default for DigiConfig {
             packet_kiss_port: default_packet_kiss_port(),
             packet_accept_incoming: false,
             packet_beacon_text: String::new(),
+            packet_connect_text: default_packet_connect_text(),
+            packet_connect_via: String::new(),
+            packet_ext_seq: false,
             packet_beacon_minutes: 0,
             aprs_mycall: String::new(),
             aprs_path: default_aprs_path(),
@@ -1489,7 +1695,9 @@ impl Default for DigiConfig {
             aprs_compressed: true,
             aprs_ack_messages: true,
             aprs_station_ttl_min: default_aprs_ttl(),
-            tx_audio_level: 1.0,
+            tx_audio_level_fm: 1.0,
+            tx_audio_level_ssb: 1.0,
+            tx_audio_levels: std::collections::HashMap::new(),
             rifp_session_timeout_s: 300,
             wspr_tx_percent: 0,
             wspr_power_dbm: wspr_default_power(),
@@ -1500,7 +1708,83 @@ impl Default for DigiConfig {
     }
 }
 
+/// The quietest a digital mode's transmit audio may be handed to a radio that
+/// modulates it itself: −40 dB, the bottom of
+/// [`DigiConfig::tx_audio_levels`]'s range.
+///
+/// A floor rather than zero because the control is the only level there is on
+/// those radios, and an operator who dragged it to the bottom would key a
+/// transmitter that radiates nothing — which looks exactly like a broken rig
+/// and is diagnosed by everything except the slider that caused it.
+///
+/// Forty decibels because that is what the adjustment actually needs. The
+/// figure it replaced was 0.05 (−26 dB), a percent-scaled floor whose two
+/// lowest steps were 1.6 dB apart; nothing could hold a value below it, so
+/// widening the range changes no station's level and only gives the ones that
+/// were already at the bottom somewhere further to go.
+pub const TX_AUDIO_LEVEL_MIN: f32 = 0.01;
+
+/// [`TX_AUDIO_LEVEL_MIN`] as the control shows it: −40 dB.
+pub const TX_AUDIO_LEVEL_MIN_DB: f32 = -40.0;
+
+/// A stored transmit-audio level as the control shows it, in dB below full
+/// scale.
+///
+/// The level is stored linear because that is what multiplies the samples, and
+/// shown in dB because that is what the adjustment is. A percent scale spends
+/// most of a rail's travel in the top of a range whose useful part is the
+/// bottom: 5 % and 6 % — two adjacent steps on the control this replaced — are
+/// 1.6 dB apart, while 50 % and 51 % are a sixth of that. An operator setting a
+/// data input against the rig's ALC is working in decibels, and so is the
+/// program they are comparing it against.
+#[must_use]
+pub fn tx_level_db(level: f32) -> f32 {
+    if level <= TX_AUDIO_LEVEL_MIN { TX_AUDIO_LEVEL_MIN_DB } else { 20.0 * level.min(1.0).log10() }
+}
+
+/// The inverse of [`tx_level_db`], clamped to the range the control offers.
+#[must_use]
+pub fn tx_level_from_db(db: f32) -> f32 {
+    if db <= TX_AUDIO_LEVEL_MIN_DB {
+        TX_AUDIO_LEVEL_MIN
+    } else {
+        10f32.powf(db.min(0.0) / 20.0).clamp(TX_AUDIO_LEVEL_MIN, 1.0)
+    }
+}
+
 impl DigiConfig {
+    /// The transmit-audio level for `mode` on a radio that modulates what we
+    /// send it: the operator's entry for that mode, else the level for the
+    /// carrier it goes out on.
+    ///
+    /// The fallback is the whole design. See
+    /// [`tx_audio_levels`](Self::tx_audio_levels) for why an absent entry
+    /// inherits rather than resetting, and
+    /// [`tx_audio_level_fm`](Self::tx_audio_level_fm) for why the carrier is
+    /// what picks between the two defaults.
+    #[must_use]
+    pub fn tx_level_for(&self, mode: crate::Mode) -> f32 {
+        self.tx_audio_levels
+            .get(&mode)
+            .copied()
+            .unwrap_or(if mode.is_fm_carrier() {
+                self.tx_audio_level_fm
+            } else {
+                self.tx_audio_level_ssb
+            })
+            .clamp(TX_AUDIO_LEVEL_MIN, 1.0)
+    }
+
+    /// Record the operator's transmit-audio level for one mode.
+    ///
+    /// Always an entry, even where the figure equals the carrier default: the
+    /// operator has said what this mode should run at, and a value that
+    /// silently went on tracking the default would move the next time they set
+    /// the default for something else.
+    pub fn set_tx_level(&mut self, mode: crate::Mode, level: f32) {
+        self.tx_audio_levels.insert(mode, level.clamp(TX_AUDIO_LEVEL_MIN, 1.0));
+    }
+
     /// The callsign APRS transmits under: the APRS-specific one if the
     /// operator set one, else the station callsign.
     ///
@@ -2001,6 +2285,63 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_keyed_tx_level_survives_the_config_file() {
+        // The same failure `a_band_keyed_offset_survives_the_config_file`
+        // guards, one map along: serde_json map keys must be strings, and a key
+        // type that serialised as anything else would make `save_digi_config`
+        // fail at the moment the operator moved the rail. `Mode` is a
+        // unit-variant enum with no rename attributes, so it serialises as its
+        // own name — pinned here rather than trusted.
+        let mut cfg = DigiConfig { my_call: "G4MQL".into(), ..DigiConfig::default() };
+        cfg.set_tx_level(crate::Mode::Ft8, 0.25);
+        cfg.set_tx_level(crate::Mode::Rtty, 0.4);
+        let text = serde_json::to_string(&cfg).expect("a mode-keyed map must serialise");
+        assert!(text.contains(r#""Ft8":0.25"#), "FT8's level is not in the file: {text}");
+
+        let back: DigiConfig = serde_json::from_str(&text).expect("and must load again");
+        assert_eq!(back.tx_level_for(crate::Mode::Ft8), 0.25);
+        assert_eq!(back.tx_level_for(crate::Mode::Rtty), 0.4);
+    }
+
+    #[test]
+    fn a_mode_with_no_level_of_its_own_takes_its_carrier_default() {
+        // The property the whole shape rests on. A digi.json written before
+        // this field existed carries no map at all, so every mode must come out
+        // exactly where the carrier pair left it — that is what makes "nobody's
+        // signal changes level on an update" true without a migration.
+        let old = r#"{"my_call":"G4MQL","tx_audio_level_fm":0.4,"tx_audio_level_ssb":0.9}"#;
+        let cfg: DigiConfig = serde_json::from_str(old).expect("an old config must still load");
+        assert!(cfg.tx_audio_levels.is_empty(), "a mode with no entry must have none");
+        assert_eq!(cfg.tx_level_for(crate::Mode::Ft8), 0.9, "sideband took the FM level");
+        assert_eq!(cfg.tx_level_for(crate::Mode::Rtty), 0.9);
+        assert_eq!(cfg.tx_level_for(crate::Mode::Cw), 0.9, "MCW is audio on a sideband");
+        assert_eq!(cfg.tx_level_for(crate::Mode::Aprs), 0.4, "APRS took the sideband level");
+        assert_eq!(cfg.tx_level_for(crate::Mode::Packet), 0.4);
+        assert_eq!(cfg.tx_level_for(crate::Mode::PacketHf), 0.9, "HF packet is not FM");
+
+        // And an entry beats the default for that mode alone.
+        let mut cfg = cfg;
+        cfg.set_tx_level(crate::Mode::Rtty, 0.2);
+        assert_eq!(cfg.tx_level_for(crate::Mode::Rtty), 0.2);
+        assert_eq!(cfg.tx_level_for(crate::Mode::Ft8), 0.9, "RTTY's level reached FT8");
+    }
+
+    #[test]
+    fn the_tx_level_floor_leaves_a_transmitter_that_radiates() {
+        // Dragging the rail to the bottom must not key a dead transmitter.
+        let mut cfg = DigiConfig::default();
+        cfg.set_tx_level(crate::Mode::Ft8, 0.0);
+        assert_eq!(cfg.tx_level_for(crate::Mode::Ft8), TX_AUDIO_LEVEL_MIN);
+        cfg.set_tx_level(crate::Mode::Ft8, 9.0);
+        assert_eq!(cfg.tx_level_for(crate::Mode::Ft8), 1.0);
+        // A carrier default from a hand-edited file is clamped on the way out
+        // too — `tx_level_for` is the only reader, so this is the one place it
+        // can be caught.
+        let wild = DigiConfig { tx_audio_level_ssb: 0.0, ..DigiConfig::default() };
+        assert_eq!(wild.tx_level_for(crate::Mode::Ft8), TX_AUDIO_LEVEL_MIN);
+    }
+
+    #[test]
     fn report_formatting() {
         assert_eq!(fmt_report(-13), "-13");
         assert_eq!(fmt_report(2), "+02");
@@ -2264,6 +2605,30 @@ mod tests {
         assert_eq!(b.my_grid, "FN42");
     }
 
+    /// A name outside ASCII survives the export and comes back off it. The
+    /// length ADIF declares is a byte count, so a Cyrillic or accented name is
+    /// longer than it looks — writing the character count instead would put
+    /// every later field in the record out of step.
+    #[test]
+    fn adif_round_trips_a_name_outside_ascii() {
+        let rec = QsoRecord {
+            call: "UA1ABC".into(),
+            name: "Владимир".into(),
+            qth: "Москва".into(),
+            country: "Ålesund".into(),
+            band: "20m".into(),
+            mode: "SSB".into(),
+            ..Default::default()
+        };
+        let adif = qso_log_to_adif(std::slice::from_ref(&rec));
+        assert!(adif.contains("<NAME:16>Владимир"), "the count is bytes, not characters");
+        let back = adif_to_qso_log(&adif);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].name, "Владимир");
+        assert_eq!(back[0].qth, "Москва");
+        assert_eq!(back[0].country, "Ålesund");
+    }
+
     #[test]
     fn adif_import_reads_character_counted_lengths() {
         // QRZ's logbook counts the length in characters rather than the bytes
@@ -2373,6 +2738,13 @@ fn default_packet_slottime_ms() -> u16 {
 }
 fn default_packet_kiss_port() -> u16 {
     8001
+}
+/// What a station that answers a call says first.
+///
+/// Generic on purpose: it goes out under whatever callsign the operator set,
+/// and a greeting naming a station that is not theirs is worse than none.
+fn default_packet_connect_text() -> String {
+    "Connected to sdroxide. No mailbox here — type away.".to_string()
 }
 /// One local fill-in hop and one wide one — the path that reaches almost
 /// anywhere without asking the whole network to repeat you three times.

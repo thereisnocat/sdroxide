@@ -1,9 +1,16 @@
-//! The UI tab: frame rate, spectrum averaging, waterfall speed and palette,
-//! and the spoken announcements.
+//! The UI tab: layout, theme and font sizes, the frame rate, the waterfall's
+//! palette and the colours the overlays are drawn in, and the spoken
+//! announcements.
 //!
-//! These take effect live — the frame rate and averaging reach the engine
-//! through the spectrum-config diff on the next frame, and the waterfall speed
-//! is read straight out of the settings each frame.
+//! These take effect live — the frame rate reaches the engine through the
+//! spectrum-config diff on the next frame, and the rest is read straight out of
+//! the settings each frame.
+//!
+//! The panadapter's own settings — its detail, the spectrum's reaction and the
+//! waterfall's scroll speed — used to be here and are now on the SPEC popup,
+//! beside the picture they change (`SdroxideApp::panadapter_controls`). They
+//! are still the same [`sdroxide_types::UiSettings`] fields, written and
+//! persisted the same way.
 
 use eframe::egui::{self, Color32, ComboBox, RichText};
 use sdroxide_types::{BandplanKind, CallsignStyle, FreqStyle, SpeechSettings, SpotKind, Verbosity};
@@ -20,8 +27,21 @@ pub(in crate::app) fn settings_ui_tab(
     cfg: &mut sdroxide_types::UiSettings,
     cloud_march: Option<&mut bool>,
 ) {
-    use sdroxide_types::{ChromeStyle, FontSize, LayoutMode, Speed, UiSettings, UiTheme};
+    use sdroxide_types::{ChromeStyle, FontSize, LayoutMode, UiSettings, UiTheme};
     ui.label(RichText::new("Display").size(14.0).strong().color(crate::theme::CYAN()));
+    ui.add_space(6.0);
+    // Said here because this is where they used to be, and where an operator
+    // who remembers them will come looking. They moved to the panadapter's own
+    // button, beside the picture they change — see
+    // `SdroxideApp::panadapter_controls`.
+    ui.label(
+        RichText::new(
+            "Panadapter detail, the spectrum's reaction and the waterfall's scroll speed are \
+             set from the SPEC button on the display strip — the DISP menu on a narrow window.",
+        )
+        .size(11.0)
+        .weak(),
+    );
     ui.add_space(6.0);
     egui::Grid::new("ui-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label("Layout");
@@ -60,14 +80,6 @@ pub(in crate::app) fn settings_ui_tab(
                     ui.selectable_value(&mut cfg.frame_rate_fps, f, format!("{f} fps"));
                 }
             });
-        ui.end_row();
-
-        ui.label("Waterfall scroll speed");
-        enum_combo(ui, "ui-wf", &mut cfg.waterfall_speed, &Speed::ALL, Speed::label);
-        ui.end_row();
-
-        ui.label("Spectrum update speed");
-        enum_combo(ui, "ui-spec", &mut cfg.spectrum_speed, &Speed::ALL, Speed::label);
         ui.end_row();
 
         ui.label("Waterfall palette");

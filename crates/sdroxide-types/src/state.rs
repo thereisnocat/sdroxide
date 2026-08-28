@@ -366,6 +366,31 @@ pub struct RadioState {
     /// engine.
     #[serde(default)]
     pub oob_tx: bool,
+    /// The *radio's own* squelch threshold, as a `0..1` fraction of its scale —
+    /// `0` open, `1` closed, the way the knob on the front panel reads.
+    ///
+    /// Kept apart from [`RxState::squelch_db`], which is sdroxide's own gate on
+    /// a passband it demodulated itself. This one is a setting in the rig, and
+    /// on a transceiver that hands us audio it has already gated it is the only
+    /// squelch there is: the software one can close further on what got
+    /// through, never open what was shut out (issue #192). Which of the two the
+    /// operator is given is [`crate::DeviceCaps::commands_squelch`]'s answer.
+    ///
+    /// *Adopted* from the radio when the control link opens, so this starts
+    /// where the operator left the rig rather than imposing a remembered level
+    /// on it. Appended last: postcard numbers fields by position.
+    #[serde(default)]
+    pub rig_squelch: f32,
+    /// How the ADS-B decoder behaves, and whether it can run at all.
+    ///
+    /// Here rather than only in `adsb.json` for the reason every other
+    /// decoder's settings are: a remote client edits it, and the engine's reply
+    /// is this field coming back changed. It is also where the engine says no —
+    /// a front end that hands over demodulated audio cannot feed a 2 Msps
+    /// demodulator, and [`crate::AdsbSettings::OFF`] arriving back is how the
+    /// panel learns that. Appended last: postcard numbers fields by position.
+    #[serde(default)]
+    pub adsb: crate::AdsbSettings,
 }
 
 impl Default for RadioState {
@@ -393,6 +418,7 @@ impl Default for RadioState {
             noise_blanker: false,
             skimmer: crate::SkimmerSettings::default(),
             ism: crate::IsmSettings::default(),
+            adsb: crate::AdsbSettings::default(),
             gains: Vec::new(),
             tx_gains: Vec::new(),
             antenna_rx: String::new(),
@@ -401,6 +427,9 @@ impl Default for RadioState {
             recording_file: None,
             recording_mono: false,
             oob_tx: false,
+            // Open, until the radio says otherwise: the level is adopted from
+            // the rig, and until one has answered there is nothing to claim.
+            rig_squelch: 0.0,
         }
     }
 }

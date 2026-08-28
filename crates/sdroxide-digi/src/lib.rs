@@ -183,6 +183,19 @@ pub trait DigiEngine: Send {
     /// Packet: transmit a frame on a KISS host's behalf. Subject to CSMA like
     /// everything else — a host asks for the channel, it does not take it.
     fn packet_send_frame(&mut self, _frame: Vec<u8>) {}
+
+    /// Packet: call a station in connected mode. `via` is the operator's path
+    /// string, parsed here where the callsign validation lives.
+    fn packet_connect(&mut self, _call: String, _via: String, _ext: bool) {}
+
+    /// Packet: send one line to the connected station.
+    fn packet_send_line(&mut self, _text: String) {}
+
+    /// Packet: hang up the connected-mode link.
+    fn packet_disconnect(&mut self) {}
+
+    /// Packet: empty the terminal transcript, leaving the link alone.
+    fn packet_term_clear(&mut self) {}
     /// APRS: send one position beacon now. Still subject to CSMA — the
     /// operator asks for the channel, they do not take it.
     fn aprs_beacon_now(&mut self) {}

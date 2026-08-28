@@ -587,7 +587,7 @@ use sdroxide_types::{
 /// **87** — an RSPduo can run *both* of its tuners and combine them, the same
 /// way a LimeSDR's second chain is combined at v82 (issue #153).
 /// [`sdroxide_types::SdrPlayConfig`] gained a `diversity` block —
-/// [`sdroxide_types::SdrPlayDiversity`] — carrying whether the second tuner
+/// [`sdroxide_types::SdrPlayDuo`] — carrying whether the second tuner
 /// runs at all, its own two gains, and the adaptive filter's mode, length,
 /// rate and hold.
 ///
@@ -618,19 +618,238 @@ use sdroxide_types::{
 /// decode it into and desynchronises on everything after it, rather than
 /// failing on the field itself.
 ///
-/// **90** — the RSPduo's diversity filter (v87) gains two more ways to find
-/// its combining weight, alongside the original adaptive one (issue #153).
-/// [`sdroxide_types::SdrPlayDiversity`] gained `technique`
-/// ([`sdroxide_types::DiversityTechnique`]: `Adaptive`, `Decorrelate`, or
-/// `WidebandDecorrelate`) and `gate_db`, both appended at the tail of the
-/// struct for the same reason `enabled`'s siblings originally landed in
-/// declaration order — a field-order slip in a positional wire format
-/// reconfigures the wrong setting rather than failing outright.
+/// **90** — an RSPduo's two tuners can be two *radios* rather than two aerials
+/// combined, and the diversity filter's controls have moved to the main strip
+/// (issue #165). [`sdroxide_types::SdrPlayDuo`] gained `role`
+/// ([`sdroxide_types::SdrPlayDuoRole`]): whether the second tuner is combined
+/// with the first or handed to a radio of its own.
+/// [`sdroxide_types::DeviceCaps`] gained `diversity`, which is what tells the
+/// strip that a filter is running without it having to know which backend has
+/// one.
+///
+/// Fields appended to the radio configuration and to the capabilities. Both
+/// ride the wire — the configuration in a command and an event, the
+/// capabilities in an event of their own — so a v89 peer would read the tail
+/// of any of them as garbage; the handshake's equality test is what stops it
+/// trying.
+///
+/// The block itself is written under a new name with this version — `duo`
+/// rather than `diversity`, since combining is no longer all it does — which
+/// is invisible here: postcard numbers fields by position and never sends a
+/// name. It is `radio.json` that the old name matters to, and a serde alias
+/// keeps those files loading.
+///
+/// **91** — the panadapter's horizontal resolution is the client's to ask for
+/// (issue #172). [`sdroxide_types::SpectrumConfig`] gained `bins`: how many
+/// columns the emitted frames carry, which until now was a constant 2048 on
+/// both sides of the wire and so never needed saying.
+///
+/// It is the *client* that knows the number — its screen's pixel width and its
+/// own renderer's limits — so it has to travel, and it travels in the same
+/// command as the FFT size and the frame rate. Inserted after `fft_size`
+/// rather than appended, because it belongs next to it: postcard numbers
+/// fields by position, so a v90 peer would read `bins` as `fps` and everything
+/// after it as garbage either way. The handshake's equality test is what stops
+/// it trying.
+///
+/// **92** — the waterfall's *time* axis is the client's to ask for too, and the
+/// engine now clocks it. [`sdroxide_types::SpectrumConfig`] gained
+/// `rows_per_sec`, and [`sdroxide_types::SpectrumFrame`] gained `rows`: the
+/// waterfall lines the engine clocked since the last frame, each of them the
+/// per-bin peak over its own slice of time.
+///
+/// Until now a frame *was* a row, so the waterfall could not advance faster
+/// than the screen redrew — a fast scroll simply wrote the same numbers two or
+/// three times and the operator saw lines two or three pixels tall, while a
+/// front end streaming megahertz had hundreds of transforms a second going
+/// spare. The two rates are now separate all the way down the wire.
+///
+/// The frame also gained `rows_clocked`, which is not the same as `rows` being
+/// non-empty and has to be said separately: below the frame rate most frames
+/// carry no rows at all, and a client that read that as "this lane does not
+/// clock rows" would scroll them on its own wall clock *as well* and run the
+/// waterfall at twice the rate of its own time labels. `false` is the shape for
+/// a lane that really cannot clock them — a radio's own sweep, a transmit
+/// monitor — and only then does the client scroll on its own.
+///
+/// All three ride in the frame or the config, both of which cross the wire, and
+/// `rows_per_sec` sits after `display_bins` rather than at the tail, so a v91
+/// peer would desynchronise on any of them. The handshake's equality test is
+/// what stops it trying.
+///
+/// **93** — the digital modes' transmit-audio level split in two.
+/// [`sdroxide_types::DigiConfig`] lost `tx_audio_level` and gained
+/// `tx_audio_level_fm` and `tx_audio_level_ssb`: the one number was doing two
+/// unrelated jobs — deviation into an FM rig, drive into a sideband rig's
+/// modulator — and a level set for 1200 baud packet was quietly taking 8 dB off
+/// FT8 as well, which is issue #131's symptom by another road.
+///
+/// The configuration rides the wire in a command and comes back in an event, so
+/// one field becoming two moves everything after it: postcard numbers fields by
+/// position, and a v92 peer would read the new sideband level as the field that
+/// used to follow and the rest as garbage. The handshake's equality test is what
+/// stops it trying. `digi.json` is migrated rather than versioned — the old key
+/// carries into both new ones on load, so nobody's signal changes level.
+///
+/// **94** — packet radio grew an operator's terminal, so the panel needs to know
+/// more about the link than the callsign at the far end.
+/// [`sdroxide_types::PacketStatus::link`] changes from `Option<String>` to
+/// `Option<PacketLink>`: the state machine's own name for where it is, the peer,
+/// the digipeater path, the sequence width, the frames outstanding, the retry
+/// count against N2, and which of the two things that can drive one link is
+/// driving it — the packet panel or the MAIL window. That last one is the answer
+/// to "why was I refused", which an operator otherwise has to guess at.
+///
+/// `term` and `term_partial` are new beside it: the session's lines, and the
+/// tail of one that has arrived without its terminator. The tail is carried
+/// separately because it is the most important thing on the screen — a BBS
+/// prompt has no carriage return after it, so a terminal that printed only whole
+/// lines would sit showing nothing while the far end waited for an answer to a
+/// question the operator never saw.
+///
+/// [`sdroxide_types::Command`] gains `PacketConnect`, `PacketSend`,
+/// `PacketDisconnect` and `PacketTermClear`, appended for the usual reason, and
+/// [`sdroxide_types::DigiConfig`] gains `packet_connect_text`,
+/// `packet_connect_via` and `packet_ext_seq` beside the packet settings they
+/// belong with rather than at the tail — postcard numbers fields by position and
+/// a v93 peer desynchronises on either placement, so they go where they read.
+/// The handshake's equality test is what stops it trying. `digi.json` needs no
+/// migration: all three carry `#[serde(default)]`, so a config written by v93
+/// loads unchanged.
+///
+/// **95** — the digital modes' transmit-audio level is per mode (issue #186).
+/// [`sdroxide_types::DigiConfig`] gains `tx_audio_levels`, a map from
+/// [`Mode`](sdroxide_types::Mode) to the level the operator set for it, placed
+/// beside the two carrier levels it overrides rather than at the tail — the same
+/// reasoning as v94's placement, since postcard numbers fields by position and a
+/// v94 peer desynchronises either way. `DigiConfig` rides inside `DigiStatus` and
+/// inside `Command::SetDigiConfig`, so this is not an append a v94 client can
+/// survive; the handshake's equality test is what stops it trying.
+///
+/// The two carrier levels **stay**, as the level for a mode with no entry of its
+/// own, which is what makes this the rare wire change that needs no config
+/// migration at all: an empty map is exactly v94's behaviour, so nobody's signal
+/// changes level on the update, and a mode appended in a later release inherits
+/// the level the operator actually runs instead of springing back to full scale.
+///
+/// [`sdroxide_types::Command`] gains `SetDigiTxLevel`, appended for the usual
+/// reason. It carries the mode rather than letting the engine read it off the
+/// dial, because the control is a rail dragged while transmitting and a mode
+/// change landing mid-drag would otherwise write one mode's level onto another's.
+///
+/// [`sdroxide_types::DeviceCaps`] gains `cw_audio_keyed`, appended: a client has
+/// to know whether CW leaves as audio or as text over the control port before it
+/// can decide whether that level reaches CW at all.
+///
+/// **96** — xHE-AAC decoding for DRM. Two changes to `DrmStatus`, which rides in
+/// [`ServerMsg::Drm`].
+///
+/// [`sdroxide_types::DrmCodec`] lost its `Celp` and `Hvxc` variants. Both were
+/// withdrawn from the DRM standard and neither can be signalled, and the two
+/// slots they occupied now mean Opus and "reserved" — so the old table read an
+/// Opus service as CELP. Postcard numbers a fieldless enum by declaration
+/// order, so every remaining variant moved: a v95 peer would read xHE-AAC as
+/// HVXC.
+///
+/// [`sdroxide_types::DrmService`] gained `codec_supported`, which is not
+/// appended but sits beside `codec` where it reads. A locked receiver whose
+/// codec has no decoder reports a healthy signal, a service label and silence,
+/// and this is the only field that distinguishes that from an audio decode
+/// that is merely failing.
+/// **97** — converter overload is a reading of its own (issue #173).
+/// [`sdroxide_types::Meters`] gained `adc_clip`, the fraction of converter
+/// samples sitting at full scale, beside the `adc_peak_dbfs` it completes
+/// rather than at the tail — postcard numbers fields by position and a v96 peer
+/// desynchronises on either placement, so it goes where it reads.
+///
+/// `adc_peak_dbfs` was on the wire from the start and had never been measured:
+/// the engine filled it with a literal `0.0`. It now carries the real peak, so
+/// a v96 client shown a v97 reading would not merely mis-parse the tail — it
+/// would read a field that used to be a constant. The handshake's equality test
+/// is what stops it trying.
+///
+/// Two figures rather than one because neither answers alone. The peak cannot
+/// tell a signal that fills the converter from one twice too large for it, and
+/// the fraction saturates as soon as a constant-envelope signal passes √2 of
+/// full scale — every sample of an FM carrier clips from there on. Together
+/// they say whether the front end is into its rails and roughly how far.
+///
+/// `Meters` rides in an event only, never in a command, so this is a one-way
+/// change: nothing a client sends carries it.
+/// **98** — an IC-9700 on macOS, three ways (issue #192).
+///
+/// `Mode::SstvFm` — SSTV on an FM carrier, the way slow-scan is sent on VHF
+/// and UHF — is appended to [`sdroxide_types::Mode`]. Appended, so every mode
+/// already on the wire keeps its number; but the variant itself is new, and a
+/// v97 peer handed one decodes it as nothing at all.
+///
+/// [`sdroxide_types::RadioState`] gained `rig_squelch`, the radio's *own*
+/// squelch threshold as a `0..1` fraction of its scale, and
+/// [`sdroxide_types::Command`] gained `SetRigSquelch` to move it. A rig that
+/// hands sdroxide audio it has already gated has the only squelch that can
+/// open — `Command::SetSquelch` is a threshold on what got through — so the
+/// SQL control follows [`sdroxide_types::DeviceCaps::commands_squelch`], also
+/// new here, to whichever of the two the front end actually has.
+///
+/// Three appended fields and one appended variant: postcard numbers both by
+/// position, so a v97 peer desynchronises on the tail of every `RadioState`
+/// and every `DeviceCaps` regardless. The handshake's equality test is what
+/// stops it trying.
+///
+/// **99** — ADS-B (issue #160).
+///
+/// `Mode::Adsb` is appended to [`sdroxide_types::Mode`], which is on its own
+/// enough to force this bump: every mode already on the wire keeps its number,
+/// but a v98 peer handed the new one has no variant to decode it into and
+/// desynchronises on the rest of the message. That is the same reasoning as
+/// v98's `Mode::SstvFm` and v89's `Mode::Aprs`.
+///
+/// With it: `ServerMsg::AdsbStatus` carrying the aircraft table,
+/// `Command::SetAdsbConfig` to change how the decoder behaves, and
+/// [`sdroxide_types::RadioState::adsb`] holding what it was set to — all
+/// appended, all at the end of their respective enums and structs.
+///
+/// The table is re-sent whole a couple of times a second rather than
+/// incrementally, like the ISM device table and for the same reasons; the
+/// per-aircraft position history is `f32` (about two metres at any latitude)
+/// because it is the bulk of that message and a history dot on a map has no use
+/// for more.
+///
+/// **100** — one appended field, `AdsbStatus::degraded` (issue #160).
+///
+/// A receiver can be able to run the ADS-B decoder and still be too narrow to
+/// carry the waveform properly — below about 2.4 Msps a Mode S chip and a
+/// sample are the same width, and the aircraft at the edge of range are lost to
+/// arithmetic rather than to propagation. That is not the same statement as
+/// `unavailable`, which means nothing is running at all, so it is a field of
+/// its own rather than a reuse.
+///
+/// Appended at the end of the struct; postcard numbers fields by position, so a
+/// v99 peer desynchronises on the tail of every `AdsbStatus` and the
+/// handshake's equality test is what stops it trying.
+///
+/// **101** — the RSPduo's diversity filter (v87, now [`sdroxide_types::SdrPlayDuo`]
+/// after v90's own rename) gains two more ways to find its combining weight,
+/// alongside the original adaptive one (issue #153). `SdrPlayDuo` gained
+/// `technique` ([`sdroxide_types::DiversityTechnique`]: `Adaptive`,
+/// `Decorrelate`, or `WidebandDecorrelate`) and `gate_db`, both appended at
+/// the struct's current tail — after `frozen`, and so after v90's own `role`
+/// insertion too, which sits earlier in the struct (between `enabled` and
+/// `mode`) and is untouched by this append — for the same reason `enabled`'s
+/// siblings originally landed in declaration order: a field-order slip in a
+/// positional wire format reconfigures the wrong setting rather than failing
+/// outright.
+///
+/// Renumbered to sit after upstream's own v90–100 chain rather than the v90
+/// this carried on the local branch it was built on: that local v90 was never
+/// released or pushed anywhere as this exact numbering, so no compatibility
+/// with it existed outside this one branch, and upstream's v90–100 run is the
+/// one with real peers depending on its numbers.
 ///
 /// A field appended to the radio configuration, which rides in both a command
-/// and an event, so a v89 peer would read the tail of either as garbage — the
-/// handshake's equality test is what stops it trying.
-pub const PROTO_VERSION: u16 = 90;
+/// and an event, so a v100 peer would read the tail of either as garbage —
+/// the handshake's equality test is what stops it trying.
+pub const PROTO_VERSION: u16 = 101;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1022,6 +1241,10 @@ pub enum ServerMsg {
     /// What the DRM decoder has made of the broadcast on the main receiver.
     /// A snapshot — see [`sdroxide_types::DrmStatus`].
     Drm(sdroxide_types::DrmStatus),
+    /// Every aircraft the ADS-B decoder is tracking, plus what the demodulator
+    /// is seeing and why it is not running when it is not. A whole snapshot,
+    /// twice a second — see [`sdroxide_types::AdsbStatus`].
+    AdsbStatus(Box<sdroxide_types::AdsbStatus>),
 }
 
 /// One radio in a station's roster, as a client sees it.
@@ -1525,8 +1748,9 @@ mod tests {
                 serial: "1809014C9B".into(),
                 sample_rate_hz: 1_000_000.0,
                 duo_tuner: sdroxide_types::SdrPlayDuoTuner::Tuner2,
-                diversity: sdroxide_types::SdrPlayDiversity {
+                duo: sdroxide_types::SdrPlayDuo {
                     enabled: true,
+                    role: sdroxide_types::SdrPlayDuoRole::SecondRadio,
                     mode: sdroxide_types::DiversityMode::Combine,
                     lna_state: 6,
                     if_gr_db: 27,
@@ -1603,6 +1827,56 @@ mod tests {
                 ClientMsg::Command(Command::SetRadioConfig { cfg: Box::new(cfg.clone()), reopen });
             assert_eq!(decode::<ClientMsg>(&encode(&c).unwrap()).unwrap(), c);
         }
+    }
+
+    /// The per-mode transmit-audio level, over the wire in both directions
+    /// (issue #186).
+    ///
+    /// Filled rather than left at its default on purpose: `DigiConfig` rides
+    /// whole inside `DigiStatus`, postcard numbers fields by position, and a map
+    /// placed among the scalars is exactly the shape that decodes into garbage
+    /// rather than failing outright if the two ends disagree. An empty map would
+    /// encode as a length of zero and prove nothing.
+    #[test]
+    fn roundtrip_per_mode_tx_level() {
+        use sdroxide_types::{DigiConfig, Mode};
+
+        let mut cfg = DigiConfig { my_call: "OE1XYZ".into(), ..DigiConfig::default() };
+        cfg.set_tx_level(Mode::Ft8, 0.25);
+        cfg.set_tx_level(Mode::Rtty, 0.4);
+        cfg.set_tx_level(Mode::Aprs, 0.6);
+
+        // The command that writes one, and the configuration that carries them
+        // all back.
+        let m = ClientMsg::Command(Command::SetDigiTxLevel { mode: Mode::Ft8, level: 0.25 });
+        assert_eq!(decode::<ClientMsg>(&encode(&m).unwrap()).unwrap(), m);
+
+        let m = ClientMsg::Command(Command::SetDigiConfig(cfg.clone()));
+        assert_eq!(decode::<ClientMsg>(&encode(&m).unwrap()).unwrap(), m);
+
+        let status = DigiStatus::idle(cfg);
+        let m = ServerMsg::Ft8Status(status);
+        let back = decode::<ServerMsg>(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let ServerMsg::Ft8Status(s) = back else { panic!("not a status") };
+        assert_eq!(s.config.tx_level_for(Mode::Ft8), 0.25);
+        assert_eq!(s.config.tx_level_for(Mode::Rtty), 0.4);
+        assert_eq!(s.config.tx_level_for(Mode::Aprs), 0.6);
+        // And a mode with no entry still reaches the carrier default across the
+        // wire, which is the property that makes the map need no migration.
+        assert_eq!(s.config.tx_level_for(Mode::Psk), 1.0);
+    }
+
+    /// Whether CW leaves as audio is a capability, and the client needs it to
+    /// decide whether the transmit-audio level reaches CW at all.
+    #[test]
+    fn roundtrip_cw_audio_keyed_capability() {
+        let caps = DeviceCaps { cw_audio_keyed: true, ..DeviceCaps::default() };
+        let m = ServerMsg::Capabilities(caps);
+        let back = decode::<ServerMsg>(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let ServerMsg::Capabilities(c) = back else { panic!("not capabilities") };
+        assert!(c.cw_audio_keyed);
     }
 
     /// Device questions and their answers, both ways.

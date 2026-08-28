@@ -283,6 +283,20 @@ pub enum RadioEvent {
     /// A whole snapshot, emitted a few times a second while anything moves —
     /// the sync lights and the scrolling text both change on their own.
     Drm(crate::DrmStatus),
+    /// Every aircraft the ADS-B decoder is still tracking, plus what the
+    /// demodulator is seeing, re-sent whole a couple of times a second
+    /// (issue #160).
+    ///
+    /// One message rather than the ISM decoder's pair, because unlike a room of
+    /// weather sensors the whole table moves at once: an airliner reports its
+    /// position twice a second, so a snapshot that carried the aircraft without
+    /// the counters — or the other way round — would be describing two
+    /// different instants.
+    ///
+    /// Boxed because a busy sector's table is far larger than anything else in
+    /// this enum, and an enum is as big as its largest variant everywhere it is
+    /// held.
+    AdsbStatus(Box<crate::AdsbStatus>),
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

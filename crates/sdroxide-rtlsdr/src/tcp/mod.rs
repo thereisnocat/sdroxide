@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rtrb::Producer;
-use sdroxide_types::{RtlSdrAgc, RtlSdrConfig, RtlSdrHfMode, RtlTcpConfig};
+use sdroxide_types::{RtlSdrAgc, RtlSdrHfMode, RtlTcpConfig};
 
 use crate::error::{Error, Result};
 use crate::handle::{Ctrl, Pending, RtlSdrHandle, RxStats, Shared, push_iq, ring_for};
@@ -70,11 +70,12 @@ const READ_TIMEOUT: Duration = Duration::from_millis(20);
 /// ones. 64 KiB is 13.6 ms at 2.4 Msps.
 const READ_BYTES: usize = 64 * 1024;
 
-/// Hysteresis around [`RtlSdrConfig::HF_CROSSOVER_HZ`], so a dial parked next
-/// to the crossover cannot flip the far end between direct sampling and its
-/// tuner on every nudge. Wider than the USB backend's 500 kHz: each switch
-/// costs a tuner re-init *and* a network round trip, and the samples in flight
-/// when it happens are already stale.
+/// Hysteresis above [`crate::TUNER_MIN_HZ`], so a dial parked next to the
+/// crossover cannot flip the far end between direct sampling and its tuner on
+/// every nudge. Wider than the USB backend's 500 kHz: each switch costs a tuner
+/// re-init *and* a network round trip, and the samples in flight when it
+/// happens are already stale. Above the floor and never straddling it, for the
+/// reason the USB backend's copy gives.
 const HF_HYSTERESIS_HZ: f64 = 1_000_000.0;
 
 /// [`Client::direct`] before anything has been asked of the far end. Whatever
@@ -325,9 +326,9 @@ impl Client {
             RtlSdrHfMode::Auto if self.greeting.tuner.upconverts_hf() => 0,
             RtlSdrHfMode::Auto => {
                 let threshold = if self.direct == 0 {
-                    RtlSdrConfig::HF_CROSSOVER_HZ - HF_HYSTERESIS_HZ
+                    crate::TUNER_MIN_HZ
                 } else {
-                    RtlSdrConfig::HF_CROSSOVER_HZ + HF_HYSTERESIS_HZ
+                    crate::TUNER_MIN_HZ + HF_HYSTERESIS_HZ
                 };
                 u32::from(hz < threshold) * 2
             }
@@ -687,7 +688,8 @@ mod tests {
     }
 
     /// The whole point of the hysteresis: a dial sitting on the crossover must
-    /// not flip the far end's front end back and forth.
+    /// not flip the far end's front end back and forth. The crossover itself is
+    /// the tuner's floor, and the hysteresis is spent entirely above it.
     #[test]
     fn auto_hf_switches_once_and_holds() {
         let mut p = peer(Tuner::R820T, RtlSdrHfMode::Auto);
@@ -695,16 +697,16 @@ mod tests {
         // Above the crossover: the tuner.
         c.apply_hf_path(40e6).expect("write");
         assert_eq!(c.direct, 0);
-        // Just below it, but inside the hysteresis band — still the tuner.
-        c.apply_hf_path(28.0e6).expect("write");
-        assert_eq!(c.direct, 0, "flipped inside the hysteresis band");
-        // Clearly below: direct sampling.
-        c.apply_hf_path(14.1e6).expect("write");
-        assert_eq!(c.direct, 2);
+        // 12 m and 10 m are the tuner's own — it reaches them, unaliased.
+        c.apply_hf_path(24.915e6).expect("write");
+        assert_eq!(c.direct, 0, "12 m belongs to the tuner");
+        // Below the floor, where the ADC is the only way: direct sampling.
+        c.apply_hf_path(21.074e6).expect("write");
+        assert_eq!(c.direct, 2, "15 m has nowhere else to go");
         // Back up, but not clear of the band yet.
-        c.apply_hf_path(29.0e6).expect("write");
+        c.apply_hf_path(24.5e6).expect("write");
         assert_eq!(c.direct, 2, "flipped back inside the hysteresis band");
-        c.apply_hf_path(31.0e6).expect("write");
+        c.apply_hf_path(28.074e6).expect("write");
         assert_eq!(c.direct, 0);
     }
 

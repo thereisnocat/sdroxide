@@ -238,6 +238,11 @@ pub(crate) struct Latest {
     /// to tell that from a decoder that is not running.
     pub ism_reports: Vec<sdroxide_types::IsmReport>,
     pub ism_status: Option<sdroxide_types::IsmStatus>,
+    /// The aircraft the ADS-B decoder is tracking. Replayed on connect for the
+    /// same reason the ISM table is: a target that has been overhead for five
+    /// minutes is a standing condition, and a client that attaches without it
+    /// would show an empty radar in front of a working decoder.
+    pub adsb_status: Option<Box<sdroxide_types::AdsbStatus>>,
     /// What the DRM decoder has made of the broadcast currently tuned. Replayed
     /// on connect for the same reason as `rds`: a station's label and the
     /// transmission's parameters are standing conditions, and a client that
@@ -964,6 +969,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::IsmStatus(st) => {
                 latest.ism_status = Some(st.clone());
                 Some(ServerMsg::IsmStatus(st))
+            }
+            RadioEvent::AdsbStatus(st) => {
+                latest.adsb_status = Some(st.clone());
+                Some(ServerMsg::AdsbStatus(st))
             }
             RadioEvent::SstvLine { image_id, y, rgb } => {
                 Some(ServerMsg::SstvLine { image_id, y, rgb })

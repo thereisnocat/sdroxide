@@ -8,7 +8,7 @@ use anyhow::Result;
 use sdroxide_config::Settings;
 use sdroxide_radio::rtrb;
 use sdroxide_radio::{
-    AudioParams, EngineConfig, IqSource, MicParams, StoreSync, TxGate, start_engine,
+    AudioParams, EngineConfig, IqSource, MicParams, RadeWatch, StoreSync, TxGate, start_engine,
 };
 use sdroxide_server::{RadioParams, ServerParams};
 
@@ -35,6 +35,7 @@ pub fn run(
     // does, not less — nobody is sitting here to notice two radios keying.
     let gate = Arc::new(TxGate::new());
     let sync = Arc::new(StoreSync::new());
+    let rade = Arc::new(RadeWatch::new());
 
     let mut params = Vec::with_capacity(radios.len());
     for (i, boot) in radios.into_iter().enumerate() {
@@ -77,6 +78,7 @@ pub fn run(
                 primary: i == 0,
                 tx_gate: Some(gate.clone()),
                 store_sync: Some(sync.clone()),
+                rade_watch: Some(rade.clone()),
             },
         );
 
@@ -104,6 +106,7 @@ pub fn run(
     // everyone on the air to add a dongle.
     let add_gate = gate.clone();
     let add_sync = sync.clone();
+    let add_rade = rade.clone();
     let add_radio: sdroxide_server::AddRadioFn = Box::new(move |name: &str| {
         let slot = sdroxide_config::create_radio(name).map_err(|e| e.to_string())?;
         // Read fresh: this is minutes or days after startup, and the operator
@@ -147,6 +150,7 @@ pub fn run(
                 primary: false,
                 tx_gate: Some(add_gate.clone()),
                 store_sync: Some(add_sync.clone()),
+                rade_watch: Some(add_rade.clone()),
             },
         );
         Ok(RadioParams {

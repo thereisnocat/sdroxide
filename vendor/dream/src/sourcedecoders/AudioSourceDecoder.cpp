@@ -46,7 +46,7 @@
 
 CAudioSourceDecoder::CAudioSourceDecoder()
     :	bWriteToFile(false), TextMessage(false),
-      bUseReverbEffect(true), codec(nullptr)
+      bUseReverbEffect(true), pAudioSuperFrame(nullptr), codec(nullptr)
 {
     /* Initialize Audio Codec List */
     CAudioCodec::InitCodecList();
@@ -59,6 +59,9 @@ CAudioSourceDecoder::CAudioSourceDecoder()
 
 CAudioSourceDecoder::~CAudioSourceDecoder()
 {
+    delete pAudioSuperFrame;
+    pAudioSuperFrame = nullptr;
+
     /* Unreference Audio Codec List */
     CAudioCodec::UnrefCodecList();
 }
@@ -98,6 +101,12 @@ CAudioSourceDecoder::ProcessDataInternal(CParameter & Parameters)
     /* Audio data header parsing ********************************************* */
     /* Check if audio shall not be decoded */
     if (DoNotProcessAudDecoder)
+    {
+        return;
+    }
+
+    /* No parser means InitInternal() failed before it could build one. */
+    if (pAudioSuperFrame == nullptr)
     {
         return;
     }
@@ -199,6 +208,18 @@ CAudioSourceDecoder::ProcessDataInternal(CParameter & Parameters)
         Parameters.AudioComponentStatus[unsigned(Parameters.GetCurSelAudioService())].SetStatus(status);
         Parameters.Unlock();
 
+        /* The output buffer was sized in InitInternal() from what an audio
+           super frame is supposed to last. For AAC that is exact. For xHE-AAC
+           the number of audio frames is a 4 bit field off the air and their
+           length comes out of the USAC config, so the product can exceed it -
+           and this loop is the only thing standing between that and a write
+           past the end of the cyclic buffer's write window. Drop what will not
+           fit rather than run off the end; the block is already marked bad by
+           its status. */
+        const int iRoomPerChan = (iMaxOutputBlockSize - iOutputBlockSize) / 2;
+        if (iResOutBlockSize > iRoomPerChan)
+            iResOutBlockSize = iRoomPerChan > 0 ? iRoomPerChan : 0;
+
         /* Conversion from _REAL to _SAMPLE with special function */
         for (int i = 0; i < iResOutBlockSize; i++)
         {
@@ -209,18 +230,8 @@ CAudioSourceDecoder::ProcessDataInternal(CParameter & Parameters)
         /* Add new block to output block size ("* 2" for stereo output block) */
         iOutputBlockSize += iResOutBlockSize * 2;
 
-        if(iOutputBlockSize==0) {
-            //cerr << "iOutputBlockSize is zero" << endl;
-        }
-        else {
-            double d=0.0;
-            for (int i = 0; i < iOutputBlockSize; i++)
-            {
-                double n = (*pvecOutputData)[i];
-                d += n*n;
-            }
-            //cerr << "energy after converting " << iOutputBlockSize << " samples back to int " << sqrt(d/iOutputBlockSize) << endl;
-        }
+        /* An RMS-of-the-whole-buffer loop stood here, re-reading everything
+           written so far once per audio frame to feed a commented-out trace. */
 
     }
 }
@@ -346,6 +357,23 @@ CAudioSourceDecoder::InitInternal(CParameter & Parameters)
            have to consider larger buffers. An audio frame always corresponds to 400 ms */
         int iMaxLenResamplerOutput = int(_REAL(outputSampleRate) * 0.4 /* 400ms */  * 2 /* for stereo */ );
 
+        if (eAudioCoding == CAudioParam::AC_xHE_AAC)
+        {
+            /* Not for xHE-AAC, where the 400 ms is not a bound at all: the
+               audio super frame carries as many audio frames as its 4 bit
+               frame border count says, each as long as the USAC config makes
+               it (aacdecoder_lib.h documents 768, 1024, 2048 or 4096 samples).
+               Sized for the worst case the fields can express, which is one
+               allocation per service change and cheap; the clamp in
+               ProcessDataInternal is what makes it safe rather than this. */
+            const int iMaxFrames = 16;            /* 4 bit frame border count */
+            const int iMaxSamplesPerFrame = 4096; /* longest USAC frame       */
+            const int64_t iWorstCase = int64_t(iMaxFrames) * iMaxSamplesPerFrame
+                                       * outputSampleRate / inputSampleRate * 2;
+            if (iWorstCase > iMaxLenResamplerOutput)
+                iMaxLenResamplerOutput = int(iWorstCase);
+        }
+
         if(inputSampleRate != outputSampleRate) {
             _REAL rRatio = _REAL(outputSampleRate) / _REAL(inputSampleRate);
             /* Init resample objects */
@@ -413,6 +441,11 @@ CAudioSourceDecoder::GetNumCorDecAudio()
 void
 CAudioSourceDecoder::CloseDecoder()
 {
+    /* InitInternal() runs again on every mode, service and audio parameter
+       change and builds a fresh super frame parser each time. */
+    delete pAudioSuperFrame;
+    pAudioSuperFrame = nullptr;
+
     if (codec != nullptr)
         codec->DecClose();
 }

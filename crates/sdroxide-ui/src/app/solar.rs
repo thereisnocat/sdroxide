@@ -197,7 +197,7 @@ impl SdroxideApp {
     /// `extra` stretches the chip past its label, like the rest of the
     /// condensed Display box's row; every other caller passes 0.
     pub(in crate::app) fn solar_button(&mut self, ui: &mut egui::Ui, extra: f32) {
-        let label = super::top_bar::DISPLAY_TOOL_CHIPS[0];
+        let label = super::top_bar::DISPLAY_VIEW_CHIPS[0];
         #[cfg(not(target_arch = "wasm32"))]
         {
             if super::top_bar::chip_stretched(ui, self.solar.open, label, extra)

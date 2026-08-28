@@ -106,7 +106,10 @@ async fn the_far_ends_devices_reach_a_remote_client() {
     // about what the session did *during* one rather than after it.
     let scanning = Arc::new(AtomicBool::new(false));
     let flag = scanning.clone();
-    let prober: ProbeFn = Box::new(move |req| {
+    let prober: ProbeFn = Box::new(move |req, radio| {
+        // Every question here is about the machine, so the asking radio only
+        // has to be the one this server has.
+        assert_eq!(radio, 0, "the answer goes back to the radio that asked");
         match req {
             DeviceProbe::RtlSdr => ProbeAnswer::RtlSdr(vec![far_end_dongle()]),
             DeviceProbe::SerialPorts => ProbeAnswer::SerialPorts(vec!["/dev/ttyACM1".into()]),

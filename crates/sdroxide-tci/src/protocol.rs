@@ -304,10 +304,12 @@ pub fn mode_to_tci(mode: Mode) -> &'static str {
         // reason as the hamlib mapping.
         Mode::Am | Mode::Drm => "am",
         Mode::Sam => "sam",
-        // RIFP centres on the dial and swings ±4 kHz, and VHF packet
-        // frequency-modulates it too: FM, not a sideband.
-        Mode::Nfm | Mode::Rifp | Mode::Packet | Mode::Aprs => "nfm",
-        Mode::Wfm => "wfm",
+        // RIFP centres on the dial and swings ±4 kHz, and VHF packet and
+        // VHF SSTV frequency-modulate it too: FM, not a sideband.
+        Mode::Nfm | Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm => "nfm",
+        // ExpertSDR has no ADS-B mode either; wide FM is the nearest thing a
+        // client can be told without inventing a name it would reject.
+        Mode::Wfm | Mode::Adsb => "wfm",
         Mode::Digu
         | Mode::Ft8
         | Mode::Js8

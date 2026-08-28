@@ -208,6 +208,23 @@ impl PanadapterSource {
             // false here however the transceiver answers: the window belongs to
             // the receiver and the dial moves inside it.
             center_is_dial: false,
+            // The transceiver's, like the rest of the transmit half — and the
+            // engine overwrites it from `Self::cw_audio_keyed`, which says the
+            // same thing.
+            cw_audio_keyed: ctrl.cw_audio_keyed,
+            // The transceiver's too, but only while it is the one being
+            // listened to: its squelch decides what comes out of its sound
+            // card, and that is the audio here only under
+            // `PanadapterAudio::Transceiver`. Listening to the receiver's own
+            // I/Q instead, the honest gate is the engine's — the transceiver's
+            // squelch would then be muting nothing but its own speaker. The
+            // engine overwrites this from `Self::commands_squelch`, which says
+            // the same thing.
+            commands_squelch: ctrl.commands_squelch && cfg.audio == PanadapterAudio::Transceiver,
+            // The receiver's, like the filter: if the radio painting the
+            // picture is combining two aerials, this radio is listening to
+            // what came out of that.
+            diversity: rx.diversity,
         }
     }
 
@@ -560,6 +577,21 @@ impl IqSource for PanadapterSource {
 
     fn cw_audio_keyed(&self) -> bool {
         self.ctrl.cw_audio_keyed()
+    }
+
+    /// The transceiver's squelch, and only while the transceiver is the one
+    /// being listened to — see `merge_caps`.
+    fn commands_squelch(&self) -> bool {
+        self.ctrl.commands_squelch() && self.cfg.audio == PanadapterAudio::Transceiver
+    }
+
+    /// Gated on the same test, so the two answers cannot disagree: a level that
+    /// reached the transceiver while the *receiver* was the one being listened
+    /// to would quieten the operator's other radio and nothing here.
+    fn set_squelch(&mut self, frac: f32) {
+        if self.cfg.audio == PanadapterAudio::Transceiver {
+            self.ctrl.set_squelch(frac);
+        }
     }
 
     fn send_cw(&mut self, text: &str) {

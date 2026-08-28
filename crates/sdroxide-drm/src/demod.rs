@@ -16,7 +16,7 @@
 
 use num_complex::Complex32;
 use sdroxide_dsp::{ComplexResampler, Demodulator};
-use sdroxide_types::{DrmChannel, DrmStatus};
+use sdroxide_types::{DrmChannel, DrmCodec, DrmStatus};
 use tracing::{debug, warn};
 
 use crate::{AUDIO_RATE, DrmWorker, SIGNAL_RATE};
@@ -77,6 +77,9 @@ pub struct DrmDemod {
     status: DrmStatus,
     /// Cleared by `take_drm`, so the engine only republishes what has moved.
     status_dirty: bool,
+    /// The codec last warned about, so the log gets one line per station rather
+    /// than one every 250 ms.
+    warned_codec: Option<DrmCodec>,
 }
 
 impl DrmDemod {
@@ -104,6 +107,7 @@ impl DrmDemod {
             frame_debt: 0.0,
             status: DrmStatus::default(),
             status_dirty: true,
+            warned_codec: None,
         }
     }
 
@@ -272,6 +276,24 @@ impl Demodulator for DrmDemod {
             if now != self.status {
                 self.status = now;
                 self.status_dirty = true;
+            }
+            /* Nothing else in the receive chain reports this. Every indicator
+            reads healthy - locked, FAC, SDC, a service label - and the audio
+            is silence, so without a line here the log of a working install
+            and the log of a station nobody can hear are identical. */
+            match self.status.service.codec {
+                Some(c) if self.status.locked && !self.status.service.codec_supported => {
+                    if self.warned_codec != Some(c) {
+                        self.warned_codec = Some(c);
+                        warn!(
+                            codec = c.label(),
+                            service = %self.status.service.label,
+                            "this DRM service's audio codec has no decoder here; \
+                             xHE-AAC needs libfdk-aac installed"
+                        );
+                    }
+                }
+                _ => self.warned_codec = None,
             }
         }
         if !std::mem::take(&mut self.status_dirty) {

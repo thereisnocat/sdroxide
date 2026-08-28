@@ -255,6 +255,7 @@ fn convert_status(raw: &sys::sdrx_drm_status) -> DrmStatus {
         service_id: raw.service_id as u32,
         bitrate_kbps: raw.bitrate_kbps as f32,
         codec: (raw.has_signal != 0).then(|| DrmCodec::from_raw(raw.audio_codec)),
+        codec_supported: raw.audio_codec_supported != 0,
         stereo: raw.is_stereo != 0,
     };
     // A multiplex with no clock signals all-zero rather than omitting the field.
@@ -296,4 +297,7 @@ fn convert_status(raw: &sys::sdrx_drm_status) -> DrmStatus {
         // status conversion has no way to know that.
         constellation: None,
     }
+    // The C side also fills sdc_scheme, msc_scheme, audio_mode,
+    // audio_sample_rate and audio_sample_rate_out, none of which have anywhere
+    // to go yet. They are there if a use turns up.
 }

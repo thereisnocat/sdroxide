@@ -103,6 +103,7 @@ const DREAM_SOURCES: &[&str] = &[
     "sound/audiofilein.cpp",
     "sourcedecoders/aac_codec.cpp",
     "sourcedecoders/AudioCodec.cpp",
+    "sourcedecoders/fdk_aac_codec.cpp",
     "sourcedecoders/AudioSourceDecoder.cpp",
     "sourcedecoders/AudioSourceEncoder.cpp",
     "sourcedecoders/null_codec.cpp",
@@ -178,6 +179,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/fftw_compat.c");
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed={}", dream.join("src").display());
+    println!("cargo:rerun-if-changed={}", manifest.join("../../vendor/fdk-aac/include").display());
 }
 
 /// The DRM build of faad2: the same sources as the stock library with
@@ -239,6 +241,16 @@ fn common_defines(build: &mut cc::Build) {
     build.define("USE_SDROXIDE_SOUND", None);
     build.define("USE_FAAD2_LIBRARY", None);
     build.define("SDROXIDE_NO_AAC_ENCODER", None);
+    // xHE-AAC, the codec most surviving DRM30 broadcasters moved to. Dream's
+    // FDK-AAC codec is compiled in and `HAVE_USAC` turns on its USAC branches,
+    // but the library itself is *not* linked: the Fraunhofer licence carries
+    // restrictions GPL-3.0-or-later cannot absorb, so `SDROXIDE_FDK_DLOPEN`
+    // makes `fdk_aac_dll.h` look it up at run time instead. Without it
+    // installed, `FdkAacCodec::CanDecode` returns false and an xHE-AAC service
+    // falls back to the null codec, which is where this build stood before.
+    build.define("HAVE_LIBFDK_AAC", None);
+    build.define("HAVE_USAC", None);
+    build.define("SDROXIDE_FDK_DLOPEN", None);
     // The EPG decoder is the one place in the receiver that writes to disk, and
     // it names the file from the broadcast. Nothing here reads those files back.
     build.define("SDROXIDE_NO_DATA_FILES", None);
@@ -259,8 +271,16 @@ fn build_dream(manifest: &Path, dream: &Path, faad2: &Path) {
     for build in [&mut cxx, &mut c] {
         build
             .include(&src)
+            // `sourcedecoders/fdk_aac_codec.cpp` is the one file in the tree
+            // that spells an include from the project root (`src/SDC/SDC.h`),
+            // which is what upstream's qmake `INCLUDEPATH` gives it. Nothing
+            // at this level shadows a header.
+            .include(dream)
             .include(manifest.join("include"))
             .include(faad2.join("include"))
+            // Headers only — see `vendor/fdk-aac/PROVENANCE.md`. Nothing from
+            // this directory reaches the linker.
+            .include(manifest.join("../../vendor/fdk-aac/include"))
             .opt_level(2)
             .warnings(false);
         common_defines(build);
@@ -356,6 +376,7 @@ fn generate_bindings(manifest: &Path, out: &Path) {
         .header(manifest.join("src/drm_shim.h").to_string_lossy())
         .allowlist_function("sdrx_drm_.*")
         .allowlist_type("sdrx_drm_.*")
+        .allowlist_var("SDRX_DRM_.*")
         .layout_tests(false)
         .derive_debug(false)
         .generate()

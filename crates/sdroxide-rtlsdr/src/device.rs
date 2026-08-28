@@ -18,12 +18,44 @@ use crate::usb::UsbDev;
 // backend — the same chip family, reached over a different bus.
 use sdroxide_r82xx::{Chip, GainSetting, R82xx};
 
-/// Frequency below which the tuner cannot reach and HF handling takes over.
-const HF_CROSSOVER_HZ: f64 = 28_800_000.0;
+/// The bottom of the R82xx's own tuning range, and so where the automatic
+/// crossover to direct sampling belongs: below this the tuner cannot lock at
+/// all, and above it it is the better path — no alias, and a gain control.
+///
+/// Not the 28.8 MHz the Blog V4's upconverter is referenced to, which is what
+/// this used to be. The two numbers are equal on a V4 and unrelated on
+/// everything else, and only a dongle *without* an upconverter ever reaches the
+/// automatic branch below — so using the V4's figure sent 12 m and the bottom of
+/// 10 m through direct sampling, aliased, on hardware whose tuner covers them
+/// properly.
+pub const TUNER_MIN_HZ: f64 = 24_000_000.0;
 
-/// Hysteresis around the crossover, so a dial parked next to it cannot
+/// Top of the R82xx's range.
+pub const TUNER_MAX_HZ: f64 = 1_766_000_000.0;
+
+/// The highest a direct-sampling dongle reaches: the ADC's own clock.
+///
+/// Half of that — 14.4 MHz — is the Nyquist limit, and it is tempting to stop
+/// there. The band between it and the clock is receivable all the same, in the
+/// ADC's second Nyquist zone: a signal at `f` above 14.4 MHz aliases to
+/// `f - 28.8` (negative), and the DDC's frequency word is a 22-bit two's
+/// complement fraction of the clock, so asking for `f` wraps to exactly that
+/// negative alias. The wanted signal lands at DC the right way up — an offset
+/// above the dial stays above it — so nothing downstream has to know.
+///
+/// What the operator has to know is that there is no filter in front of the
+/// ADC: whatever is at `28.8 - f` is folded on top. 17 m lands on 10.7 MHz and
+/// 15 m on 7.726 MHz, both quiet; 12 m would land on 3.885 MHz, which is not,
+/// and is one more reason the crossover above hands 12 m to the tuner.
+pub const DIRECT_SAMPLING_TOP_HZ: f64 = regs::RTL_XTAL_HZ;
+
+/// Hysteresis above the crossover, so a dial parked next to it cannot
 /// oscillate between direct sampling and the tuner on every nudge. Each switch
 /// costs a tuner re-init and a gap in the stream, so this is worth having.
+///
+/// Entirely *above* [`TUNER_MIN_HZ`], never straddling it: a dial below the
+/// tuner's floor has nowhere else to go, so the band the hysteresis buys can
+/// only be spent on the far side.
 const HF_HYSTERESIS_HZ: f64 = 500_000.0;
 
 pub struct Device {
@@ -227,22 +259,7 @@ impl Device {
         if self.tuner.is_blog_v4() {
             return Ok(());
         }
-        let want = match self.hf_mode {
-            RtlSdrHfMode::Off => DirectSampling::Off,
-            RtlSdrHfMode::DirectQ => DirectSampling::Q,
-            RtlSdrHfMode::Auto => {
-                // Hysteresis: only cross once the frequency is clearly on the
-                // other side of the boundary.
-                let current = self.rtl.direct_sampling();
-                let threshold = if current == DirectSampling::Off {
-                    HF_CROSSOVER_HZ - HF_HYSTERESIS_HZ
-                } else {
-                    HF_CROSSOVER_HZ + HF_HYSTERESIS_HZ
-                };
-                if hz < threshold { DirectSampling::Q } else { DirectSampling::Off }
-            }
-        };
-        self.set_direct_sampling(want)
+        self.set_direct_sampling(direct_sampling_for(hz, self.hf_mode, self.rtl.direct_sampling()))
     }
 
     fn set_direct_sampling(&mut self, mode: DirectSampling) -> Result<()> {
@@ -347,5 +364,76 @@ impl Device {
     /// The gain values this dongle can produce, in dB.
     pub fn gains_db(&self) -> Vec<f64> {
         R82xx::gains_db().collect()
+    }
+}
+
+/// Which ADC path a dial setting calls for, given the operator's HF mode and
+/// where the front end is now.
+///
+/// Pure, and separate from [`Device::apply_hf_path`] that applies it, because
+/// the crossover is a decision with edges worth testing and no dongle is needed
+/// to make it. Never asked of a Blog V4: that one upconverts inside its own
+/// tuning call, and the caller returns before reaching here.
+fn direct_sampling_for(hz: f64, mode: RtlSdrHfMode, current: DirectSampling) -> DirectSampling {
+    match mode {
+        RtlSdrHfMode::Off => DirectSampling::Off,
+        RtlSdrHfMode::DirectQ => DirectSampling::Q,
+        RtlSdrHfMode::Auto => {
+            // Hysteresis, spent above the floor only — see HF_HYSTERESIS_HZ.
+            let threshold = if current == DirectSampling::Off {
+                TUNER_MIN_HZ
+            } else {
+                TUNER_MIN_HZ + HF_HYSTERESIS_HZ
+            };
+            if hz < threshold { DirectSampling::Q } else { DirectSampling::Off }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bands this exists for. 17 m and 15 m are below the tuner's floor and
+    /// above the ADC's Nyquist limit, so direct sampling's second zone is the
+    /// only way to them; 12 m and 10 m are above the floor, where the tuner is
+    /// the better path.
+    #[test]
+    fn the_crossover_is_the_tuners_floor_not_the_v4s_reference() {
+        let auto = |hz| direct_sampling_for(hz, RtlSdrHfMode::Auto, DirectSampling::Off);
+        assert_eq!(auto(18_100_000.0), DirectSampling::Q, "17 m");
+        assert_eq!(auto(21_074_000.0), DirectSampling::Q, "15 m");
+        assert_eq!(auto(24_915_000.0), DirectSampling::Off, "12 m is the tuner's");
+        assert_eq!(auto(28_074_000.0), DirectSampling::Off, "10 m is the tuner's");
+    }
+
+    /// The hysteresis holds a dial sitting on the crossover, and holds it on
+    /// the upper side: below the tuner's floor there is no choice to make.
+    #[test]
+    fn the_hysteresis_sits_above_the_floor() {
+        let from_tuner = |hz| direct_sampling_for(hz, RtlSdrHfMode::Auto, DirectSampling::Off);
+        let from_direct = |hz| direct_sampling_for(hz, RtlSdrHfMode::Auto, DirectSampling::Q);
+
+        // On the tuner, nothing it can still reach sends us to the ADC.
+        assert_eq!(from_tuner(TUNER_MIN_HZ), DirectSampling::Off);
+        assert_eq!(from_tuner(TUNER_MIN_HZ - 1.0), DirectSampling::Q);
+        // Direct sampling, on the way back up: hold through the band, then go.
+        assert_eq!(from_direct(TUNER_MIN_HZ + 100_000.0), DirectSampling::Q);
+        assert_eq!(from_direct(TUNER_MIN_HZ + HF_HYSTERESIS_HZ), DirectSampling::Off);
+    }
+
+    /// Both explicit settings mean what they say, everywhere.
+    #[test]
+    fn an_explicit_hf_mode_is_never_second_guessed() {
+        for hz in [3_573_000.0, 21_074_000.0, 145_500_000.0] {
+            assert_eq!(
+                direct_sampling_for(hz, RtlSdrHfMode::Off, DirectSampling::Q),
+                DirectSampling::Off
+            );
+            assert_eq!(
+                direct_sampling_for(hz, RtlSdrHfMode::DirectQ, DirectSampling::Off),
+                DirectSampling::Q
+            );
+        }
     }
 }

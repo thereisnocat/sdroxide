@@ -172,6 +172,56 @@ pub struct DeviceCaps {
     /// Appended last, for the same reason as `shared_lo_rx`.
     #[serde(default)]
     pub center_is_dial: bool,
+    /// A diversity filter is running on this stream: two coherent aerials —
+    /// a LimeSDR's two receive chains, an RSPduo's two tuners — combined into
+    /// the one span this radio shows.
+    ///
+    /// What it is for is the main window: the filter has controls an operator
+    /// works with *while listening* (which way it combines, and holding it the
+    /// moment a null appears), and those belong on the strip rather than three
+    /// clicks into a settings dialog. Every backend that has one drives it
+    /// through the same pseudo-gain element names, so this one flag is all the
+    /// strip needs to know.
+    ///
+    /// Reported by the source, not read from the configuration: a setting the
+    /// hardware refused (no second tuner, a chain another radio has taken)
+    /// must not put controls on screen that do nothing. Appended last, for the
+    /// same reason as `shared_lo_rx`.
+    #[serde(default)]
+    pub diversity: bool,
+    /// CW goes out as *audio* on this radio, so the digital transmit-audio
+    /// level reaches it.
+    ///
+    /// False where the rig sends from its own keyer: there CW leaves as text
+    /// over the control port and the sound card is not in the path at all, so
+    /// a level control for it would be a control that does nothing. That is the
+    /// distinction `Mode::takes_digi_tx_audio` deliberately cannot make —
+    /// whether the audio is heard is a property of the radio, not of the mode.
+    ///
+    /// Reported by the source (`IqSource::cw_audio_keyed`) rather than read
+    /// from the CAT configuration, because a backend that is not a CAT rig has
+    /// no `cw_keying` field to read and still has an answer.
+    ///
+    /// Appended last, for the same reason as `shared_lo_rx`.
+    #[serde(default)]
+    pub cw_audio_keyed: bool,
+    /// The radio has a squelch of its own that sdroxide can set, so the SQL
+    /// control drives *that* rather than the engine's own gate
+    /// ([`crate::RadioState::rig_squelch`] rather than
+    /// [`crate::RxState::squelch_db`]).
+    ///
+    /// True on a transceiver that hands us audio it has already gated, where
+    /// the rig's squelch is the only one that can open — a threshold on this
+    /// side never hears what the radio muted (issue #192). False on every I/Q
+    /// front end, where the engine has the whole passband and its own gate is
+    /// the honest one.
+    ///
+    /// Reported by the source (`IqSource::commands_squelch`) rather than read
+    /// from the CAT configuration, for the same reason [`Self::cw_audio_keyed`]
+    /// is: a backend that is not a CAT rig has no such field and still has an
+    /// answer. Appended last, for the same reason as `shared_lo_rx`.
+    #[serde(default)]
+    pub commands_squelch: bool,
 }
 
 impl DeviceCaps {

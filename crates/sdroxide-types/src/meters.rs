@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+/// Fraction of converter samples at full scale above which the front end is
+/// called overloaded — see [`Meters::adc_clip`].
+///
+/// Not zero, because "at full scale" is measured with a shade of margin: the
+/// backends disagree on what the top code converts to (0.9922 on a packed 8-bit
+/// front end, 0.99688 on an RTL-SDR, 0.99997 on a 16-bit one), so the test has
+/// to sit under all of them and a signal that legitimately fills the converter
+/// then grazes it on the odd sample. One in two hundred is well clear of that
+/// and far below what any genuinely clipped signal produces — the mildest
+/// clipped case measured for issue #173 was already at 43 %.
+///
+/// Lives here rather than beside the meter that fills it because the UI asks
+/// this question too, and the UI builds for wasm32 where the DSP crate does not
+/// follow.
+pub const OVERLOAD_FRACTION: f32 = 0.005;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TxMeters {
     /// Forward power in watts, if the device exposes a sensor for it.
@@ -51,8 +67,23 @@ pub struct TxTelemetry {
 pub struct Meters {
     /// Signal level in the RX passband, dBm (after `cal_offset_db`).
     pub s_dbm: f32,
-    /// ADC headroom indicator.
+    /// ADC headroom indicator: the highest either converter axis reached over
+    /// the last meter window, in dBFS. `f32::NEG_INFINITY` before anything has
+    /// been measured.
     pub adc_peak_dbfs: f32,
+    /// Fraction of converter samples at full scale over the same window,
+    /// `0.0..=1.0`. Above [`OVERLOAD_FRACTION`] — ask [`Meters::adc_overloaded`] —
+    /// the front end is
+    /// running into its rails and everything downstream is reading a distorted
+    /// signal — including the `s_dbm` beside this, which understates a clipped
+    /// carrier.
+    ///
+    /// Beside the peak rather than instead of it because neither answers on its
+    /// own: the peak cannot distinguish a signal that fills the converter from
+    /// one twice too big for it, and this saturates as soon as a
+    /// constant-envelope signal passes √2 of full scale. Together they say both
+    /// *whether* and roughly *how far*.
+    pub adc_clip: f32,
     /// Present while transmitting.
     pub tx: Option<TxMeters>,
     /// A WFM stereo pilot is locked on the main receiver. Drives the `ST`
@@ -65,6 +96,12 @@ pub struct Meters {
 }
 
 impl Meters {
+    /// The front end is running into its rails, so nothing downstream — this
+    /// struct's own `s_dbm` included — is reading an undistorted signal.
+    pub fn adc_overloaded(&self) -> bool {
+        self.adc_clip > OVERLOAD_FRACTION
+    }
+
     /// S-units for display: S9 = -73 dBm, 6 dB per unit below, dB-over-9 above.
     pub fn s_units(&self) -> (u8, f32) {
         let over = self.s_dbm + 73.0;

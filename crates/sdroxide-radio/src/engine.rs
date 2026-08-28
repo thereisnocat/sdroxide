@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use tracing::{debug, info, warn};
 
+use sdroxide_adsb::{AdsbAction, AdsbController};
 use sdroxide_config::BandStacks;
 use sdroxide_digi::{
     AprsController, CwController, DigiAction, DigiController, DigiEngine, FsqController,
@@ -20,7 +21,7 @@ use sdroxide_digi::{
 };
 use sdroxide_drm::DrmDemod;
 use sdroxide_dsp::{
-    Agc, AutoNotch, DcBlock, Ddc, Decimator, DeepFilterNr, Demodulator, Duc, Modulator,
+    AdcMeter, Agc, AutoNotch, DcBlock, Ddc, Decimator, DeepFilterNr, Demodulator, Duc, Modulator,
     MonoResampler, Nco, NeuralNr, NoiseBlanker, ParametricEq, SpecBleachNr, SpectralNr,
     SpectrumAnalyzer, StereoResampler, SubToneGen, ToneBurst, channel_target, make_demod,
     make_modulator,
@@ -40,35 +41,155 @@ use crate::recorder::{Recorder, RecordingChannels};
 use crate::voice::VoiceKeyer;
 use crate::{Complex32, ControlUpdate, IqSource};
 
-/// Number of bins in emitted display frames (matches the waterfall texture width).
-pub const DISPLAY_BINS: usize = 2048;
-
-/// Bins of the device-wide analyser a viewport has to keep before the
-/// panadapter is served from a zoom lane instead (see [`ZoomLane`]).
+/// The most waterfall rows an engine will hold for a client that has stopped
+/// collecting them.
 ///
-/// One per column of the emitted frame. Below that the pooling in
-/// `SpectrumAnalyzer::make_frame` has fewer measurements than it has columns to
-/// fill and the trace stair-steps: an RX-888 streaming 8.1 MHz through a
-/// 32768-point FFT is 247 Hz a bin, so a 68 kHz window on screen is drawn from
-/// 275 numbers.
-const ZOOM_LANE_MIN_BINS: f64 = DISPLAY_BINS as f64;
+/// A hitch on the client — a tab switched away, a compositor stall — must cost
+/// the rows it happened over and no more: replaying a second of backlog into
+/// the texture at once would draw a second of band in one repaint and put the
+/// time axis out by that much. At the fastest row clock this is an eighth of a
+/// second.
+const MAX_BATCH_ROWS: usize = 64;
+
+/// Bins in a full-band frame.
+///
+/// A constant where the main panadapter's width is not, because this lane does
+/// not follow anybody's screen: the strip that draws it keeps its own
+/// 1024-column history, never zooms, and is a few dozen pixels tall. This is
+/// already twice what it can show, and `sdroxide_spyserver`'s
+/// `FFT_DISPLAY_PIXELS` is matched to it.
+///
+/// The main panadapter's width is [`sdroxide_types::SpectrumConfig::bins`].
+pub const WIDE_BINS: usize = 2048;
 
 /// How much wider than the viewport the zoom lane's output has to be, so the
 /// decimator's transition band stays off the edge of the display.
 const ZOOM_LANE_MARGIN: f64 = 1.4;
 
-/// The zoom lane's FFT size. The decimation ladder is powers of two, so the
-/// lane's output lands between [`ZOOM_LANE_MARGIN`] and twice that times the
-/// viewport, which puts at least 1400 of these bins inside it — about one per
-/// column of any display anyone owns, at any zoom.
-const ZOOM_LANE_FFT: usize = 4096;
+/// The zoom lane's FFT size for a display `display_bins` columns wide.
+///
+/// The decimation ladder is powers of two, so the lane's output lands between
+/// [`ZOOM_LANE_MARGIN`] and twice that times the viewport — which means the
+/// bins that fall *inside* the viewport are between a 2.8th and a 1.4th of
+/// these. Twice the columns therefore puts about one bin per column inside it
+/// even at the narrow end of the ladder, which is the property the old fixed
+/// 4096 had back when every display was 2048 columns wide.
+///
+/// Floored at that same 4096 so a 2048-column display is unchanged, and capped
+/// at 32768: past there a single transform covers more signal than the lane's
+/// hop can hide (see [`MAX_HOP_DIV`]).
+fn zoom_lane_fft(display_bins: usize) -> usize {
+    (display_bins * 2).next_power_of_two().clamp(4096, 32_768)
+}
 
-/// The zoom lane's overlap, as the divisor of its FFT size. An eighth rather
-/// than the usual half: the finer the zoom the longer one transform takes to
-/// fill — resolving a hertz needs a second of signal, on any analyser ever
-/// built — and at the deep end a half-window hop would leave the waterfall
-/// crawling. See [`sdroxide_dsp::SpectrumAnalyzer::with_hop_div`].
-const ZOOM_LANE_HOP_DIV: usize = 8;
+/// How many transforms a waterfall row is built from, when there are enough to
+/// choose. More than one so a signal straddling a window boundary is still seen
+/// whole in a neighbouring window, and so the peak hold has something to pick a
+/// maximum from; not many more, because every one past that is folded into the
+/// same row and thrown away.
+const TRANSFORMS_PER_ROW: f64 = 4.0;
+
+/// The overlap to run an analyser at: the divisor of its FFT size that gives
+/// about [`TRANSFORMS_PER_ROW`] transforms per waterfall row.
+///
+/// Overlap is not free and it is not uniformly useful. It exists so a signal
+/// that lands across a window boundary is still seen whole in the next window,
+/// which matters enormously when transforms are scarce — a zoomed lane running
+/// at a few kilohertz fills a 4096-point window barely twice a second, and the
+/// eighth-hop it has always used is what puts rows on its waterfall at all.
+///
+/// It is close to pure waste when transforms are abundant. An RX-888 at
+/// 8.1 MHz through a 4096-point window runs 3955 transforms a second at the
+/// customary half-hop; the waterfall consumes at most 224 of them and the peak
+/// hold folds the rest into the same rows. That was measured at 18% of the
+/// process — the single largest thing in the DSP thread after the receive
+/// chain — for detail no display can show.
+///
+/// So the overlap follows the rate and the scroll speed rather than being a
+/// constant. The clamp keeps both ends honest: never coarser than one window
+/// per hop (which would skip samples outright, and a signal shorter than a
+/// window could then be missed entirely), and never finer than an eighth,
+/// which is what the zoom lane wants and what this returns for it unchanged.
+fn hop_div_for(rate_hz: f64, fft_size: usize, rows_per_sec: f64) -> usize {
+    if !rate_hz.is_finite() || rate_hz <= 0.0 || rows_per_sec <= 0.0 {
+        return 2;
+    }
+    let want_transforms = rows_per_sec * TRANSFORMS_PER_ROW;
+    let hop = (rate_hz / want_transforms).max(1.0);
+    ((fft_size as f64 / hop).ceil() as usize).clamp(1, MAX_HOP_DIV)
+}
+
+/// The device-wide panadapter analyser, at the overlap its rate and the
+/// operator's scroll speed call for — see [`hop_div_for`].
+fn build_analyzer(
+    fft_size: usize,
+    rate_hz: f64,
+    avg_tc: f32,
+    rows_per_sec: f64,
+) -> SpectrumAnalyzer {
+    SpectrumAnalyzer::with_hop_div(
+        fft_size,
+        rate_hz,
+        avg_tc,
+        hop_div_for(rate_hz, fft_size, rows_per_sec),
+    )
+}
+
+/// Workers in the pool the block loop forks its lanes onto.
+///
+/// One block of receive samples divides into three independent pieces — the
+/// device-wide panadapter analyser, the panadapter's zoom lane, and the receive
+/// chain — and the third of them runs on the engine thread itself, which is
+/// where it has to stay (see [`Engine::process_block`]). So two workers, not
+/// three. None of the three writes anything another reads, and on a wide front
+/// end each is tens of percent of a core: an RX-888 at 32.4 Msps ran all three
+/// down one thread and left thirty other cores idle.
+///
+/// A pool of this crate's own rather than rayon's global one, which is sized to
+/// the machine: this forks about two thousand times a second on a fast front
+/// end, and thirty-two workers waking to look for two pieces of work cost more
+/// than they finish. Measured: 2.3 µs a fork on a pool of three, 9.8 µs on the
+/// global one.
+const LANE_WORKERS: usize = 2;
+
+/// Cores below which the block loop stays on one thread.
+///
+/// Forking is only ever worth it where there is somewhere for the work to go.
+/// A Raspberry Pi running the GUI, the receive chain and a compositor on four
+/// cores has no spare one to steal a lane onto, and the hand-off would be pure
+/// loss.
+const LANE_POOL_MIN_CORES: usize = 4;
+
+/// The pool the block loop forks onto, or `None` on a machine that should stay
+/// on one thread — see [`LANE_WORKERS`].
+fn lane_pool() -> Option<rayon::ThreadPool> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cores < LANE_POOL_MIN_CORES {
+        return None;
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(LANE_WORKERS)
+        .thread_name(|i| format!("sdroxide-lane{i}"))
+        .build()
+    {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            warn!("could not start the panadapter lane pool, staying single-threaded: {e}");
+            None
+        }
+    }
+}
+
+/// The finest overlap any lane runs at, and the one the zoom lane reaches.
+///
+/// An eighth rather than the usual half: the finer the zoom the longer one
+/// transform takes to fill — resolving a hertz needs a second of signal, on any
+/// analyser ever built — and at the deep end a half-window hop would leave the
+/// waterfall crawling. It used to be a constant the zoom lane passed by hand;
+/// [`hop_div_for`] now arrives at the same number from the lane's rate, and
+/// this is the ceiling it stops at.
+/// See [`sdroxide_dsp::SpectrumAnalyzer::with_hop_div`].
+const MAX_HOP_DIV: usize = 8;
 
 /// How long the main panadapter keeps drawing a front end's own spectrum after
 /// the last sweep landed.
@@ -293,6 +414,9 @@ pub struct EngineConfig {
     /// Change signal for the station-shared stores, shared like `tx_gate`.
     /// `None` (the default): no other engine exists, nothing to watch.
     pub store_sync: Option<Arc<crate::StoreSync>>,
+    /// Which radio is on FreeDV, shared like `tx_gate`. `None` (the default,
+    /// and every single-radio start): this engine's own mode is the answer.
+    pub rade_watch: Option<Arc<crate::RadeWatch>>,
 }
 
 impl Default for EngineConfig {
@@ -313,6 +437,7 @@ impl Default for EngineConfig {
             primary: true,
             tx_gate: None,
             store_sync: None,
+            rade_watch: None,
             record_iq: None,
         }
     }
@@ -331,6 +456,8 @@ pub fn start(source: Box<dyn IqSource>, caps: DeviceCaps, cfg: EngineConfig) -> 
         db_floor: 0.0,
         db_ceil: 0.0,
         bins: Vec::new(),
+        rows: Vec::new(),
+        rows_clocked: false,
     };
     let (spec_in, spectrum_out) = triple_buffer::triple_buffer(&empty);
     let (wide_in, wide_spectrum_out) = triple_buffer::triple_buffer(&empty);
@@ -1324,6 +1451,41 @@ impl TxChain {
     }
 }
 
+/// The receive chain over one block, with everything it touches handed in.
+///
+/// Free-standing rather than a method on [`Engine`] because it is one half of a
+/// fork: the other half holds `&mut Engine`, so this one may hold nothing of
+/// it. `out` is (speaker left, speaker right, recorder left, recorder right).
+///
+/// The audio is copied out rather than left borrowed from the chain because a
+/// digital-voice mode may replace it wholesale, and deciding that needs the
+/// digi engine — which would otherwise be borrowed against the chain.
+fn run_chain_block(
+    chain: &mut RxChain,
+    rx: &RxState,
+    iq: &[Complex32],
+    want_rec: bool,
+    out: (&mut Vec<f32>, &mut Vec<f32>, &mut Vec<f32>, &mut Vec<f32>),
+) {
+    let (play, play_r, rec, rec_r) = out;
+    play.clear();
+    play_r.clear();
+    let (audio, right) = chain.run(iq, rx, want_rec);
+    play.extend_from_slice(audio);
+    if let Some(r) = right {
+        play_r.extend_from_slice(r);
+    }
+    rec.clear();
+    rec_r.clear();
+    if want_rec {
+        let (rec_audio, rec_right) = chain.take_rec_audio();
+        rec.extend_from_slice(rec_audio);
+        if let Some(r) = rec_right {
+            rec_r.extend_from_slice(r);
+        }
+    }
+}
+
 /// A satellite lock in progress: the parsed propagator, who is watching from
 /// where, and the numbers most recently computed from them.
 struct ActiveSatLock {
@@ -1394,8 +1556,21 @@ struct ZoomLane {
 
 impl ZoomLane {
     /// A lane covering `in_rate / decim` centred on `center_hz`, with the front
-    /// end currently on `dev_center_hz`.
-    fn new(in_rate_hz: f64, decim: u32, center_hz: f64, dev_center_hz: f64, avg_tc: f32) -> Self {
+    /// end currently on `dev_center_hz`, analysed `fft` points at a time.
+    ///
+    /// `fft` comes from [`zoom_lane_fft`] and so from the width the client is
+    /// drawing: a lane that resolved a 2048-column display would stair-step a
+    /// 4096-column one, which is the whole complaint this lane exists to answer,
+    /// one zoom level further in.
+    fn new(
+        in_rate_hz: f64,
+        decim: u32,
+        center_hz: f64,
+        dev_center_hz: f64,
+        avg_tc: f32,
+        fft: usize,
+        rows_per_sec: f64,
+    ) -> Self {
         // The ladder is powers of two, so `Ddc` reaches this rate exactly and
         // `out_rate` is a formality — read back rather than assumed, because
         // the frame's axis has to be the width actually produced.
@@ -1403,8 +1578,11 @@ impl ZoomLane {
         let offset_hz = center_hz - dev_center_hz;
         ddc.set_offset_hz(offset_hz);
         let rate_hz = ddc.out_rate();
-        let mut analyzer =
-            SpectrumAnalyzer::with_hop_div(ZOOM_LANE_FFT, rate_hz, avg_tc, ZOOM_LANE_HOP_DIV);
+        // The same rule the device-wide lane uses. At the rates a zoom lane runs
+        // at it returns the eighth-hop this used to hard-code, and it stops
+        // asking for one on a shallow zoom that is still streaming megahertz.
+        let hop_div = hop_div_for(rate_hz, fft, rows_per_sec);
+        let mut analyzer = SpectrumAnalyzer::with_hop_div(fft, rate_hz, avg_tc, hop_div);
         // DC here is the middle of the operator's window, not the front end's
         // LO leakage, so the usual spike suppression would punch a hole through
         // whatever they had centred.
@@ -1466,6 +1644,16 @@ struct Engine {
     /// Centre and span the cached sweep covers, and when it landed.
     wide_window: Option<(f64, f64)>,
     wide_at: Instant,
+    /// Sweeps a front end with its own spectrum has finished since this engine
+    /// started.
+    ///
+    /// Diagnostic, and the one number that says how much of the picture is
+    /// real on a rig whose scope *is* the main panadapter: the waterfall is
+    /// scrolled on the wall clock there, so at three sweeps a second and a
+    /// hundred rows a second every sweep is drawn thirty times over. Counted
+    /// beside the transform and frame rates in the panadapter diagnostic, which
+    /// is where the same question gets asked about the other lanes.
+    wide_sweeps: u64,
     /// Whether the cached sweep is one the full-band lane has not published.
     /// The main lane has no such flag: it emits at the display rate whether or
     /// not a new sweep arrived, exactly as the FFT analyser does.
@@ -1473,6 +1661,36 @@ struct Engine {
     /// Sequence number for full-band frames, kept apart from the main
     /// analyser's so a client can tell one lane's frames from the other's.
     wide_seq: u32,
+    /// Samples fed to the panadapter since the last row was clocked.
+    ///
+    /// The waterfall's time axis is measured in *signal*, not in wall clock or
+    /// in blocks: a source hands over a block a few dozen times a second, and
+    /// clocking a row per block would cap the waterfall at the block rate for
+    /// no better reason than the size of a read. Counting samples instead puts
+    /// the rows exactly evenly along the axis they are drawn on, at whatever
+    /// rate was asked for, up to the rate the analyser produces transforms.
+    row_samples: usize,
+    /// Whether rows are being clocked off the sample stream (a wideband I/Q
+    /// path) rather than off the wall clock (a demod-audio rig, a radio's own
+    /// sweep — lanes where a block *is* the update).
+    row_sample_clock: bool,
+    /// Rows clocked since this engine started. Diagnostic; see the
+    /// `sdroxide::panadapter` log.
+    rows_clocked: u64,
+    /// The receive chain's DDC output rate, as of the top of this block.
+    ///
+    /// Cached rather than asked of the chain, because the frame builder may run
+    /// while the chain is away on another core — see [`Engine::process_block`]
+    /// — and a digital mode's channel analyser is described by this number. It
+    /// changes only when the chain is rebuilt, which is never inside a block.
+    channel_rate_hz: f64,
+    /// Waterfall rows clocked since the last frame went out, oldest first,
+    /// `row_axis`'s width apiece. Emptied into every published frame.
+    row_batch: Vec<u8>,
+    /// The axis and width the rows in hand were pooled on. A zoom, a retune or
+    /// a change of lane makes the older rows a picture of somewhere else, so
+    /// they are thrown away rather than drawn on the new axis.
+    row_axis: Option<(f64, f64, usize)>,
     /// Sequence number for main-lane frames built from those same bins. A third
     /// counter because a client de-duplicates each lane by its own sequence,
     /// and the two lanes emit at different rates.
@@ -1589,6 +1807,11 @@ struct Engine {
     /// band plan is only consulted when the dial has actually moved.
     auto_shift_dial: Option<f64>,
     nb: NoiseBlanker,
+    /// Converter headroom, read straight off the samples the device handed
+    /// over. Fed before the blanker and before decimation — see
+    /// [`sdroxide_dsp::AdcMeter`], which records why either of those would
+    /// erase the evidence.
+    adc: AdcMeter,
     /// Auto-notch + spectral NR for the CAT/demod-audio path (the IQ path uses
     /// per-`RxChain` instances instead).
     audio_notch: AutoNotch,
@@ -1603,6 +1826,15 @@ struct Engine {
     /// only while a digital mode is active.
     digi: Option<Box<dyn DigiEngine>>,
     digi_config: DigiConfig,
+    /// `digi_config` holds a change that is not on disk yet.
+    ///
+    /// Only `Command::SetDigiTxLevel` sets it: every other route through this
+    /// configuration saves as it goes, and can, because each is a discrete act
+    /// by the operator. The transmit-audio rail is a drag — one command per
+    /// frame for as long as it lasts — so it is applied at once and written by
+    /// [`Engine::flush_digi_config`] on the periodic tick and at shutdown, the
+    /// way the session is.
+    digi_dirty: bool,
     /// The band the running controller's transmit offset belongs to, so a move
     /// to another one can be noticed. `None` means "not yet applied", which is
     /// how a fresh controller asks for its band's stored offset: startup and a
@@ -1670,6 +1902,13 @@ struct Engine {
     /// The client's visible waterfall window, in absolute Hz; `None` until a
     /// client says otherwise (a headless server skims the whole window).
     skim_view: Option<(f64, f64)>,
+    /// Where the skim window is currently centred, in absolute Hz, so a retune
+    /// or a pan can tell whether it has to move. Meaningless while `skim_ddc`
+    /// is `None`.
+    skim_center_hz: f64,
+    /// The front-end rate the skim chain was built from — the one thing about
+    /// it that cannot be retuned in place. See [`Engine::sync_skim_window`].
+    skim_in_rate: f64,
     /// The operator's persisted skimmer preference. Distinct from
     /// `state.skimmer`, which is the *live* setting and is forced off on an
     /// audio-mode source — this is what a wideband source gets restored to.
@@ -1678,7 +1917,7 @@ struct Engine {
     /// plan, plus a worker thread, present only while the decoder is enabled.
     ///
     /// A second window rather than a share of the skimmer's: that one is 192 kHz
-    /// wide and pinned to the hardware centre, and the ISM plan needs about
+    /// wide and follows the operator's waterfall, and the ISM plan needs about
     /// 1.5 MHz placed on 868.9 MHz.
     ism_ddc: Option<Ddc>,
     ism: Option<IsmController>,
@@ -1694,6 +1933,35 @@ struct Engine {
     /// The operator's persisted ISM preference, kept apart from `state.ism` for
     /// the same reason as `skim_cfg`.
     ism_cfg: sdroxide_types::IsmSettings,
+
+    /// The ADS-B lane (issue #160): a third window, on 1090 MHz.
+    ///
+    /// Its own rather than a share of anything else's for the plainest reason
+    /// in the tree — it is two and a half megahertz wide and a gigahertz away
+    /// from every other lane. It only runs in `Mode::Adsb`, because a receiver
+    /// parked on 1090 MHz at 2.4 Msps is not listening to anything else.
+    adsb_ddc: Option<Ddc>,
+    adsb: Option<AdsbController>,
+    adsb_buf: Vec<Complex32>,
+    /// Absolute frequency the window is centred on.
+    adsb_center_hz: f64,
+    /// The stream rate `adsb_ddc` was built to decimate, so a retune can tell a
+    /// window that merely moved from one that has to be rebuilt.
+    adsb_in_rate: f64,
+    /// The operator's persisted preference, kept apart from `state.adsb` for the
+    /// same reason `ism_cfg` is.
+    adsb_cfg: sdroxide_types::AdsbSettings,
+    /// The station's own position, so a surface squitter has something to be
+    /// decoded against. Sent to the worker when it changes.
+    adsb_home: Option<(f64, f64)>,
+    /// The last "cannot run" sentence sent to the panel, so it is sent once
+    /// rather than on every block.
+    ///
+    /// The outer `None` means nothing has been said yet, which is different
+    /// from having said "there is nothing wrong". Without the distinction a
+    /// panel that connected while the lane was down would sit on "starting the
+    /// decoder" forever.
+    adsb_idle_sent: Option<Option<String>>,
     /// Open capture file for `--record-iq`, and the interleaving scratch it is
     /// written from.
     iq_rec: Option<std::io::BufWriter<std::fs::File>>,
@@ -1921,16 +2189,115 @@ struct Engine {
     /// caught up with. See [`EngineConfig::store_sync`].
     store_sync: Option<Arc<crate::StoreSync>>,
     shared_gen_seen: u64,
+    /// Which of the station's radios is on FreeDV. See
+    /// [`EngineConfig::rade_watch`].
+    rade_watch: Option<Arc<crate::RadeWatch>>,
 }
 
-/// Target width of the CW skimmer window (Hz); the Ddc snaps to the nearest
+/// Target width of the skimmers' window (Hz); the Ddc snaps to the nearest
 /// integer decimation of the device rate.
+///
+/// Not the width of the front end, and deliberately so. Every stage below is
+/// sized from this rate — the detector's bins are `rate / 4096`, and DeepCW's
+/// front end builds a transform proportional to it — so a window as wide as an
+/// RX-888's span would put 8 kHz in a bin and cost a transform to match. 192 kHz
+/// resolves CW to about 47 Hz and covers a whole HF band; where the operator is
+/// looking at more than that, [`skim_center_for`] decides which part of it gets
+/// skimmed.
 const SKIM_TARGET_HZ: f64 = 192_000.0;
+
+/// How much of a front end's stream the ADS-B window may claim.
+///
+/// The outer edges of any receiver's span are where its own anti-alias filter
+/// is already rolling off, and a decoder that slices half-microsecond chips has
+/// no margin to spend on a signal that arrives tilted. Three quarters is the
+/// same figure the ISM plan uses, for the same reason.
+///
+/// On the commonest receiver for this the fraction never binds: an RTL-SDR at
+/// 2.4 Msps hands over a stream the window is exactly as wide as, the
+/// downconverter decimates by one, and nothing is trimmed.
+const ADSB_USABLE_FRACTION: f64 = 0.75;
+
+/// Where the skim window belongs, in absolute Hz.
+///
+/// The window is a decimation of the front end's stream, not a second receiver:
+/// it is one slice of what is arriving, and something has to choose which. It
+/// used to be pinned to the hardware centre, which is right on a front end whose
+/// span is a band and wrong on one whose span is all of HF — an RX-888 handed
+/// 32 Msps centres on 16.2 MHz, so the skimmers sat in the middle of nowhere
+/// while the operator watched 20 m, found nothing to decode and looked broken.
+///
+/// So it follows the waterfall instead:
+///
+/// * A view that fits inside the window is centred in it, and the slack either
+///   side is what a pan travels through before anything has to move.
+/// * A view wider than the window keeps the dial in it — of a band-wide screen,
+///   the part the operator cares about is where they are listening — clamped so
+///   the window stays inside the view rather than hanging off the edge of it.
+/// * With no view at all (a headless server, nobody watching) the window stays
+///   where it is, and a fresh one starts on the hardware centre.
+///
+/// `current` is where the window is now, and gets the benefit of the doubt:
+/// moving it costs every track in it and every callsign half-read, so one that
+/// still covers what is on screen stays put. Hence a rule and not just an
+/// arithmetic centre — a drag that re-cut the window every frame would decode
+/// nothing at all.
+fn skim_center_for(
+    view: Option<(f64, f64)>,
+    dial_hz: f64,
+    dev_center_hz: f64,
+    dev_span_hz: f64,
+    win_hz: f64,
+    current: Option<f64>,
+) -> f64 {
+    let half = win_hz / 2.0;
+    let (dev_lo, dev_hi) = (dev_center_hz - dev_span_hz / 2.0, dev_center_hz + dev_span_hz / 2.0);
+    // Nothing to choose: the window is everything the front end delivers.
+    if !(win_hz.is_finite() && dev_span_hz.is_finite()) || win_hz >= dev_span_hz {
+        return dev_center_hz;
+    }
+    let Some((lo, hi)) = view else { return current.unwrap_or(dev_center_hz) };
+    // What of the view the front end actually reaches. A client whose window
+    // runs past the end of the span is asking for spectrum nobody has.
+    let (lo, hi) = (lo.max(dev_lo), hi.min(dev_hi));
+    if hi <= lo {
+        return current.unwrap_or(dev_center_hz);
+    }
+    let want = if hi - lo <= win_hz || !(lo..=hi).contains(&dial_hz) {
+        (lo + hi) / 2.0
+    } else {
+        dial_hz.clamp(lo + half, hi - half)
+    };
+    // The window is an NCO offset inside the stream, so both its edges have to
+    // stay inside what was sampled.
+    let want = want.clamp(dev_lo + half, dev_hi - half);
+    let Some(cur) = current else { return want };
+    // How much of the screen a window centred there would reach.
+    let covered = |c: f64| (hi.min(c + half) - lo.max(c - half)).max(0.0);
+    let holds = cur - half >= dev_lo - 1.0
+        && cur + half <= dev_hi + 1.0
+        && covered(cur) >= covered(want) - 1.0
+        // On a screen wider than the window, covering it is all a placement can
+        // do and every placement does it — so the dial decides, with a dead band
+        // wide enough that ordinary tuning does not keep re-cutting the window.
+        && (hi - lo <= win_hz
+            || !(lo..=hi).contains(&dial_hz)
+            || (dial_hz - cur).abs() <= win_hz / 4.0);
+    if holds { cur } else { want }
+}
 
 /// How soon after noticing a disconnected front-end the first reconnect attempt
 /// runs, and the ceiling the spacing doubles up to while attempts keep failing.
 const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(15);
+
+/// How long [`Engine::abandon_retry`] waits for the answer of an attempt it is
+/// throwing away. It is only ever called with the factory lock held, so the
+/// attempt has already finished and this covers the instruction between its
+/// releasing that lock and sending — never a whole open. A worker that died
+/// without answering drops its sender and is noticed at once rather than at
+/// the end of this.
+const ABANDON_WAIT: Duration = Duration::from_millis(250);
 
 /// How often the dial and mode are compared against what is in `session.json`.
 /// Only a change writes anything, and a clean exit flushes as well, so this
@@ -1971,6 +2338,56 @@ fn decimation_for(want: u32, device_rate_hz: f64, audio_mode: bool) -> u32 {
     (1u32 << want.ilog2()).min(sdroxide_types::max_decimation(device_rate_hz))
 }
 
+/// Drop the commands at the end of a drained batch that a later one in the same
+/// batch has already overwritten.
+///
+/// The case this exists for is a panadapter drag. Once the view is the whole
+/// captured span there is nothing left to slide, so the gesture moves the
+/// *window* instead and the dial with it (issue #133) — which means one
+/// [`Command::SetCenter`] and one [`Command::SetVfo`] per frame of the UI
+/// drawing it, for as long as the operator's hand is down. Every one of those
+/// is a hardware retune, a skimmer restart and a waterfall remap here; an SDR
+/// on a Pi carrying a station cannot do sixty of them a second and does not
+/// need to, because fifty-nine of them are answers nobody ever sees. Only the
+/// last of each is a state anything observes.
+///
+/// Both are absolute setters, so the last one wins — but only where nothing
+/// between them could have *read* what an earlier one set. `SwapVfos` and
+/// `CopyAtoB` do exactly that, and `TuneInSpan` reads the centre, so this is
+/// deliberately narrow: it collapses the run of setters at the *end* of the
+/// batch and stops at the first command that is anything else. Interleaving the
+/// two with each other is fine — between them they set only the two things they
+/// each overwrite.
+fn collapse_superseded(batch: &mut Vec<Command>) {
+    let settles = |c: &Command| matches!(c, Command::SetCenter(_) | Command::SetVfo { .. });
+    // Everything from here to the end is setters, so nothing in it can observe
+    // what an earlier one of them did.
+    let start = batch.iter().rposition(|c| !settles(c)).map_or(0, |i| i + 1);
+    if batch.len() - start < 2 {
+        return;
+    }
+    let slot = |vfo: &Vfo| usize::from(matches!(vfo, Vfo::B));
+    let (mut last_center, mut last_vfo) = (None, [None, None]);
+    for (i, cmd) in batch.iter().enumerate().skip(start) {
+        match cmd {
+            Command::SetCenter(_) => last_center = Some(i),
+            Command::SetVfo { vfo, .. } => last_vfo[slot(vfo)] = Some(i),
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    batch.retain(|cmd| {
+        let keep = i < start
+            || match cmd {
+                Command::SetCenter(_) => last_center == Some(i),
+                Command::SetVfo { vfo, .. } => last_vfo[slot(vfo)] == Some(i),
+                _ => true,
+            };
+        i += 1;
+        keep
+    });
+}
+
 fn engine_thread(
     source: Box<dyn IqSource>,
     mut caps: DeviceCaps,
@@ -1985,6 +2402,8 @@ fn engine_thread(
     // capabilities, so every backend reports it without having to remember to:
     // it is the trait's own answer, passed on.
     caps.center_is_dial = source.center_is_dial();
+    caps.cw_audio_keyed = source.cw_audio_keyed();
+    caps.commands_squelch = source.commands_squelch();
     let audio_mode = caps.audio_mode;
     let radio_fs = source.sample_rate();
     let audio_bw = source.display_bandwidth().unwrap_or(radio_fs / 2.0);
@@ -2048,6 +2467,20 @@ fn engine_thread(
             }
             state.band = Band::containing(hz);
         }
+        // The same for ADS-B, which is a channel in the strongest sense there
+        // is: one frequency, worldwide, and a receiver anywhere else hears
+        // nothing at all. Unconditional here, unlike the in-session rule — the
+        // capabilities are not known yet at this point, and a dial that turns
+        // out to be unreachable is reported by `sync_adsb` a moment later.
+        if mode.is_adsb() {
+            let hz = sdroxide_types::ADSB_FREQ_HZ;
+            info!(from = state.active_freq_hz(), to = hz, "ADS-B is on 1090 MHz; tuning there");
+            match state.active_vfo {
+                Vfo::A => state.vfo_a_hz = hz,
+                Vfo::B => state.vfo_b_hz = hz,
+            }
+            state.band = Band::containing(hz);
+        }
     }
     let skim_cfg = sdroxide_config::load_skimmer_config();
     state.skimmer = if audio_mode {
@@ -2076,6 +2509,12 @@ fn engine_thread(
     } else {
         ism_cfg
     };
+    let adsb_cfg = sdroxide_config::load_adsb_config();
+    state.adsb = if audio_mode {
+        sdroxide_types::AdsbSettings::OFF // wideband-only, and by far the widest
+    } else {
+        adsb_cfg
+    };
 
     // Read before the DSP below rather than with the rest of the session
     // further down: the remembered decimation decides what rate the analyzer
@@ -2092,7 +2531,8 @@ fn engine_thread(
     // otherwise it sees whatever the decimation left, which is what every span
     // downstream is measured in.
     let analyzer_rate = if audio_mode { radio_fs } else { state.sample_rate };
-    let analyzer = SpectrumAnalyzer::new(cfg.fft_size as usize, analyzer_rate, cfg.avg_tc);
+    let analyzer =
+        build_analyzer(cfg.fft_size as usize, analyzer_rate, cfg.avg_tc, f64::from(cfg.rows()));
 
     // In audio mode there is no RxChain (the source is already audio); the
     // speaker path is a plain resampler → mixer instead.
@@ -2239,8 +2679,15 @@ fn engine_thread(
         swr_tuning: false,
         swr_tripped: None,
         wide_bins: Vec::new(),
+        row_batch: Vec::new(),
+        row_axis: None,
+        row_samples: 0,
+        row_sample_clock: false,
+        rows_clocked: 0,
+        channel_rate_hz: 48_000.0,
         wide_window: None,
         wide_at: Instant::now(),
+        wide_sweeps: 0,
         wide_fresh: false,
         wide_seq: 0,
         scope_seq: 0,
@@ -2253,6 +2700,7 @@ fn engine_thread(
         burst_unkeys: false,
         auto_shift_dial: None,
         nb: NoiseBlanker::new(),
+        adc: AdcMeter::new(),
         audio_notch: AutoNotch::new(),
         audio_notch_on: false,
         audio_nr: SpectralNr::new(),
@@ -2263,6 +2711,7 @@ fn engine_thread(
         audio_nr_level: NrLevel::Off,
         digi: None,
         digi_config,
+        digi_dirty: false,
         digi_tx_band: None,
         digi_tx: false,
         hop_suspended: false,
@@ -2284,6 +2733,8 @@ fn engine_thread(
         skimmer: None,
         skim_buf: Vec::new(),
         skim_view: None,
+        skim_center_hz: 0.0,
+        skim_in_rate: 0.0,
         skim_cfg,
         ism_ddc: None,
         ism: None,
@@ -2291,6 +2742,14 @@ fn engine_thread(
         ism_center_hz: 0.0,
         ism_in_rate: 0.0,
         ism_cfg,
+        adsb_ddc: None,
+        adsb: None,
+        adsb_buf: Vec::new(),
+        adsb_center_hz: 0.0,
+        adsb_in_rate: 0.0,
+        adsb_cfg,
+        adsb_home: None,
+        adsb_idle_sent: None,
         iq_rec,
         iq_rec_buf: Vec::new(),
         scan_cfg,
@@ -2368,6 +2827,7 @@ fn engine_thread(
         cw_gate_until: None,
         shared_gen_seen: engine_cfg.store_sync.as_ref().map_or(0, |s| s.generation()),
         store_sync: engine_cfg.store_sync,
+        rade_watch: engine_cfg.rade_watch,
     };
     // After the struct, not before: the preference has to be applied through
     // the same path a reconnect uses, so both land on the same port.
@@ -2394,14 +2854,19 @@ fn engine_thread(
     if !audio_mode {
         engine.sync_skimmer(); // starts if any kind is enabled in the saved config
         engine.sync_ism(); // likewise, from ism.json
+        engine.sync_adsb_home();
+        engine.sync_adsb(); // and the aircraft lane, if the mode is already ADS-B
     }
     // Start any enabled network spot feeds from the persisted config. The
     // operator identity comes from the digi config — one identity for the whole
     // app — and has to be in place before the feeds that log in with it.
+    //
     // Only the primary engine brings the feeds up: they hold logins and
     // sockets (DX cluster, RBN, the reporters) that a station has one of, not
-    // one per radio. The config still loads on every engine so a settings
-    // dialog attached to any of them shows the real station setup.
+    // one per radio. First, before anything can start one.
+    if !engine.primary {
+        engine.spots.stand_down();
+    }
     engine.spots.set_operator(&engine.digi_config.my_call, &engine.digi_config.my_grid);
     engine.net_cfg = sdroxide_config::load_network_config();
     // Hand the persisted account to the mailbox. Without this the manager keeps
@@ -2412,9 +2877,15 @@ fn engine_thread(
         Some(wl) => wl.set_config(engine.net_cfg.winlink.clone()),
         None => engine.winlink = open_mailbox(&engine.net_cfg.winlink),
     }
-    if engine.primary {
-        engine.spots.set_config(engine.net_cfg.clone());
-    }
+    // Applied on every engine, not just the primary: the manager holds the
+    // credentials a callsign lookup and a logbook upload need, and both are
+    // per-request work whichever radio asks. `stand_down` above is what keeps
+    // the station's *sockets* on the one engine meant to hold them, wherever
+    // the settings were applied from. Withholding the config here instead left
+    // a second radio without it — and left the operator's next APPLY from that
+    // radio's window opening a duplicate of every feed, a second DX cluster
+    // login and a second FreeDV Reporter session under the same callsign.
+    engine.spots.set_config(engine.net_cfg.clone());
     // Bring up the built-in TCI server (enabled by default) so third-party
     // clients can connect without the operator having to arm anything. Each
     // radio has its own scoped config — additional radios are seeded with the
@@ -2460,12 +2931,22 @@ fn engine_thread(
     engine.push_rx_mode();
     engine.keep_vfo_in_span();
     engine.update_tuning();
+    // And a session restored into CW puts a radio that keys its own transmitter
+    // a sidetone off our dial, which the span check above has no reason to ask
+    // for — the VFO is sitting exactly on the centre. See `sync_cw_dial`.
+    engine.sync_cw_dial();
+
+    // Where the block loop's lanes go when the machine has cores to spare.
+    // Built once: a pool is threads, and starting them per block would cost
+    // more than the fork saves. `None` on a small machine — see [`lane_pool`].
+    let pool = lane_pool();
 
     let mut buf = vec![Complex32::default(); 16_384];
     // Where a decimated block lands. A local rather than a field on the engine,
     // so the borrow of the decimator ends before the samples are handed on.
     let mut dbuf: Vec<Complex32> = Vec::new();
     let mut next_frame = Instant::now();
+    let mut next_row = Instant::now();
     let mut next_meters = Instant::now();
     // Panadapter rate diagnostics. Three numbers, because they fail
     // differently: samples/s says whether the front end is delivering, fft/s
@@ -2477,15 +2958,21 @@ fn engine_thread(
     let mut lane_at = Instant::now();
     let mut lane_samples: u64 = 0;
     let mut lane_frames: u64 = 0;
+    let mut lane_rows: u64 = 0;
     let mut lane_ffts = 0u64;
+    let mut lane_sweeps: u64 = 0;
     let mut next_rds = Instant::now();
     let mut next_drm = Instant::now();
     let mut next_session = Instant::now() + SESSION_SAVE_INTERVAL;
 
+    // The commands waiting at the top of a tick, kept between iterations so the
+    // batch costs no allocation. See [`collapse_superseded`].
+    let mut batch: Vec<Command> = Vec::new();
     loop {
+        batch.clear();
         loop {
             match cmd_rx.try_recv() {
-                Ok(cmd) => engine.apply(cmd),
+                Ok(cmd) => batch.push(cmd),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if engine.tx_active {
@@ -2498,6 +2985,10 @@ fn engine_thread(
                     return;
                 }
             }
+        }
+        collapse_superseded(&mut batch);
+        for cmd in batch.drain(..) {
+            engine.apply(cmd);
         }
 
         // Frontend device swaps: audio (rebuilt cpal ring endpoints) and radio
@@ -2542,6 +3033,7 @@ fn engine_thread(
         engine.poll_voice();
         engine.poll_skimmer();
         engine.poll_ism();
+        engine.poll_adsb();
         engine.poll_scanner();
         engine.poll_tci_server();
         engine.poll_rigctld();
@@ -2587,6 +3079,7 @@ fn engine_thread(
             // over on the air as chirps. See `IqSource::read_available`.
             if engine.caps.full_duplex && !engine.audio_mode {
                 if let Ok(n @ 1..) = engine.source.read_available(&mut buf) {
+                    engine.adc.observe(&buf[..n]);
                     let iq = decimate(engine.decim.as_mut(), &buf[..n], &mut dbuf);
                     engine.run_audio(iq);
                 }
@@ -2596,10 +3089,14 @@ fn engine_thread(
                 Ok(0) => continue, // timeout
                 Ok(n) if engine.audio_mode => {
                     lane_samples += n as u64;
+                    engine.adc.observe(&buf[..n]);
                     engine.run_audio_mode(&buf[..n]);
                 }
                 Ok(n) => {
                     lane_samples += n as u64;
+                    // Ahead of the blanker and of `decimate`, both of which
+                    // destroy what this is looking for. See `AdcMeter`.
+                    engine.adc.observe(&buf[..n]);
                     // Blanking comes first, at the device rate: an impulse is
                     // only an impulse before the anti-alias filter smears it
                     // over a filter length, and after decimation there would be
@@ -2608,9 +3105,7 @@ fn engine_thread(
                         engine.nb.process(&mut buf[..n]);
                     }
                     let iq = decimate(engine.decim.as_mut(), &buf[..n], &mut dbuf);
-                    engine.analyzer.process(iq);
-                    engine.feed_zoom(iq);
-                    engine.run_audio(iq);
+                    engine.process_block(iq, pool.as_ref());
                 }
                 Err(e) => {
                     let _ = engine.event_tx.send(RadioEvent::ConnectionLost(e.to_string()));
@@ -2624,9 +3119,33 @@ fn engine_thread(
         // built from the same sweep as the strip, so the sweep has to be in hand
         // before either frame is made.
         engine.poll_wide();
+        // The waterfall's own clock, and the reason it is not the frame clock:
+        // a row is a few kilobytes appended to a texture, a frame is a repaint.
+        // Rows are clocked here at whatever rate the client asked for and ride
+        // out in whichever frame comes next, so a screen redrawing sixty times
+        // a second can still be handed two hundred lines of band.
+        //
+        // Caught up rather than accumulated: a row period shorter than the
+        // block this loop is processing (a slow front end, a stalled thread)
+        // would otherwise build a backlog that never drains. The batch is
+        // capped as well — see `MAX_BATCH_ROWS`.
+        let row_period = Duration::from_secs_f64(1.0 / f64::from(engine.cfg.rows()));
+        if engine.row_sample_clock {
+            // The samples are the clock; keep this one parked so handing the
+            // job back (a switch to a demod-audio rig) does not fire a burst.
+            next_row = now + row_period;
+        } else if now >= next_row {
+            let behind = now.duration_since(next_row);
+            let skipped = (behind.as_secs_f64() / row_period.as_secs_f64()) as u32;
+            next_row = now + row_period - behind.min(row_period * skipped.max(1));
+            next_row = next_row.max(now);
+            engine.push_row();
+        }
         if now >= next_frame {
             next_frame = now + Duration::from_secs_f64(1.0 / engine.cfg.fps.max(1) as f64);
-            spec_in.write(engine.make_spectrum_frame());
+            let mut frame = engine.make_spectrum_frame();
+            engine.attach_rows(&mut frame);
+            spec_in.write(frame);
             lane_frames += 1;
         }
         // Once a second, and only where somebody asked for it: this is the
@@ -2645,15 +3164,36 @@ fn engine_thread(
                 samples_per_s = lane_samples as f64 / secs,
                 fft_per_s = ffts_delta as f64 / secs,
                 frames_per_s = lane_frames as f64 / secs,
+                // The waterfall's real time resolution, which is the number
+                // this diagnostic exists to separate from the other two.
+                rows_per_s = engine.rows_clocked.saturating_sub(lane_rows) as f64 / secs,
+                // Finished sweeps from a front end that computes its own
+                // spectrum. Zero on an I/Q receiver; on a rig whose scope is
+                // the main panadapter it is the real picture rate, and the
+                // number to compare `rows_per_s` against before believing a
+                // report that the waterfall looks blocky.
+                sweeps_per_s = engine.wide_sweeps.saturating_sub(lane_sweeps) as f64 / secs,
                 rate_hz = engine.state.sample_rate,
                 fft_size = engine.cfg.fft_size,
+                // What the frames are actually being cut into, which is the
+                // client's choice and not this engine's — worth naming next to
+                // the transform size, because "the FFT is 32768" and "the
+                // picture is 2048 columns wide" answer different questions.
+                bins = engine.cfg.bins(),
                 zoom = engine.zoom.is_some(),
                 audio_mode = engine.audio_mode,
+                // The window the client asked for, and — on a demod-audio rig
+                // — the rig's own passband it is measured against to decide
+                // which lane draws. See `Engine::audio_zoom_window`.
+                view = ?engine.cfg.viewport,
+                audio_band = ?engine.audio_mode.then(|| engine.audio_band()),
                 "panadapter rates",
             );
             lane_at = now;
             lane_samples = 0;
             lane_frames = 0;
+            lane_rows = engine.rows_clocked;
+            lane_sweeps = engine.wide_sweeps;
             lane_ffts = ffts;
         }
         if let Some(frame) = engine.make_wide_frame() {
@@ -2784,9 +3324,11 @@ fn engine_thread(
                         None => {}
                     }
                 }
+                let (adc_peak_dbfs, adc_clip) = engine.adc.read();
                 Some(Meters {
                     s_dbm: -127.0,
-                    adc_peak_dbfs: 0.0,
+                    adc_peak_dbfs,
+                    adc_clip,
                     tx: Some(TxMeters { fwd_w: tele.fwd_w, swr: tele.swr, alc, po: tele.po }),
                     stereo: false,
                     tone: None,
@@ -2803,9 +3345,14 @@ fn engine_thread(
                 engine.swr_tuning = false;
                 let stereo = engine.main.as_ref().is_some_and(|c| c.stereo_locked());
                 let tone = engine.main.as_ref().and_then(|c| c.sub_tone());
+                // Read unconditionally, so the window is consumed whether or not
+                // a reading is published — otherwise a front end with no signal
+                // report would accumulate one reading over the whole session.
+                let (adc_peak_dbfs, adc_clip) = engine.adc.read();
                 engine.rx_signal_dbm().map(|s_dbm| Meters {
                     s_dbm,
-                    adc_peak_dbfs: 0.0,
+                    adc_peak_dbfs,
+                    adc_clip,
                     tx: None,
                     stereo,
                     tone,
@@ -2836,6 +3383,7 @@ fn engine_thread(
         if now >= next_session {
             next_session = now + SESSION_SAVE_INTERVAL;
             engine.save_session();
+            engine.flush_digi_config();
         }
     }
 }
@@ -2903,6 +3451,9 @@ impl Drop for Engine {
         // periodic tick because a clean quit is the common case, and it would
         // otherwise lose up to one tick's worth of tuning.
         self.save_session();
+        // And the transmit-audio rail, for the same reason: an operator who
+        // trims their level and quits has set it, not been trying it out.
+        self.flush_digi_config();
         // Finalize any in-progress recording so the MP3 file is closed cleanly
         // when the engine thread exits (all controllers gone / fatal error).
         if let Some(rec) = self.recorder.take() {
@@ -2922,6 +3473,111 @@ impl Drop for Engine {
 
 impl Engine {
     fn run_audio(&mut self, iq: &[Complex32]) {
+        let want_rec_main = self.recorder.is_some() && !self.caps.rx_audio_external;
+        let rx0 = self.state.rx[0];
+        self.refresh_channel_rate();
+        let Some(main) = self.main.as_mut() else { return };
+        // Four disjoint fields, so the chain's own borrow and the buffers its
+        // output is copied into can be live at once.
+        run_chain_block(
+            main,
+            &rx0,
+            iq,
+            want_rec_main,
+            (
+                &mut self.main_play,
+                &mut self.main_play_r,
+                &mut self.main_play_rec,
+                &mut self.main_play_r_rec,
+            ),
+        );
+        self.finish_audio(iq);
+    }
+
+    /// One block through every lane that consumes it, on as many cores as the
+    /// machine has to spare.
+    ///
+    /// Three things read these samples and write nothing in common: the
+    /// device-wide panadapter analyser, the panadapter's zoom lane, and the
+    /// receive chain. One after the other they are a sum — on an RX-888 at
+    /// 32.4 Msps, most of a core on a machine with thirty-one idle ones. Side
+    /// by side they are a maximum.
+    ///
+    /// **Which half is sent matters.** The receive chain is not `Send`:
+    /// DeepFilterNet's inference plan holds `Rc`s, so a chain cannot cross a
+    /// thread boundary at all. The two analysers can, so they are what goes to
+    /// the pool while the chain stays here — which is also why this uses
+    /// `in_place_scope` rather than `join`, since only the spawned side of a
+    /// scope has to be `Send`.
+    ///
+    /// The fork is taken only for a block that lies wholly inside one waterfall
+    /// row. A row is pooled from whichever lane is drawing, which is a question
+    /// about the engine's *state* and cannot be asked while the analysers are
+    /// away — so a block a row boundary falls inside runs the ordinary
+    /// sequential path. On a front end fast enough for this to matter that is a
+    /// small minority of blocks (an RX-888 at 32.4 Msps clocks a row every
+    /// fifteenth one); on a slow one it is most of them, and there is nothing
+    /// there to win anyway.
+    fn process_block(&mut self, iq: &[Complex32], pool: Option<&rayon::ThreadPool>) {
+        // Read while the chain is certainly in hand, and on both paths: the
+        // frame builder asks for it and must never be answered with the
+        // stand-in.
+        self.refresh_channel_rate();
+        let per_row = self.row_period_samples();
+        let one_row = self.row_samples + iq.len() <= per_row;
+        let Some(pool) = pool.filter(|_| one_row && !iq.is_empty()) else {
+            self.feed_panadapter(iq);
+            self.run_audio(iq);
+            return;
+        };
+        self.row_sample_clock = true;
+        self.sync_zoom();
+
+        let want_rec_main = self.recorder.is_some() && !self.caps.rx_audio_external;
+        let rx0 = self.state.rx[0];
+        // Named apart so the compiler can see that the three lanes below borrow
+        // disjoint fields of the engine.
+        let analyzer = &mut self.analyzer;
+        let zoom = self.zoom.as_mut();
+        let chain = self.main.as_mut();
+        let play = &mut self.main_play;
+        let play_r = &mut self.main_play_r;
+        let play_rec = &mut self.main_play_rec;
+        let play_r_rec = &mut self.main_play_r_rec;
+
+        pool.in_place_scope(|scope| {
+            scope.spawn(move |_| analyzer.process(iq));
+            if let Some(zoom) = zoom {
+                scope.spawn(move |_| zoom.process(iq));
+            }
+            // This thread's share, and the one that could not have been
+            // anywhere else.
+            if let Some(chain) = chain {
+                run_chain_block(
+                    chain,
+                    &rx0,
+                    iq,
+                    want_rec_main,
+                    (play, play_r, play_rec, play_r_rec),
+                );
+            }
+        });
+
+        self.row_samples += iq.len();
+        if self.row_samples >= per_row {
+            self.row_samples = 0;
+            self.push_row();
+        }
+        if self.main.is_some() {
+            self.finish_audio(iq);
+        }
+    }
+
+    /// Everything downstream of the receive chain: the speaker, the decoders,
+    /// the recorders and the lanes that take their own decimation of the raw
+    /// block. Split from [`Engine::run_audio`] so the chain itself can be
+    /// forked — see [`Engine::process_block`].
+    fn finish_audio(&mut self, iq: &[Complex32]) {
         let want_rec = self.recorder.is_some();
         // A radio listening to its transceiver while an attached receiver
         // paints the picture. The main chain still runs — the high-resolution
@@ -2930,28 +3586,7 @@ impl Engine {
         // so its speaker and recorder taps are dropped and the transceiver's
         // audio takes their place below.
         let ext = self.caps.rx_audio_external;
-        let want_rec_main = want_rec && !ext;
-        let Some(main) = self.main.as_mut() else { return };
-        let out_rate = main.out_rate;
-        // Copied out rather than borrowed: a digital-voice mode may replace
-        // this audio wholesale, and deciding that needs the digi engine, which
-        // would otherwise be borrowed against the chain.
-        self.main_play.clear();
-        self.main_play_r.clear();
-        let (audio, right) = main.run(iq, &self.state.rx[0], want_rec_main);
-        self.main_play.extend_from_slice(audio);
-        if let Some(r) = right {
-            self.main_play_r.extend_from_slice(r);
-        }
-        self.main_play_rec.clear();
-        self.main_play_r_rec.clear();
-        if want_rec_main {
-            let (rec_audio, rec_right) = main.take_rec_audio();
-            self.main_play_rec.extend_from_slice(rec_audio);
-            if let Some(r) = rec_right {
-                self.main_play_r_rec.extend_from_slice(r);
-            }
-        }
+        let Some(out_rate) = self.main.as_ref().map(|m| m.out_rate) else { return };
 
         if ext {
             // Everything the operator hears is the transceiver's: the speaker,
@@ -3098,6 +3733,17 @@ impl Engine {
                 d.on_rx_iq(&self.ism_buf);
             }
         }
+        // ...and the ADS-B decoder, from the widest window of the lot. On the
+        // commonest receiver for this — an RTL-SDR at its default 2.4 Msps —
+        // that decimation is by one and the chain is a mixer, because a
+        // megabit-a-second waveform has no slack to give away.
+        if let Some(ddc) = self.adsb_ddc.as_mut() {
+            self.adsb_buf.clear();
+            ddc.process(iq, &mut self.adsb_buf);
+            if let Some(d) = self.adsb.as_ref() {
+                d.on_rx_iq(&self.adsb_buf);
+            }
+        }
         // Feed TCI clients: the same clean tap the digital decoders use (so
         // muting or turning down sdroxide can't silence somebody's decoder),
         // resampled to the 48 kHz TCI mandates.
@@ -3151,12 +3797,18 @@ impl Engine {
         if !span.is_finite() || span <= 0.0 || full <= 0.0 || span >= full {
             return None;
         }
+        // One device-wide bin per column of the emitted frame. Below that the
+        // pooling in `SpectrumAnalyzer::make_frame` has fewer measurements than
+        // it has columns to fill and the trace stair-steps: an RX-888 streaming
+        // 8.1 MHz through a 32768-point FFT is 247 Hz a bin, so a 68 kHz window
+        // on screen is drawn from 275 numbers.
+        //
         // Hysteresis: a lane already up is held until the device-wide analyser
         // has comfortably enough bins again. The two draw the same signal at
         // different bin widths, so they put the noise floor at different levels
         // — a zoom parked on the threshold would otherwise flip the picture
         // between them every time the client resent its window.
-        let need = ZOOM_LANE_MIN_BINS * if self.zoom.is_some() { 1.5 } else { 1.0 };
+        let need = self.cfg.bins() as f64 * if self.zoom.is_some() { 1.5 } else { 1.0 };
         if self.analyzer.fft_size() as f64 * span / full >= need {
             return None;
         }
@@ -3170,14 +3822,18 @@ impl Engine {
         (decim > 1).then_some(((lo + hi) / 2.0, decim))
     }
 
-    /// Keep the zoom lane in step with the window the display is asking for,
-    /// and feed it this block.
+    /// Keep the zoom lane in step with the window the display is asking for.
     ///
     /// Synced here rather than at each of the half-dozen places a viewport, a
     /// centre or a rate can move: it is a handful of comparisons when nothing
     /// has changed, and a lane that quietly stopped matching its window would
     /// show the operator a picture of somewhere else.
-    fn feed_zoom(&mut self, iq: &[Complex32]) {
+    ///
+    /// Separate from feeding it samples because feeding is forked: choosing the
+    /// lane needs the whole engine, and running it needs only the lane. Nothing
+    /// inside a block can change the answer, so it is settled once at the top of
+    /// [`Engine::feed_panadapter`] and the two analysers then run side by side.
+    fn sync_zoom(&mut self) {
         let in_rate = self.state.sample_rate;
         match self.wanted_zoom() {
             None => {
@@ -3188,25 +3844,26 @@ impl Engine {
                 // The same window: only the front end may have moved under it.
                 Some(z) if z.serves(want, in_rate) => z.point_at(self.state.center_hz),
                 _ => {
+                    let fft = zoom_lane_fft(self.cfg.bins());
                     let lane = ZoomLane::new(
                         in_rate,
                         want.1,
                         want.0,
                         self.state.center_hz,
                         self.cfg.avg_tc,
+                        fft,
+                        f64::from(self.cfg.rows()),
                     );
                     debug!(
                         center = lane.center_hz,
                         rate = lane.rate_hz,
                         decim = lane.decim,
+                        fft,
                         "panadapter zoom lane built"
                     );
                     self.zoom = Some(lane);
                 }
             },
-        }
-        if let Some(z) = self.zoom.as_mut() {
-            z.process(iq);
         }
     }
 
@@ -3217,7 +3874,11 @@ impl Engine {
         self.audio_re.clear();
         self.audio_re.extend(iq.iter().map(|c| c.re));
 
-        // Panadapter (packed-real FFT — see make_spectrum_frame).
+        // Panadapter (packed-real FFT — see make_spectrum_frame). No sample
+        // clocking here: a demod-audio lane runs at tens of kilohertz, so a
+        // block already carries more time than a row does and there is nothing
+        // finer to divide.
+        self.row_sample_clock = false;
         self.analyzer.process(iq);
 
         self.play_rx_audio(self.radio_fs);
@@ -3435,6 +4096,11 @@ impl Engine {
     fn apply_control(&mut self, update: ControlUpdate) {
         match update {
             ControlUpdate::Freq(hz) => {
+                // The rig reports its VFO, which in CW on a radio that keys its
+                // own transmitter is a sidetone above our dial — the offset this
+                // end put there (`rig_cw_offset_hz`). Taking it back out is what
+                // stops the readout climbing by one pitch per poll.
+                let hz = hz - self.rig_cw_offset_hz();
                 match self.state.active_vfo {
                     Vfo::A => self.state.vfo_a_hz = hz,
                     Vfo::B => self.state.vfo_b_hz = hz,
@@ -3492,11 +4158,9 @@ impl Engine {
                 // while the dial plainly read 868.88 MHz. Switching the decoder
                 // off and on rebuilt it and it worked, which is the tell: the
                 // window was stale, not wrong.
-                if let Some(sk) = self.skimmer.as_ref() {
-                    sk.set_center(hz);
-                }
-                self.sync_skimmer_view();
+                self.sync_skim_window();
                 self.sync_ism_window();
+                self.sync_adsb_window();
                 self.update_tuning();
                 let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
             }
@@ -3514,6 +4178,17 @@ impl Engine {
                 let frac = frac.clamp(0.0, 1.0);
                 if self.state.tx.tune_drive != frac {
                     self.state.tx.tune_drive = frac;
+                    let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
+                }
+            }
+            // The squelch the radio is set to, read when its control link
+            // opened. Adopted rather than overridden, exactly as the drive
+            // above is — the operator set it at the rig, and a remembered level
+            // imposed on top would move a gate they can hear.
+            ControlUpdate::Squelch(frac) => {
+                let frac = frac.clamp(0.0, 1.0);
+                if self.state.rig_squelch != frac {
+                    self.state.rig_squelch = frac;
                     let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
                 }
             }
@@ -3600,6 +4275,10 @@ impl Engine {
                     }
                     self.update_display_center(); // sideband flip changes the window
                     self.sync_digi_mode();
+                    // Into or out of CW the dial and the rig's VFO stop being
+                    // the same number — see `reseat_dial_for_cw`, which moves
+                    // ours rather than the radio's.
+                    self.reseat_dial_for_cw();
                     let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
                 }
             }
@@ -3675,17 +4354,19 @@ impl Engine {
         // Where the hardware demonstrably is, is by definition a frequency it
         // took — this is the dial the rig itself just reported.
         self.good_vfo_hz = self.state.active_freq_hz();
-        // The skim window follows the hardware centre; re-label spots and clear
-        // tracks so nothing straddles the old and new axes (as `retune_named`
-        // does for a retune we asked for).
-        if let Some(sk) = self.skimmer.as_ref() {
-            sk.set_center(center);
-        }
-        self.sync_skimmer_view();
+        // The skim window is placed against the hardware centre, so it has to be
+        // re-placed against the new one — and re-labelled and cleared if it
+        // really moved, so no track straddles the old and new axes (as
+        // `retune_named` does for a retune we asked for).
+        self.sync_skim_window();
         // The ISM window does *not* follow the hardware centre: its channels are
         // at fixed frequencies, so it stays on them for as long as the new span
         // still reaches, and only slides when it has to.
         self.sync_ism_window();
+        // The ADS-B window *does* follow the hardware centre, being one fixed
+        // target rather than a plan of them: 1090 MHz is where it has to be, and
+        // the only question is whether the new span still reaches it.
+        self.sync_adsb_window();
         // Re-seat the DDCs on the new centre. Without this the main receiver
         // keeps the offset it had against the old one, which is exactly how a
         // rig-initiated retune ends up demodulating somewhere the readout does
@@ -4090,7 +4771,10 @@ impl Engine {
         } else if mode.is_rade() {
             Box::new(RadeController::new(self.digi_config.clone(), tap_rate))
         } else if mode.is_sstv() {
-            Box::new(SstvController::new(self.digi_config.clone(), tap_rate))
+            // Both SSTV modes, one controller: HF and VHF differ in the radio
+            // underneath, not in the picture — the same reason the two packet
+            // modes share theirs.
+            Box::new(SstvController::new(mode, self.digi_config.clone(), tap_rate))
         } else if mode.is_wefax() {
             Box::new(WefaxController::new(self.digi_config.clone(), tap_rate))
         } else if mode.is_rifp() {
@@ -4185,7 +4869,7 @@ impl Engine {
         if self.state.rx[0].mode != Mode::Cw {
             return;
         }
-        let pitch = self.digi.as_ref().map_or(self.digi_config.cw_pitch_hz, |d| d.audio_hz());
+        let pitch = self.cw_pitch_hz();
         let r = &mut self.state.rx[0];
         let w = (r.filter_hi - r.filter_lo).abs().clamp(50.0, 3000.0);
         let (lo, hi) = (pitch - w / 2.0, pitch + w / 2.0);
@@ -4197,6 +4881,100 @@ impl Engine {
             d.set_filter(lo, hi);
         }
         self.push_control_filter();
+    }
+
+    /// The sidetone pitch the CW panel is copying at.
+    ///
+    /// The controller's rather than the configuration's, because the operator
+    /// moves it by clicking; the stored figure only stands in before there is a
+    /// controller to ask.
+    fn cw_pitch_hz(&self) -> f32 {
+        self.digi.as_ref().map_or(self.digi_config.cw_pitch_hz, |d| d.audio_hz())
+    }
+
+    /// How far above our dial a transceiver's own VFO has to sit.
+    ///
+    /// Zero everywhere but one case, and that case is CW on a radio handing us
+    /// raw I/Q around its own VFO. sdroxide's CW dial is a zero-beat — the tone
+    /// being copied sits a sidetone pitch above it, which is what
+    /// [`Mode::on_air_hz`] answers and where the keyer puts the carrier when
+    /// sdroxide makes it. A transceiver put in CW makes its own instead, on its
+    /// VFO, whether the key is a paddle in its socket or text handed to its
+    /// keyer — so a VFO left on our dial transmits a whole sidetone below the
+    /// station being answered, and the station never hears the call. That is
+    /// issue #170, reported on an ELAD FDM-DUO with a key in it: the signal was
+    /// copied perfectly at 700 Hz and worked nobody.
+    ///
+    /// So the VFO goes where the contact is and the DDC takes the difference.
+    /// Nothing on screen moves: the readout, the passband and the axis are all
+    /// exactly where they were, and the radio is on the station.
+    ///
+    /// Whether the stream comes out on the VFO at all is a property of the
+    /// radio rather than of CW, so the front end has to say
+    /// ([`IqSource::cw_iq_on_vfo`]): a rig that moves its own I.F. by the
+    /// pitch instead — a K3 on `CW WGHT: VFO OFS`, a QMX on I/Q — hands out a
+    /// stream that is already a sidetone below its readout, and there the dial
+    /// and the VFO are the same number and must stay it.
+    ///
+    /// Not in demodulated-audio mode, where the rig's own receiver has already
+    /// applied the offset — a station on its VFO is what arrives as a tone — and
+    /// not for MCW ([`IqSource::cw_audio_keyed`]), where the rig is held on a
+    /// sideband and keyed sidetone lands a pitch above the VFO exactly as it
+    /// does on an SDR.
+    fn rig_cw_offset_hz(&self) -> f64 {
+        if self.audio_mode
+            || self.state.rx[0].mode != Mode::Cw
+            || !self.source.center_is_dial()
+            || !self.source.cw_iq_on_vfo()
+            || self.source.cw_audio_keyed()
+        {
+            return 0.0;
+        }
+        f64::from(self.cw_pitch_hz())
+    }
+
+    /// Put the dial back under a VFO whose *mode* the radio changed.
+    ///
+    /// [`Self::rig_cw_offset_hz`] the other way round. A mode reported by the
+    /// rig is somebody's hand on its front panel, and nothing there moved the
+    /// VFO — so entering or leaving CW is ours to absorb: the radio keeps the
+    /// frequency it is displaying and our dial takes the sidetone step. The
+    /// alternative would nudge a stranger's rig 700 Hz for having been switched
+    /// to CW, which is not what connecting to it should do.
+    ///
+    /// Only where the centre *is* the rig's VFO, which is also where that
+    /// front end parks no LO of its own, so the two numbers are one.
+    fn reseat_dial_for_cw(&mut self) {
+        if self.audio_mode || !self.source.center_is_dial() {
+            return;
+        }
+        let want = self.state.center_hz - self.rig_cw_offset_hz();
+        if (want - self.state.active_freq_hz()).abs() < 0.5 {
+            return;
+        }
+        match self.state.active_vfo {
+            Vfo::A => self.state.vfo_a_hz = want,
+            Vfo::B => self.state.vfo_b_hz = want,
+        }
+        self.state.band = Band::containing(want);
+        self.good_vfo_hz = want;
+        self.update_tuning();
+    }
+
+    /// Keep a self-keying transceiver's VFO where CW says it has to be.
+    ///
+    /// The pitch is where the contact is ([`Self::rig_cw_offset_hz`]), so a
+    /// pitch the operator moved — from the panel, or by clicking a station in
+    /// the passband — moves the frequency such a radio belongs on; and a
+    /// session restored straight into CW opens with the dial and the VFO on the
+    /// same number, which in CW they must not be. A no-op in every other mode,
+    /// and on an SDR, where `follow_dial` falls through to the span check.
+    fn sync_cw_dial(&mut self) {
+        if self.state.rx[0].mode != Mode::Cw {
+            return;
+        }
+        self.follow_dial();
+        self.update_tuning();
     }
 
     /// Hand the main receiver's passband to a radio that filters for us.
@@ -4307,7 +5085,7 @@ impl Engine {
             (true, false) => {
                 // 16k-point FFT over the ~50 kHz channel ≈ 3 Hz/bin, enough to
                 // resolve 6.25 Hz FT8 tones.
-                let ch_rate = self.main.as_ref().map(|c| c.channel_rate()).unwrap_or(48_000.0);
+                let ch_rate = self.channel_rate_hz;
                 self.channel_analyzer = Some(SpectrumAnalyzer::new(16_384, ch_rate, 0.10));
             }
             // Covers arriving in CW from a digital mode, where the analyzer is
@@ -4369,6 +5147,7 @@ impl Engine {
             self.wide_window = Some(window);
             self.wide_at = Instant::now();
             self.wide_fresh = true;
+            self.wide_sweeps = self.wide_sweeps.wrapping_add(1);
         }
         // The scope is the display axis while it is the main lane, so the axis
         // has to follow it both ways: a sweep on a new centre or span moves the
@@ -4385,12 +5164,197 @@ impl Engine {
         }
     }
 
+    /// Every FFT lane that can feed the main panadapter, so the peak hold
+    /// between waterfall rows can be switched on or read across all of them at
+    /// once without naming them four times at each call site.
+    fn lanes(&mut self) -> impl Iterator<Item = &mut SpectrumAnalyzer> {
+        std::iter::once(&mut self.analyzer)
+            .chain(std::iter::once(&mut self.tx_analyzer))
+            .chain(self.zoom.as_mut().map(|z| &mut z.analyzer))
+            .chain(self.channel_analyzer.as_mut())
+    }
+
+    /// One waterfall row: the strongest thing each column saw since the last
+    /// row was taken.
+    ///
+    /// Deliberately built by calling [`Engine::make_spectrum_frame`] itself
+    /// with the lanes switched to read their held peaks. The row and the frame
+    /// it will ride in have to agree about which lane is drawing, what the
+    /// viewport is and how the bins are pooled, and the only way to be sure of
+    /// that is for it to be the same code — a second copy of that branch would
+    /// drift from this one on the first change to either.
+    ///
+    /// `None` where a lane has no peaks to hold: a radio's own sweep arrives
+    /// finished a few times a second and has nothing between rows to miss, and
+    /// a transmit monitor is a level check rather than a record of the band.
+    /// Both leave the frame's rows empty and the client scrolls on its own
+    /// clock, which is what every build before this one did everywhere.
+    fn make_row(&mut self) -> Option<SpectrumFrame> {
+        if !self.clocks_rows() {
+            return None;
+        }
+        // Idempotent, and here rather than at the half-dozen places a lane is
+        // built: a lane that quietly came up without its hold would draw rows
+        // of the latest transform instead of the loudest, which is a
+        // sensitivity bug nobody would see until they went looking for a weak
+        // signal that was there all along.
+        self.lanes().for_each(|a| {
+            a.set_row_hold(true);
+            a.set_read_hold(true);
+        });
+        let frame = self.make_spectrum_frame();
+        self.lanes().for_each(|a| {
+            a.set_read_hold(false);
+            a.reset_hold();
+        });
+        Some(frame)
+    }
+
+    /// Feed the panadapter lanes a block, clocking waterfall rows off the
+    /// samples as they go by.
+    ///
+    /// The block is handed over in row-sized pieces rather than whole. Nothing
+    /// about the analysis changes — an FFT still lands every `hop` samples,
+    /// wherever the piece boundaries fall — but a row can now be taken *inside*
+    /// a block, so the waterfall's rate is what the operator asked for instead
+    /// of however often the front end happens to be read. On a 1.5 Msps source
+    /// read 16384 samples at a time that is the difference between 94 rows a
+    /// second and 224.
+    ///
+    /// What still bounds it is the analyser: a row can never show more than the
+    /// transforms its interval contained, so asking for rows faster than
+    /// `rate / hop` simply repeats them.
+    fn feed_panadapter(&mut self, iq: &[Complex32]) {
+        self.row_sample_clock = true;
+        // Which window the zoom lane covers cannot change inside one block, so
+        // it is settled once here rather than per piece.
+        self.sync_zoom();
+        let per_row = self.row_period_samples();
+        let mut off = 0;
+        while off < iq.len() {
+            let want = per_row.saturating_sub(self.row_samples).max(1);
+            let take = want.min(iq.len() - off);
+            let chunk = &iq[off..off + take];
+            self.analyzer.process(chunk);
+            if let Some(zoom) = self.zoom.as_mut() {
+                zoom.process(chunk);
+            }
+            self.row_samples += take;
+            off += take;
+            if self.row_samples >= per_row {
+                self.row_samples = 0;
+                self.push_row();
+            }
+        }
+    }
+
+    /// Take the receive chain's channel rate into
+    /// [`Engine::channel_rate_hz`](#structfield.channel_rate_hz).
+    fn refresh_channel_rate(&mut self) {
+        self.channel_rate_hz = self.main.as_ref().map_or(48_000.0, |c| c.channel_rate());
+    }
+
+    /// Samples between waterfall rows at the rate the client asked for.
+    fn row_period_samples(&self) -> usize {
+        (self.state.sample_rate / f64::from(self.cfg.rows())).max(1.0) as usize
+    }
+
+    /// Clock one row into the batch the next frame will carry.
+    fn push_row(&mut self) {
+        let Some(row) = self.make_row() else {
+            return;
+        };
+        let axis = (row.center_hz, row.span_hz, row.bins.len());
+        if self.row_axis != Some(axis) && !self.slide_batch(axis) {
+            self.row_batch.clear();
+            self.row_axis = Some(axis);
+        }
+        let cols = row.bins.len();
+        if cols == 0 {
+            return;
+        }
+        self.rows_clocked = self.rows_clocked.wrapping_add(1);
+        while self.row_batch.len() / cols >= MAX_BATCH_ROWS {
+            self.row_batch.drain(..cols);
+        }
+        self.row_batch.extend_from_slice(&row.bins);
+    }
+
+    /// Hand the batch to a frame about to go out, if the rows are of that
+    /// frame — a lane that switched between the last row and this frame leaves
+    /// them behind rather than drawing one picture's history under another's.
+    fn attach_rows(&mut self, frame: &mut SpectrumFrame) {
+        // Said whether or not there are any rows *this* frame: below the frame
+        // rate most frames carry none, and the client has to know that as
+        // "wait for the next one" rather than as "scroll this yourself".
+        frame.rows_clocked = self.clocks_rows();
+        // A lane that has just stopped clocking still has whatever it batched
+        // before it stopped — the operator keying up, or zooming the audio
+        // scope in. Those rows go nowhere: the client is about to scroll this
+        // frame on its own wall clock, and rows handed to it alongside that
+        // instruction are a picture drawn twice over. "Does not clock rows"
+        // and "carries rows" are contradictory, and the invariant is worth
+        // holding at the one place that can break it.
+        if !frame.rows_clocked {
+            self.row_batch.clear();
+            return;
+        }
+        let axis = (frame.center_hz, frame.span_hz, frame.bins.len());
+        if self.row_axis == Some(axis) || self.slide_batch(axis) {
+            frame.rows = std::mem::take(&mut self.row_batch);
+        } else {
+            self.row_batch.clear();
+        }
+    }
+
+    /// Carry the batched rows onto a window that has moved, and say whether
+    /// they could be.
+    ///
+    /// A centre that has moved is not a different picture, and this is the
+    /// common case rather than the exotic one: a panadapter drag with the view
+    /// fully zoomed out moves the window once per displayed frame (issue
+    /// #133), so between one row and the next — and between the last row and
+    /// the frame it belongs to — the axis has usually shifted. Throwing the
+    /// batch away each time cost about a third of the rows at the medium
+    /// scroll rate, measured, and the waterfall then scrolled slower than its
+    /// own time labels for as long as the drag lasted (issue #177).
+    fn slide_batch(&mut self, to: (f64, f64, usize)) -> bool {
+        let Some(from) = self.row_axis else { return false };
+        if !slide_rows(&mut self.row_batch, from, to) {
+            return false;
+        }
+        self.row_axis = Some(to);
+        true
+    }
+
+    /// Whether the lane about to be published clocks its own waterfall rows.
+    ///
+    /// The same test [`Engine::make_row`] refuses on, named once so the two
+    /// cannot disagree — a lane that said it clocked rows and then never
+    /// produced any would freeze the waterfall.
+    fn clocks_rows(&self) -> bool {
+        // A sweep that arrives finished has nothing between rows to miss, so
+        // the client scrolls it on its own clock. The audio analyser is not
+        // like that: it runs transforms continuously, and while it is the one
+        // drawing ([`Engine::audio_zoom_window`]) the waterfall gets its rows
+        // clocked and its peak held like any other lane.
+        let scope_draws = self.audio_mode
+            && self.scope_main_window().is_some()
+            && self.audio_zoom_window().is_none();
+        !(self.tx_active || scope_draws)
+    }
+
     /// Build a full-band frame, if a sweep has arrived since the last one.
     ///
     /// The source hands over dBFS bins covering its whole Nyquist band; the
-    /// display policy — pooling down to [`DISPLAY_BINS`] and mapping to the u8
+    /// display policy — pooling down to [`WIDE_BINS`] and mapping to the u8
     /// range the client draws — stays here, identical to the main lane, so both
     /// panadapters respond to the same level controls.
+    ///
+    /// Deliberately the constant and not the client's chosen width: the strip
+    /// this feeds is a shallow band-wide overview a thousand pixels across, so
+    /// widening it with the main panadapter would spend link bandwidth on
+    /// detail that is pooled away again at the far end.
     fn make_wide_frame(&mut self) -> Option<SpectrumFrame> {
         if !self.wide_fresh {
             return None;
@@ -4407,7 +5371,7 @@ impl Engine {
             span_hz,
             floor,
             ceil,
-            DISPLAY_BINS,
+            WIDE_BINS,
             None,
         ))
     }
@@ -4439,6 +5403,64 @@ impl Engine {
         self.wide_window
     }
 
+    /// The RF window the rig's demodulated audio covers: its passband, on the
+    /// side of the dial the mode puts it.
+    fn audio_band(&self) -> (f64, f64) {
+        let dial = self.state.active_freq_hz();
+        if self.state.rx[0].mode.is_lower_sideband_at(dial) {
+            (dial - self.audio_bw, dial)
+        } else {
+            (dial, dial + self.audio_bw)
+        }
+    }
+
+    /// The viewport, when it lies inside the rig's own passband — and so when
+    /// the audio it is sending resolves that window far better than its scope.
+    ///
+    /// A serial CAT rig's scope is a fixed number of points across whatever
+    /// span it was told to sweep: an IC-705 sends 475, so at ±250 kHz that is a
+    /// kilohertz a point, and an operator zooming in is magnifying rather than
+    /// resolving — a CW signal stays one block wide however far they go, and
+    /// the block only gets fatter. Measured on that radio: 1053 Hz a point at
+    /// ±250 kHz, 105 at ±25 kHz, and about four sweeps a second at every span.
+    ///
+    /// The same rig is already sending its demodulated audio over the sound
+    /// card, and that goes through the panadapter's own analyser — 48 kHz
+    /// through a 16384-point window is some three hertz a bin, arriving twenty
+    /// times a second. Inside the passband it is a better picture by two orders
+    /// of magnitude in both axes.
+    ///
+    /// Outside it there is nothing to switch to: the audio is not a picture of
+    /// the band at all, only of what the rig has already demodulated, so a
+    /// wider view stays on the scope. The display *axis* stays the scope's
+    /// either way ([`Engine::update_display_center`]), so zooming back out is
+    /// the same gesture it always was.
+    fn audio_zoom_window(&self) -> Option<(f64, f64)> {
+        if !self.audio_mode {
+            return None;
+        }
+        let (lo, hi) = self.cfg.viewport?;
+        if !(hi > lo) {
+            return None;
+        }
+        let (band_lo, band_hi) = self.audio_band();
+        // What the operator can actually see, which is not what arrives: a
+        // client sends its window with slack around it so that panning inside
+        // it needs no reconfiguration, and today that slack is double the
+        // visible span. So the visible part is the middle of what was asked
+        // for, and it is the *visible* part that has to be inside the rig's
+        // filter for the audio to be the honest picture. Judging the slack as
+        // well would refuse every zoom that reached the passband edge.
+        let quarter = (hi - lo) / 4.0;
+        if lo + quarter < band_lo || hi - quarter > band_hi {
+            return None;
+        }
+        // Clipped to the filter, so the mirror the other side of the dial is
+        // never drawn: the rig sends *real* audio, whose spectrum is symmetric,
+        // and only the one side of it is the band.
+        Some((lo.max(band_lo), hi.min(band_hi)))
+    }
+
     /// The main panadapter, drawn from the radio's own finished bins.
     ///
     /// Auto-ranged rather than mapped through the operator's dB window: an
@@ -4458,7 +5480,7 @@ impl Engine {
             span_hz,
             floor,
             ceil,
-            DISPLAY_BINS,
+            self.cfg.bins(),
             self.cfg.viewport,
         )
     }
@@ -4467,7 +5489,22 @@ impl Engine {
         if self.tx_active {
             return self.make_tx_frame();
         }
+        let bins = self.cfg.bins();
         if self.audio_mode {
+            // Zoomed inside the rig's own passband: its audio resolves that
+            // window by two orders of magnitude more than its scope can, so it
+            // draws — see [`Engine::audio_zoom_window`]. Ahead of the scope
+            // test, because the scope is what owns the picture everywhere else.
+            if let Some(vp) = self.audio_zoom_window() {
+                return self.analyzer.make_frame(
+                    self.state.active_freq_hz(),
+                    self.radio_fs,
+                    self.cfg.db_floor,
+                    self.cfg.db_ceil,
+                    bins,
+                    Some(vp),
+                );
+            }
             // The radio's own scope, where this session has one — the only
             // spectrum of the *band* a demod-audio path can show.
             if let Some((center_hz, span_hz)) = self.scope_main_window() {
@@ -4487,7 +5524,7 @@ impl Engine {
                 self.radio_fs,
                 self.cfg.db_floor,
                 self.cfg.db_ceil,
-                DISPLAY_BINS,
+                bins,
                 Some(vp),
             );
         }
@@ -4520,7 +5557,7 @@ impl Engine {
                     ch_rate,
                     self.cfg.db_floor,
                     self.cfg.db_ceil,
-                    DISPLAY_BINS,
+                    bins,
                     Some((vp_lo, vp_hi)),
                 );
             }
@@ -4533,7 +5570,7 @@ impl Engine {
                 z.rate_hz,
                 self.cfg.db_floor,
                 self.cfg.db_ceil,
-                DISPLAY_BINS,
+                bins,
                 self.cfg.viewport,
             );
         }
@@ -4542,7 +5579,7 @@ impl Engine {
             self.state.sample_rate,
             self.cfg.db_floor,
             self.cfg.db_ceil,
-            DISPLAY_BINS,
+            bins,
             self.cfg.viewport,
         )
     }
@@ -4553,6 +5590,7 @@ impl Engine {
     /// transmit-sideband scope built from the TX baseband/audio.
     fn make_tx_frame(&mut self) -> SpectrumFrame {
         let dial = self.tx_center_hz;
+        let bins = self.cfg.bins();
         let lsb = self.state.rx[0].mode.is_lower_sideband_at(dial);
         let (floor, ceil) = (self.cfg.db_floor, self.cfg.db_ceil);
         // Attenuate the monitor for display by mapping through a window shifted
@@ -4578,17 +5616,10 @@ impl Engine {
             } else {
                 (dial, dial + bw)
             };
-            self.tx_analyzer.make_frame(dial, TX_MONITOR_RATE, mf, mc, DISPLAY_BINS, Some(vp))
+            self.tx_analyzer.make_frame(dial, TX_MONITOR_RATE, mf, mc, bins, Some(vp))
         } else {
             // Wideband IQ: the upconverted TX sits at `tx_center_hz` in the full span.
-            self.analyzer.make_frame(
-                self.tx_center_hz,
-                self.state.sample_rate,
-                mf,
-                mc,
-                DISPLAY_BINS,
-                None,
-            )
+            self.analyzer.make_frame(self.tx_center_hz, self.state.sample_rate, mf, mc, bins, None)
         };
         // Report the real range so the panadapter's dB axis is unchanged; the
         // bins are already dimmed by the shifted window above.
@@ -4720,6 +5751,14 @@ impl Engine {
             SetVolume { rx, v } => self.state.rx[rx.index()].volume = v.clamp(0.0, 1.0),
             SetMute { rx, muted } => self.state.rx[rx.index()].muted = muted,
             SetSquelch { rx, db } => self.state.rx[rx.index()].squelch_db = db,
+            // The rig's own squelch, on a front end that has one. Held in the
+            // state either way so the rail keeps its position on a source that
+            // is not listening, and passed straight down — the radio is what
+            // the level means something to.
+            SetRigSquelch { frac } => {
+                self.state.rig_squelch = frac.clamp(0.0, 1.0);
+                self.source.set_squelch(self.state.rig_squelch);
+            }
             SetNoiseBlanker(on) => self.state.noise_blanker = on,
             SetNoiseReduction { rx, level } => {
                 // A remote client can ask for an engine this host cannot run.
@@ -5135,16 +6174,36 @@ impl Engine {
                 let view = view.filter(|(lo, hi)| hi > lo && lo.is_finite() && hi.is_finite());
                 if self.skim_view != view {
                     self.skim_view = view;
-                    self.sync_skimmer_view();
+                    // Not just the gate: the window itself follows the operator's
+                    // waterfall, and a pan far enough out of it moves the whole
+                    // slice of band the skimmers are reading.
+                    self.sync_skim_window();
                 }
             }
             SetSpectrumCfg(new_cfg) => {
-                let rebuild = new_cfg.fft_size != self.cfg.fft_size;
+                // The overlap is chosen from the rate *and* the scroll speed
+                // ([`hop_div_for`]), so a change of speed re-sizes the hop too.
+                let rebuild =
+                    new_cfg.fft_size != self.cfg.fft_size || new_cfg.rows() != self.cfg.rows();
+                // The zoom lane's FFT is sized from the display width
+                // ([`zoom_lane_fft`]), and `ZoomLane::serves` knows nothing
+                // about that — it identifies a lane by its window. So a client
+                // that widens its display without moving the window would keep
+                // a lane analysing for the old width. Drop it and let
+                // `feed_zoom` build the replacement.
+                let rewidth = new_cfg.bins() != self.cfg.bins();
                 let rate = self.analyzer_rate();
                 self.cfg = new_cfg;
+                if rewidth {
+                    self.zoom = None;
+                }
                 if rebuild {
-                    self.analyzer =
-                        SpectrumAnalyzer::new(self.cfg.fft_size as usize, rate, self.cfg.avg_tc);
+                    self.analyzer = build_analyzer(
+                        self.cfg.fft_size as usize,
+                        rate,
+                        self.cfg.avg_tc,
+                        f64::from(self.cfg.rows()),
+                    );
                     self.tx_analyzer = SpectrumAnalyzer::new(
                         self.cfg.fft_size as usize,
                         TX_MONITOR_RATE,
@@ -5173,13 +6232,20 @@ impl Engine {
                 // settles the argument over the dial that suspended it.
                 self.hop_suspended = false;
                 self.sync_cw_filter();
+                self.sync_cw_dial();
                 if let Err(e) = sdroxide_config::save_digi_config(&self.digi_config) {
                     warn!("saving digi config: {e}");
                 }
+                // This write covers whatever the rail had queued, so the
+                // debounce has nothing left to flush.
+                self.digi_dirty = false;
                 self.mark_shared_store_write();
                 // The network features report the same operator identity, so a
                 // callsign or grid edit reaches them from here.
                 self.spots.set_operator(&self.digi_config.my_call, &self.digi_config.my_grid);
+                // ...and so does the ADS-B lane, which needs the operator's own
+                // position to place an aircraft on the ground.
+                self.sync_adsb_home();
                 self.emit_digi_status();
             }
             SetDigiAudioFreq(hz) => {
@@ -5187,6 +6253,7 @@ impl Engine {
                     d.set_audio_hz(hz);
                 }
                 self.sync_cw_filter();
+                self.sync_cw_dial();
                 // Remembered against the band, and only here: this arm is the
                 // operator's own route (the offset box, the nudge chips, a click
                 // on a decode or the waterfall). The automatic movers never
@@ -5221,6 +6288,29 @@ impl Engine {
                         }
                     }
                 }
+            }
+            SetDigiTxLevel { mode, level } => {
+                // Keyed on the mode the command carries, not on the dial: the
+                // rail is dragged while transmitting, and a mode change landing
+                // between the drag and this arm would write one mode's level
+                // onto another's entry (see `Command::SetDigiTxLevel`).
+                self.digi_config.set_tx_level(mode, level);
+                // The controller keeps its own copy and `DigiStatus.config` is
+                // built from it, so without this the echo below carries a stale
+                // map and every client seeds from the wrong number.
+                if let Some(d) = self.digi.as_mut() {
+                    d.set_config(self.digi_config.clone());
+                }
+                // Applied now, written later. A drag emits one of these per
+                // frame, and `save_digi_config` is an atomic write — temp file,
+                // fsync, rename — on the thread that is also pacing transmit
+                // blocks to real time. The one time an operator moves this
+                // control is while transmitting and watching ALC, which is
+                // exactly when that cost would land. `SetDigiAudioFreq` saves
+                // immediately because nudge chips fire a handful of times; a
+                // rail is not a chip.
+                self.digi_dirty = true;
+                self.emit_digi_status();
             }
             DigiCallCq => {
                 if let Some(d) = self.digi.as_mut() {
@@ -5401,6 +6491,22 @@ impl Engine {
                 }
             }
 
+            // ADS-B decoder (issue #160).
+            SetAdsbConfig(cfg) => {
+                let cfg = cfg.sane();
+                self.state.adsb = cfg;
+                // Remembered before `sync_adsb` may force the live state off,
+                // so a source swap back restores what was chosen.
+                self.adsb_cfg = cfg;
+                if let Err(e) = sdroxide_config::save_adsb_config(&cfg) {
+                    warn!("saving ADS-B config: {e}");
+                }
+                self.sync_adsb();
+                if let Some(d) = self.adsb.as_ref() {
+                    d.set_config(cfg);
+                }
+            }
+
             ReloadIsmDecoders => {
                 // Seeded here as well as at startup, so deleting the file to get
                 // the commented example back works without a restart.
@@ -5564,6 +6670,54 @@ impl Engine {
                             "switch the radio to PACKET or PACKET-HF to beacon".into(),
                         )));
                     }
+                }
+                return;
+            }
+            // The connected-mode terminal. No transmit gate of its own on any
+            // of these: the frames leave through `DigiAction::KeyTx` and the
+            // engine's normal PTT path, so the station interlock and the band
+            // rails apply exactly as they do to a beacon. Its absence here
+            // looks like an oversight, so: it is not one.
+            //
+            // Every other refusal — no callsign, a bad path, the link busy —
+            // is written into the terminal's own transcript by the controller,
+            // where the operator is looking. Only "you are not in a packet
+            // mode" has to be a Notice, because in that case there is no
+            // controller and so no transcript to write into.
+            PacketConnect { call, via, ext } => {
+                match self.digi.as_mut() {
+                    Some(d) if self.state.rx[0].mode.is_packet() => {
+                        d.packet_connect(call, via, ext);
+                    }
+                    _ => {
+                        let _ = self.event_tx.send(RadioEvent::Notice(Some(
+                            "switch the radio to PACKET or PACKET-HF to connect".into(),
+                        )));
+                    }
+                }
+                return;
+            }
+            PacketSend { text } => {
+                if let Some(d) = self.digi.as_mut()
+                    && self.state.rx[0].mode.is_packet()
+                {
+                    d.packet_send_line(text);
+                }
+                return;
+            }
+            PacketDisconnect => {
+                if let Some(d) = self.digi.as_mut()
+                    && self.state.rx[0].mode.is_packet()
+                {
+                    d.packet_disconnect();
+                }
+                return;
+            }
+            PacketTermClear => {
+                if let Some(d) = self.digi.as_mut()
+                    && self.state.rx[0].mode.is_packet()
+                {
+                    d.packet_term_clear();
                 }
                 return;
             }
@@ -5873,9 +7027,9 @@ impl Engine {
 
     /// Construct or tear down the wideband skimmer worker: it runs while at
     /// least one kind (CW / PSK / RTTY) is enabled. The skim window is a
-    /// dedicated decimation of the raw IQ centered on the device center (offset
-    /// 0), so tuning the VFO within the span doesn't disturb the streaming
-    /// decoders.
+    /// dedicated decimation of the raw IQ, placed on the part of the band the
+    /// operator is looking at ([`skim_center_for`]) and kept there by
+    /// [`Engine::sync_skim_window`].
     fn sync_skimmer(&mut self) {
         // Wideband-only: an audio-mode source (a CAT rig on a sound card) has
         // only a narrow audio slice, so the skimmers stay off there — and the
@@ -5886,13 +7040,18 @@ impl Engine {
         }
         match (self.state.skimmer.any_enabled(), self.skimmer.is_some()) {
             (true, false) => {
-                let ddc = Ddc::new(self.state.sample_rate, SKIM_TARGET_HZ);
+                let (ddc, center) = self.build_skim_window();
                 let rate = ddc.out_rate();
-                self.skimmer =
-                    Some(SkimmerController::new(rate, self.state.center_hz, self.state.skimmer));
+                self.skimmer = Some(SkimmerController::new(
+                    rate,
+                    center,
+                    self.state.center_hz - center,
+                    self.state.skimmer,
+                ));
                 self.skim_ddc = Some(ddc);
+                self.skim_center_hz = center;
                 self.sync_skimmer_view();
-                info!(rate, "skimmer started");
+                info!(rate, center, "skimmer started");
             }
             (false, true) => {
                 self.skimmer = None;
@@ -5904,11 +7063,82 @@ impl Engine {
         }
     }
 
+    /// A down-converter for the skim window as it should be placed *now*,
+    /// already mixed onto it, and the absolute frequency it is centred on.
+    ///
+    /// The one place the chain is built, so the rate it was built from is always
+    /// recorded with it.
+    fn build_skim_window(&mut self) -> (Ddc, f64) {
+        let mut ddc = Ddc::new(self.state.sample_rate, SKIM_TARGET_HZ);
+        let center = self.skim_window_center_hz(ddc.out_rate(), None);
+        ddc.set_offset_hz(center - self.state.center_hz);
+        self.skim_in_rate = self.state.sample_rate;
+        (ddc, center)
+    }
+
+    /// Where the skim window should sit for a window of `rate`, given where the
+    /// operator is looking and where it is now.
+    fn skim_window_center_hz(&self, rate: f64, current: Option<f64>) -> f64 {
+        skim_center_for(
+            self.skim_view,
+            self.state.rx_freq_hz(),
+            self.state.center_hz,
+            self.state.sample_rate,
+            rate,
+            current,
+        )
+    }
+
+    /// Re-place the skim window after a retune, a pan or a rate change, and hand
+    /// the skimmers the view they are gated to.
+    ///
+    /// The rate is the one thing that cannot be re-pointed: the detector's bin
+    /// width, its frame clock, the WPM it reads off that clock and DeepCW's whole
+    /// front end are all built from it, and none can be retuned in place. So a
+    /// chain built for a rate the front end has left is rebuilt rather than kept
+    /// — the mistake issue #142 was in the ISM lane, where a stale window went
+    /// quiet and only switching the decoder off and on put it right.
+    ///
+    /// Everything else moves in place. The NCO offset is re-seated on every call,
+    /// even where the window has not moved in absolute terms: it is measured from
+    /// the hardware centre, and on a front end wide enough to keep the view in
+    /// sight either side of a retune that centre is exactly what just moved.
+    fn sync_skim_window(&mut self) {
+        let Some(ddc) = self.skim_ddc.as_ref() else { return };
+        let want_rate = Ddc::rate_for(self.state.sample_rate, SKIM_TARGET_HZ);
+        if (want_rate - ddc.out_rate()).abs() >= 1.0
+            || (self.state.sample_rate - self.skim_in_rate).abs() >= 1.0
+        {
+            self.skimmer = None;
+            self.skim_ddc = None;
+            self.skim_buf.clear();
+            self.sync_skimmer();
+            return;
+        }
+        let center = self.skim_window_center_hz(want_rate, Some(self.skim_center_hz));
+        if let Some(ddc) = self.skim_ddc.as_mut() {
+            ddc.set_offset_hz(center - self.state.center_hz);
+        }
+        let moved = (center - self.skim_center_hz).abs() >= 1.0;
+        self.skim_center_hz = center;
+        // Sent even when the centre held: the DC spike is at a fixed frequency,
+        // so a front end that retuned under a stationary window moved it inside
+        // that window. The skimmers ignore a centre that has not changed, so
+        // nothing is thrown away by saying so.
+        if let Some(sk) = self.skimmer.as_ref() {
+            sk.set_window(center, self.state.center_hz - center);
+        }
+        if moved {
+            debug!(center, rate = want_rate, "skim window moved");
+        }
+        // After the placement, not before: a window that moved has just dropped
+        // its tracks, and the view has to be back in place before the new ones
+        // are spawned.
+        self.sync_skimmer_view();
+    }
+
     /// Hand the running skimmers the window the operator can actually see, so
     /// they only spend decoder time on signals that are on screen.
-    ///
-    /// Re-sent on a retune as well as on a pan: `set_center` clears the tracks,
-    /// and the view has to be back in place before the new ones are spawned.
     fn sync_skimmer_view(&self) {
         if let Some(sk) = self.skimmer.as_ref() {
             sk.set_view(self.skim_view);
@@ -6079,6 +7309,243 @@ impl Engine {
                 IsmAction::Status(s) => RadioEvent::IsmStatus(s),
             };
             let _ = self.event_tx.send(ev);
+        }
+    }
+
+    /// The rate the ADS-B window asks its down-converter for.
+    ///
+    /// Everything the front end delivers, up to a CPU cap — *not* a preferred
+    /// figure the stream is decimated down to. Mode S is a half-microsecond
+    /// chip, so samples per chip is the whole game: a receiver handing over
+    /// 4 Msps decodes every arrival phase where one handing over 2.4 is merely
+    /// good, and decimating to hit a target would give away the only thing that
+    /// matters here.
+    ///
+    /// A receiver below [`sdroxide_types::ADSB_MIN_RATE_HZ`] lands on its own
+    /// rate, `sync_adsb` refuses to start, and the panel says why.
+    fn adsb_target_rate_hz(&self) -> f64 {
+        self.state.sample_rate.min(sdroxide_types::ADSB_MAX_RATE_HZ)
+    }
+
+    /// Why the decoder will do badly here even though it can run. `None` when
+    /// there is nothing to say.
+    ///
+    /// A different kind of statement from [`Self::adsb_unavailable`]: the lane
+    /// is decoding and aircraft will appear, and the operator would otherwise
+    /// have no way of knowing that the ones at the edge of range are being lost
+    /// to arithmetic rather than to propagation.
+    fn adsb_degraded(&self) -> Option<String> {
+        let rate = Ddc::rate_for(self.state.sample_rate, self.adsb_target_rate_hz());
+        if rate >= sdroxide_types::ADSB_GOOD_RATE_HZ || self.adsb_unavailable().is_some() {
+            return None;
+        }
+        Some(format!(
+            "this stream is {:.3} Msps and a Mode S chip is half a microsecond, so the \
+             signal is barely sampled: the strong aircraft decode and the weak ones are \
+             lost. {:.1} Msps or more is what it takes — widen the receiver's window if \
+             it has the setting.",
+            rate / 1e6,
+            sdroxide_types::ADSB_GOOD_RATE_HZ / 1e6
+        ))
+    }
+
+    /// Where the window sits: on 1090 MHz where the span reaches it, and on the
+    /// hardware centre where it does not — in which case nothing decodes and
+    /// [`Self::adsb_unavailable`] is what the operator is told.
+    fn adsb_window_center_hz(&self, rate: f64) -> f64 {
+        let want = sdroxide_types::ADSB_FREQ_HZ;
+        // The window has to fit inside the stream, and the stream's outer edges
+        // are where a front end's own anti-alias filter is rolling off, so the
+        // usable span is not the whole of it.
+        let slack = (self.state.sample_rate * ADSB_USABLE_FRACTION - rate) / 2.0;
+        if slack <= 0.0 {
+            return self.state.center_hz;
+        }
+        want.clamp(self.state.center_hz - slack, self.state.center_hz + slack)
+    }
+
+    /// Why the decoder cannot run here, if it cannot. `None` means it can.
+    ///
+    /// Every sentence names the number it is talking about. "No aircraft" and
+    /// "this receiver was never going to hear any" produce the same empty list,
+    /// and only this tells them apart.
+    fn adsb_unavailable(&self) -> Option<String> {
+        if self.audio_mode {
+            return Some(
+                "this front end hands over demodulated audio; ADS-B needs the raw I/Q stream"
+                    .to_string(),
+            );
+        }
+        if self.state.sample_rate < sdroxide_types::ADSB_MIN_RATE_HZ {
+            return Some(format!(
+                "ADS-B needs at least {:.1} Msps and this stream is {:.3} Msps — \
+                 lower the front-end decimation, or raise the device sample rate",
+                sdroxide_types::ADSB_MIN_RATE_HZ / 1e6,
+                self.state.sample_rate / 1e6
+            ));
+        }
+        if !self.caps.can_rx_hz(sdroxide_types::ADSB_FREQ_HZ) {
+            return Some("this receiver does not tune to 1090 MHz".to_string());
+        }
+        let rate = Ddc::rate_for(self.state.sample_rate, self.adsb_target_rate_hz());
+        let center = self.adsb_window_center_hz(rate);
+        if !sdroxide_adsb::window_covers(center, rate) {
+            return Some(format!(
+                "1090.000 MHz is outside the receiver's window, which is {:.3} MHz wide \
+                 about {:.3} MHz",
+                rate / 1e6,
+                center / 1e6
+            ));
+        }
+        None
+    }
+
+    /// A down-converter for the 1090 MHz window, already mixed onto it, and the
+    /// absolute frequency it is centred on.
+    ///
+    /// The one place the chain is built, so the rate it was built from is always
+    /// recorded with it.
+    fn build_adsb_window(&mut self) -> (Ddc, f64) {
+        let target = self.adsb_target_rate_hz();
+        let mut ddc = Ddc::new(self.state.sample_rate, target);
+        let center = self.adsb_window_center_hz(ddc.out_rate());
+        ddc.set_offset_hz(center - self.state.center_hz);
+        self.adsb_in_rate = self.state.sample_rate;
+        (ddc, center)
+    }
+
+    /// Start or stop the ADS-B lane to match the mode and the front end.
+    ///
+    /// Unlike the ISM decoder, which the operator switches on and leaves running
+    /// under whatever else they are doing, this one follows the *mode*: it needs
+    /// the receiver parked on 1090 MHz at two and a half megasamples a second,
+    /// and nothing else can be listened to through that.
+    fn sync_adsb(&mut self) {
+        let want = self.state.rx[0].mode.is_adsb() && self.adsb_unavailable().is_none();
+        // The operator's own preference survives being overruled: `state.adsb`
+        // is what the panel reads, `adsb_cfg` is what they chose.
+        if self.audio_mode {
+            self.state.adsb = sdroxide_types::AdsbSettings::OFF;
+        } else {
+            self.state.adsb = self.adsb_cfg;
+        }
+        match (want, self.adsb.is_some()) {
+            (true, false) => {
+                let (ddc, center) = self.build_adsb_window();
+                let out_rate = ddc.out_rate();
+                let c = AdsbController::new(center, out_rate, self.state.adsb);
+                c.set_home(self.adsb_home);
+                self.adsb = Some(c);
+                self.adsb_ddc = Some(ddc);
+                self.adsb_center_hz = center;
+                info!(rate = out_rate, center, "ADS-B decoder started");
+            }
+            (false, true) => {
+                self.adsb = None;
+                self.adsb_ddc = None;
+                self.adsb_buf.clear();
+                info!("ADS-B decoder stopped");
+            }
+            (true, true) => self.sync_adsb_window(),
+            _ => {}
+        }
+    }
+
+    /// Re-place the window after a retune or a rate change.
+    ///
+    /// The aircraft table survives: a receiver nudged a hundred kilohertz is
+    /// still looking at the same sky, and a target list rebuilt from nothing
+    /// every time the dial moves would be worse than a second of missed frames.
+    /// The chain that feeds it is another matter — a `Ddc` bakes in both its
+    /// input rate and its decimation, so a change in either is a rebuild rather
+    /// than a retune (the lesson of issue #142, next door).
+    fn sync_adsb_window(&mut self) {
+        let Some(ddc) = self.adsb_ddc.as_ref() else { return };
+        let want_rate = Ddc::rate_for(self.state.sample_rate, self.adsb_target_rate_hz());
+        if (want_rate - ddc.out_rate()).abs() >= 1.0
+            || (self.state.sample_rate - self.adsb_in_rate).abs() >= 1.0
+        {
+            let (ddc, center) = self.build_adsb_window();
+            let rate = ddc.out_rate();
+            self.adsb_ddc = Some(ddc);
+            self.adsb_center_hz = center;
+            if let Some(d) = self.adsb.as_ref() {
+                d.set_window(center, rate);
+            }
+            info!(rate, center, "ADS-B window rebuilt");
+            return;
+        }
+
+        let center = self.adsb_window_center_hz(want_rate);
+        let Some(ddc) = self.adsb_ddc.as_mut() else { return };
+        // Re-seated even when the window has not moved in absolute terms: the
+        // offset is measured from the *hardware* centre, and a retune is exactly
+        // what moves that. Phase-continuous and filter-free, so there is nothing
+        // to save by skipping it.
+        ddc.set_offset_hz(center - self.state.center_hz);
+        if (center - self.adsb_center_hz).abs() < 1.0 {
+            return;
+        }
+        self.adsb_center_hz = center;
+        if let Some(d) = self.adsb.as_ref() {
+            d.set_window(center, want_rate);
+        }
+    }
+
+    /// Tell the ADS-B lane where the station is, when that changes.
+    ///
+    /// A surface position squitter has no globally-unambiguous decode, so an
+    /// aircraft on a taxiway can only be placed against a reference — and until
+    /// it has been heard airborne, ours is the only one there is.
+    fn sync_adsb_home(&mut self) {
+        let grid = self.digi_config.my_grid.trim();
+        let home = (!grid.is_empty()).then(|| sdroxide_types::grid_to_latlon(grid)).flatten();
+        if home == self.adsb_home {
+            return;
+        }
+        self.adsb_home = home;
+        if let Some(d) = self.adsb.as_ref() {
+            d.set_home(home);
+        }
+    }
+
+    /// Drain the ADS-B decoder's aircraft table and forward it.
+    ///
+    /// The worker knows what it is decoding but not what the receiver could have
+    /// been decoding, so the "why is this empty" fields are filled in here,
+    /// where the front end's capabilities are.
+    fn poll_adsb(&mut self) {
+        let unavailable = self.adsb_unavailable();
+        let Some(d) = self.adsb.as_ref() else {
+            // Nothing running. On the ADS-B mode that is a fact worth sending —
+            // it is the only way the panel can say what is wrong — but off it
+            // there is nobody listening.
+            //
+            // Once, not per block: this runs at the front end's block rate,
+            // which on a fast source is hundreds of times a second, and every
+            // one of them would go to the UI and to every remote client.
+            if self.state.rx[0].mode.is_adsb() && self.adsb_idle_sent.as_ref() != Some(&unavailable)
+            {
+                self.adsb_idle_sent = Some(unavailable.clone());
+                let st = sdroxide_types::AdsbStatus {
+                    unavailable,
+                    suggest_center_hz: Some(sdroxide_types::ADSB_FREQ_HZ),
+                    ..Default::default()
+                };
+                let _ = self.event_tx.send(RadioEvent::AdsbStatus(Box::new(st)));
+            }
+            return;
+        };
+        // Running again: whatever was last said about it being down is stale,
+        // so a later stop says it afresh.
+        self.adsb_idle_sent = None;
+        let degraded = self.adsb_degraded();
+        for action in d.poll() {
+            let AdsbAction::Status(mut st) = action;
+            st.unavailable = unavailable.clone();
+            st.degraded = degraded.clone();
+            st.suggest_center_hz = unavailable.is_some().then_some(sdroxide_types::ADSB_FREQ_HZ);
+            let _ = self.event_tx.send(RadioEvent::AdsbStatus(st));
         }
     }
 
@@ -6314,7 +7781,11 @@ impl Engine {
     /// The address we'd bind, when it is the very rig we are connected to as a
     /// TCI client.
     fn tci_backend_conflict(&self) -> Option<String> {
-        let radio = sdroxide_config::load_radio_config();
+        // This radio's scope, not the station's: on a station with more than
+        // one radio the free function is radio 0's file, so radio 1's server
+        // would be diagnosed against radio 0's backend — and either accuse it
+        // of a clash it does not have, or miss its own.
+        let radio = self.store.load_radio_config();
         if radio.backend != sdroxide_types::Backend::Tci {
             return None;
         }
@@ -6967,7 +8438,18 @@ impl Engine {
         // ever on a link that no longer exists.
         let port = self.packet_port.clone();
         if let Some(wl) = self.winlink.as_mut() {
-            if wl.packet_available() != port.is_some() {
+            // Compared by identity, not by "is there one".
+            //
+            // `start_digi` clears the handle and `make_digi` puts a new one
+            // back inside the same call, so a change from PACKET to PACKET-HF
+            // reads as `true != true` here and the manager keeps a handle whose
+            // other end was dropped with the old controller. A session started
+            // on it then blocks against a link that no longer exists.
+            let stale = match (port.as_ref(), wl.packet_port()) {
+                (Some(new), Some(held)) => !new.same_link(held),
+                (a, b) => a.is_some() != b.is_some(),
+            };
+            if stale {
                 wl.set_packet_port(port);
             }
         }
@@ -7120,9 +8602,31 @@ impl Engine {
         // `tx_freq_hz` (not `rx_freq_hz`) because the reporter shows where a
         // station transmits, and `tx_active` (not `state.tx.ptt`) because a
         // refused key must never be reported as being on the air.
-        self.spots.set_reporter_freq(self.state.tx_freq_hz().round().max(0.0) as u64);
-        self.spots.set_reporter_visible(self.state.rx[0].mode.is_rade());
-        self.spots.set_reporter_tx(self.tx_active);
+        //
+        // On a station with more than one radio the answer is not this engine's
+        // own mode: the session lives on the primary engine, and the radio in
+        // RADE may be any of them. Every engine publishes its own state to the
+        // shared `RadeWatch`; what the reporter is told is whichever radio is
+        // actually on FreeDV. `None` is a single-radio start, where this engine
+        // *is* the station.
+        let in_rade = self.state.rx[0].mode.is_rade();
+        let tx_freq = self.state.tx_freq_hz().round().max(0.0) as u64;
+        let (freq, visible, tx) = match self.rade_watch.as_ref() {
+            Some(w) => {
+                w.publish(self.instance, in_rade, tx_freq, self.tx_active);
+                match w.reported() {
+                    // Nobody on FreeDV: hidden, and the frequency stops
+                    // mattering — keep pushing our own so a station that comes
+                    // back to RADE has something current to show.
+                    None => (tx_freq, false, self.tx_active),
+                    Some((f, t)) => (f, true, t),
+                }
+            }
+            None => (tx_freq, in_rade, self.tx_active),
+        };
+        self.spots.set_reporter_freq(freq);
+        self.spots.set_reporter_visible(visible);
+        self.spots.set_reporter_tx(tx);
 
         for ev in self.spots.poll() {
             let re = match ev {
@@ -7164,6 +8668,28 @@ impl Engine {
             && !sdroxide_types::is_aprs_channel(self.state.active_freq_hz())
         {
             let hz = sdroxide_types::aprs_dial();
+            match self.state.active_vfo {
+                Vfo::A => self.state.vfo_a_hz = hz,
+                Vfo::B => self.state.vfo_b_hz = hz,
+            }
+            self.state.band = Band::containing(hz);
+            self.follow_dial();
+        }
+        // ADS-B is a channel too, and a far more absolute one: there is exactly
+        // one worldwide, the receiver has to be on it, and nothing else can be
+        // heard through a 2.4 Msps window parked there. Same three guards as
+        // APRS above — main receiver, a real mode change, and only when 1090 is
+        // not already inside the window — plus one more: a receiver that cannot
+        // reach 1090 MHz at all is left where it is, because retuning it would
+        // take away the band the operator was on and give nothing back. The
+        // panel says why instead.
+        if rx == RxId::Main
+            && mode.is_adsb()
+            && !self.state.rx[0].mode.is_adsb()
+            && self.caps.can_rx_hz(sdroxide_types::ADSB_FREQ_HZ)
+            && !sdroxide_adsb::window_covers(self.state.center_hz, self.state.sample_rate)
+        {
+            let hz = sdroxide_types::ADSB_FREQ_HZ;
             match self.state.active_vfo {
                 Vfo::A => self.state.vfo_a_hz = hz,
                 Vfo::B => self.state.vfo_b_hz = hz,
@@ -7220,13 +8746,20 @@ impl Engine {
         // or leaving Ft8/Ft4 starts/stops it (and aborts any in-flight QSO).
         if rx == RxId::Main {
             self.sync_digi_mode();
+            // ...and the ADS-B lane, which unlike the other wideband decoders
+            // runs only while its mode is selected.
+            self.sync_adsb();
             self.emit_digi_status();
             // A wider channel needs a wider berth from the LO: switching a
             // narrow mode that was happily sitting 30 kHz off the LO into WFM
             // hands the discriminator a 250 kHz channel with the DC spike
             // inside it. Re-check the clearance and move the LO if it grew.
             if !self.audio_mode {
-                self.keep_vfo_in_span();
+                // `follow_dial` rather than the span check alone: entering or
+                // leaving CW moves a self-keying transceiver's VFO by a whole
+                // sidetone (`rig_cw_offset_hz`), and that is a move no span
+                // check would ever ask for — the VFO is sitting on the centre.
+                self.follow_dial();
                 self.update_tuning();
             }
         }
@@ -7433,6 +8966,11 @@ impl Engine {
             return;
         }
         self.state.scan = sdroxide_types::ScanState::default();
+        // A sweep drives the hardware centre itself, dial and all, so a scan
+        // that stopped on a CW signal leaves a self-keying transceiver's VFO on
+        // our zero-beat rather than on the station. Put it back before the
+        // operator reaches for the paddle. See `sync_cw_dial`.
+        self.sync_cw_dial();
         if let Some(why) = why {
             self.notice(why);
         }
@@ -7986,6 +9524,29 @@ impl Engine {
         }
     }
 
+    /// Write `digi.json` if the transmit-audio rail has moved since the last
+    /// write. A no-op otherwise, which is every tick that is not during or just
+    /// after a drag.
+    ///
+    /// Deferred rather than written in the command arm for the reason
+    /// `digi_dirty` gives, and flushed from the same two places the session is —
+    /// the periodic tick and `Drop` — for the reason the session's own comment
+    /// gives: a clean quit is the common case, and without it a drag that ended
+    /// in the last few seconds would be lost.
+    ///
+    /// `digi.json` is a shared store, so the generation is bumped as
+    /// `SetDigiConfig` does: without it this engine reloads its own write the
+    /// next time another one touches the directory.
+    fn flush_digi_config(&mut self) {
+        if !std::mem::take(&mut self.digi_dirty) {
+            return;
+        }
+        if let Err(e) = sdroxide_config::save_digi_config(&self.digi_config) {
+            warn!("saving digi config: {e}");
+        }
+        self.mark_shared_store_write();
+    }
+
     /// Write the dial, mode, antennas and levels to `session.json` if any of
     /// them has moved since the last write, so the next start comes up here
     /// rather than on the default frequency and levels. A no-op on an engine
@@ -8080,6 +9641,10 @@ impl Engine {
     /// disk moves; nothing is written back from here, so two engines nudging
     /// each other cannot ping-pong.
     fn reload_shared_stores(&mut self) {
+        // Ours first. A level still sitting in `digi_config` waiting for the
+        // tick is not in the file another engine just wrote, so reading that
+        // file over it would discard the operator's last drag.
+        self.flush_digi_config();
         let memories = sdroxide_config::load_memories();
         if memories != self.memories {
             self.memories = memories;
@@ -8227,10 +9792,11 @@ impl Engine {
         self.decim = (factor > 1).then(|| Decimator::new(factor));
         self.state.sample_rate = self.radio_fs / factor as f64;
 
-        self.analyzer = SpectrumAnalyzer::new(
+        self.analyzer = build_analyzer(
             self.cfg.fft_size as usize,
             self.state.sample_rate,
             self.cfg.avg_tc,
+            f64::from(self.cfg.rows()),
         );
         if self.mixer.is_some() {
             self.main =
@@ -8253,6 +9819,14 @@ impl Engine {
         self.ism_ddc = None;
         self.ism = None;
         self.ism_buf.clear();
+        // The ADS-B lane goes the same way and for the same reason, except that
+        // decimating the front end is the one thing most likely to take it below
+        // the two megasamples a second it cannot work without — which `sync_adsb`
+        // will then say out loud rather than restarting a decoder that can only
+        // find nothing.
+        self.adsb_ddc = None;
+        self.adsb = None;
+        self.adsb_buf.clear();
         // Dropped outright rather than left to `sync_tci_iq`'s own comparison:
         // two device rates can snap to the same client rate, and it would then
         // keep a decimation chain built for the rate we have just left.
@@ -8262,6 +9836,7 @@ impl Engine {
         self.sync_digi_mode();
         self.sync_skimmer();
         self.sync_ism();
+        self.sync_adsb();
         self.sync_audio_tap();
         self.sync_tci_iq();
         info!(factor, rate = self.state.sample_rate, "front-end decimation");
@@ -8297,6 +9872,15 @@ impl Engine {
         // wins as soon as that one finishes.
         let opened = {
             let mut reopen = factory.lock().unwrap_or_else(|e| e.into_inner());
+            // Holding the factory means any attempt that was already in flight
+            // has finished. Its answer is stale — it was opening whatever the
+            // configuration said a moment ago — so it is let go of here rather
+            // than collected later, where `poll_reconnect` would adopt it on
+            // top of what the operator just asked for. That is what used to
+            // put a radio's interface straight back after it was switched off:
+            // the switch released the device, and the attempt already running
+            // claimed it again a moment later, with the switch reading OFF.
+            self.abandon_retry();
             reopen(center)
         };
         // Whatever the operator just chose starts the retry schedule over.
@@ -8310,6 +9894,26 @@ impl Engine {
                     .event_tx
                     .send(RadioEvent::Notice(Some(format!("Interface change failed: {e}"))));
             }
+        }
+    }
+
+    /// Throw away a background reconnect attempt, standing down whatever it
+    /// opened.
+    ///
+    /// Called only with the factory lock held, which is what bounds the wait:
+    /// the worker holds that lock across its whole open, so by the time this
+    /// runs the attempt has finished and its answer is at most one instruction
+    /// away. A source it did open is *released* rather than merely dropped —
+    /// an exclusively-claimed device has to be let go before its replacement
+    /// can have it, and that is the method that says so.
+    fn abandon_retry(&mut self) {
+        let Some(rx) = self.retry.take() else { return };
+        if let Ok(Ok((mut source, _))) = rx.recv_timeout(ABANDON_WAIT) {
+            debug!(source = %source.describe(), "dropping a reconnect the operator overtook");
+            source.release();
+        }
+        if let Some(j) = self.retry_join.take() {
+            let _ = j.join();
         }
     }
 
@@ -8423,6 +10027,8 @@ impl Engine {
         self.source = source;
         self.caps = caps;
         self.caps.center_is_dial = self.source.center_is_dial();
+        self.caps.cw_audio_keyed = self.source.cw_audio_keyed();
+        self.caps.commands_squelch = self.source.commands_squelch();
         self.audio_mode = self.caps.audio_mode;
         self.radio_fs = self.source.sample_rate();
         self.audio_bw = self.source.display_bandwidth().unwrap_or(self.radio_fs / 2.0);
@@ -8511,8 +10117,12 @@ impl Engine {
         // measures its bins against; the card rate in audio mode, where the
         // analyzer FFTs the rig's audio directly.
         let analyzer_rate = if self.audio_mode { self.radio_fs } else { self.state.sample_rate };
-        self.analyzer =
-            SpectrumAnalyzer::new(self.cfg.fft_size as usize, analyzer_rate, self.cfg.avg_tc);
+        self.analyzer = build_analyzer(
+            self.cfg.fft_size as usize,
+            analyzer_rate,
+            self.cfg.avg_tc,
+            f64::from(self.cfg.rows()),
+        );
 
         // Drop rate-dependent / stateful DSP so it rebuilds for the new source.
         self.tx = None;
@@ -8588,6 +10198,7 @@ impl Engine {
         if !self.audio_mode {
             self.sync_skimmer();
             self.sync_ism();
+            self.sync_adsb();
         }
         // Re-derive the TCI streams at the new device rate and push a fresh
         // state burst, so connected clients follow the swap.
@@ -8615,7 +10226,9 @@ impl Engine {
     /// leaves them alone.
     fn follow_sideband(&mut self) {
         let mode = self.state.rx[0].mode;
-        if !mode.is_sstv() {
+        // `Mode::Sstv` by name rather than [`Mode::is_sstv`]: its VHF twin
+        // rides an FM carrier, which has no sideband to swap.
+        if mode != Mode::Sstv {
             return;
         }
         let want = mode.default_filter_at(self.state.rx_freq_hz());
@@ -8696,6 +10309,12 @@ impl Engine {
         // Keep a wideband-IQ rig's own VFO on our dial (TCI); no-op elsewhere. This
         // way returning from TX doesn't snap the rig back to the IQ centre.
         self.source.set_if_offset(main_offset);
+        // On a screen wider than the skim window the dial decides which part of
+        // it is skimmed ([`skim_center_for`]), and tuning inside the span moves
+        // the dial without moving the front end or the client's view — so this
+        // is the only place that would notice. A handful of comparisons, and the
+        // dead band means ordinary tuning changes nothing.
+        self.sync_skim_window();
     }
 
     /// Tell the source where we would transmit, for the band-switching hardware
@@ -9028,7 +10647,11 @@ impl Engine {
             // In audio mode `tx_begin` just asserts CAT PTT; there is no
             // modulator/DUC (the rig modulates the audio we feed its sound card).
             let begin_rate = if self.audio_mode { self.radio_fs } else { self.state.sample_rate };
-            match self.source.tx_begin(txf, begin_rate) {
+            // On a radio that makes its own CW carrier the VFO *is* the transmit
+            // frequency, and the contact sits a sidetone above the dial — the
+            // same offset the receive window already rides on.
+            let rig_txf = txf + self.rig_cw_offset_hz();
+            match self.source.tx_begin(rig_txf, begin_rate) {
                 Ok(tx_rate) => {
                     // Rate-match the digital modes to whatever this radio
                     // actually plays.
@@ -9416,6 +11039,24 @@ impl Engine {
         self.emit_voice_status();
     }
 
+    /// The operator's transmit-audio level for the over that is on the air, on a
+    /// radio that modulates what we send it.
+    ///
+    /// This mode's own level if the operator has set one, else the level for
+    /// the carrier it goes out on — see
+    /// [`sdroxide_types::DigiConfig::tx_audio_levels`] for why an absent entry
+    /// inherits, and [`sdroxide_types::DigiConfig::tx_audio_level_fm`] for what
+    /// the two carrier defaults mean. On FM it is the deviation; on sideband it
+    /// is drive into the modulator, and the thing that keeps a constant-envelope
+    /// mode out of the rig's ALC.
+    ///
+    /// Keyed on the mode on the air rather than on whichever panel set it, so a
+    /// deviation set for 1200 baud never lands on FT8 and an FT8 level never
+    /// lands on RTTY.
+    fn digi_tx_audio_level(&self) -> f32 {
+        self.digi_config.tx_level_for(self.state.rx[0].mode)
+    }
+
     /// One block of transmit audio from the digital mode, at the rate the radio
     /// consumes and with the modem's own headroom already divided out.
     ///
@@ -9453,16 +11094,10 @@ impl Engine {
         // a full transmitter (issue #131).
         //
         // ...and then the operator's own level, but only where the *radio*
-        // modulates what we send it. On FM that level is the deviation and
-        // nothing else sets it: a full-scale burst into a data input set for
-        // voice over-deviates, which sounds entirely normal and decodes for
-        // nobody. Where we modulate it ourselves the modulator and Drive
-        // already own the level, so this stays out of it.
-        let level = if self.audio_mode || self.caps.tx_audio {
-            self.digi_config.tx_audio_level.clamp(0.05, 1.0)
-        } else {
-            1.0
-        };
+        // modulates what we send it. Where we modulate it ourselves the
+        // modulator and Drive already own the level, so this stays out of it.
+        let level =
+            if self.audio_mode || self.caps.tx_audio { self.digi_tx_audio_level() } else { 1.0 };
         let gain = gain * level;
         if (gain - 1.0).abs() > f32::EPSILON {
             for a in out.iter_mut() {
@@ -9576,6 +11211,19 @@ impl Engine {
         if self.digi.as_ref().is_some_and(|d| d.wants_mic()) {
             self.fill_tx_audio_fifo_depth(TX_AUDIO_BLOCK);
             if !self.mic_fifo.is_empty() {
+                // Mic gain, on the one path where the microphone is the
+                // payload. It was missing here: both places that applied it are
+                // voice branches this never reaches, so the Mic slider did
+                // nothing at all to a digital-voice over and the vocoder was
+                // fed whatever the sound card delivered. Same 50 %-is-unity
+                // convention as the voice paths, so one setting means one thing
+                // whichever mode is transmitting.
+                let gain = self.state.tx.mic_gain * 2.0;
+                if (gain - 1.0).abs() > f32::EPSILON {
+                    for a in self.mic_fifo.iter_mut() {
+                        *a = (*a * gain).clamp(-1.0, 1.0);
+                    }
+                }
                 if let Some(d) = self.digi.as_mut() {
                     d.on_tx_mic(&self.mic_fifo);
                 }
@@ -9986,13 +11634,19 @@ impl Engine {
             self.keep_vfo_in_span();
             return;
         }
-        let vfo = self.state.active_freq_hz();
+        let dial = self.state.active_freq_hz();
+        // Not always the dial: in CW a radio that keys its own transmitter has
+        // to sit on the contact, a sidetone above it (`rig_cw_offset_hz`).
+        let vfo = dial + self.rig_cw_offset_hz();
         // Asking for a centre the front end is already on costs a skimmer
         // restart and a CAT write for nothing.
         if (self.state.center_hz - (vfo + self.lo_offset_hz())).abs() >= 0.5 {
-            self.retune_for_vfo(vfo);
+            if self.retune_for_vfo(vfo) {
+                // What a refused tune goes back to is a dial, not a VFO.
+                self.good_vfo_hz = dial;
+            }
         } else {
-            self.good_vfo_hz = vfo;
+            self.good_vfo_hz = dial;
         }
     }
 
@@ -10126,13 +11780,12 @@ impl Engine {
         match self.source.set_center_hz(center_hz) {
             Ok(()) => {
                 self.state.center_hz = center_hz;
-                // The skim window follows the hardware center; re-label spots
-                // and clear tracks so nothing straddles the old/new axis.
-                if let Some(sk) = self.skimmer.as_ref() {
-                    sk.set_center(center_hz);
-                }
-                self.sync_skimmer_view();
+                // Re-place the skim window inside the span that has just moved;
+                // one that really moves re-labels its spots and clears its
+                // tracks, so none straddles the old and new axis.
+                self.sync_skim_window();
                 self.sync_ism_window();
+                self.sync_adsb_window();
                 true
             }
             Err(e) => {
@@ -10224,9 +11877,18 @@ fn rig_mode_class(m: Mode) -> u8 {
         // rig has no DRM setting to report back — see `to_hamlib_mode`.
         Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => 2,
         Mode::Cw => 3,
-        // RIFP, VHF packet and APRS are data on an FM carrier, so a rig
-        // reporting plain FM is still where we left it.
-        Mode::Nfm | Mode::Wfm | Mode::Rifp | Mode::Packet | Mode::Aprs => 5,
+        // RIFP, VHF packet, APRS and VHF SSTV are data on an FM carrier, so a
+        // rig reporting plain FM is still where we left it.
+        Mode::Nfm
+        | Mode::Wfm
+        | Mode::Rifp
+        | Mode::Packet
+        | Mode::Aprs
+        | Mode::SstvFm
+        // ADS-B is not a mode any rig has, and no rig will ever be in it: the
+        // dial is at 1090 MHz. Grouped with FM so an echo is never read as the
+        // operator having left the mode.
+        | Mode::Adsb => 5,
     }
 }
 
@@ -10379,15 +12041,20 @@ fn encode_png_gray(gray: &[u8], w: u16, h: u16) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
-/// Replace the fields of an incoming [`DigiConfig`] that the engine owns rather
-/// than the client, leaving every genuine setting as sent.
+/// Replace the fields of an incoming [`DigiConfig`] that a client's copy cannot
+/// be trusted to carry, leaving every genuine setting as sent.
 ///
-/// Only `tx_audio_hz` so far, the per-band transmit offsets. They ride in
-/// `DigiConfig` because that is what reaches the config file, not because a
-/// client has any business setting them, and the panel seeds its editable copy
-/// from the first status and owns it from then on. So an incoming map is always
-/// a stale snapshot, and taking it discards every offset learned since that
-/// client started.
+/// The property they share is not who *owns* the setting — it is that each has a
+/// write route of its own, outside `SetDigiConfig`. A panel seeds its editable
+/// copy from the first status and owns it from then on, so anything written by
+/// another route is missing from every copy seeded before that write. An
+/// incoming config is therefore always a stale snapshot of these two fields, and
+/// taking it discards everything learned since that client started.
+///
+/// - `tx_audio_hz`, the per-band transmit offsets, written by
+///   `Command::SetDigiAudioFreq`.
+/// - `tx_audio_levels`, the per-mode transmit-audio levels, written by
+///   `Command::SetDigiTxLevel`.
 ///
 /// Found the hard way, minutes after the offsets went in. 60 m's was set,
 /// recorded and saved; ticking Hold TX a moment later sent a copy seeded before
@@ -10397,6 +12064,7 @@ fn encode_png_gray(gray: &[u8], w: u16, h: u16) -> Option<Vec<u8>> {
 /// faithfully could be defeated by any of them.
 fn keep_engine_owned(mut incoming: DigiConfig, current: &DigiConfig) -> DigiConfig {
     incoming.tx_audio_hz = current.tx_audio_hz.clone();
+    incoming.tx_audio_levels = current.tx_audio_levels.clone();
     incoming
 }
 
@@ -10448,6 +12116,24 @@ mod digi_config_tests {
             "a chip toggle wiped the band offsets"
         );
         assert!(merged.hold_tx_freq, "and the edit the client actually made was lost");
+    }
+
+    /// The same trap, one map along (issue #186). The transmit-audio rail has
+    /// its own command, so a client seeded before the operator touched it sends
+    /// an empty map — and an hour of per-mode levels would go over the good
+    /// file on the next squelch nudge.
+    #[test]
+    fn a_client_config_cannot_wipe_the_per_mode_tx_levels() {
+        let mut current = DigiConfig::default();
+        current.set_tx_level(Mode::Ft8, 0.25);
+        current.set_tx_level(Mode::Rtty, 0.4);
+
+        let incoming = DigiConfig { digi_squelch: 3.0, ..DigiConfig::default() };
+
+        let merged = keep_engine_owned(incoming, &current);
+        assert_eq!(merged.tx_level_for(Mode::Ft8), 0.25, "a squelch nudge wiped the TX levels");
+        assert_eq!(merged.tx_level_for(Mode::Rtty), 0.4);
+        assert_eq!(merged.digi_squelch, 3.0, "and the edit the client actually made was lost");
     }
 }
 
@@ -10654,6 +12340,98 @@ mod stereo_tests {
     }
 }
 
+/// Slide a batch of pooled waterfall rows from one window onto another, and
+/// say whether it could be done at all.
+///
+/// Only a move: the span and the column count have to match, and then the bins
+/// are the same width and the move is a whole number of them. Each row keeps
+/// whatever of the band is still inside the window, and the strip that has
+/// just come into view is filled with the floor — the same "nothing here yet"
+/// a client's own history remap leaves along the edge it has just uncovered.
+///
+/// False for a zoom, a width change, or a move further than the window is
+/// wide: there is nothing of the old picture left to carry, and the caller
+/// starts the batch again.
+fn slide_rows(batch: &mut [u8], from: (f64, f64, usize), to: (f64, f64, usize)) -> bool {
+    let (to_center, span, cols) = to;
+    if cols == 0 || from.2 != cols || span <= 0.0 || (from.1 - span).abs() > span * 1e-6 {
+        return false;
+    }
+    let d = ((to_center - from.0) / (span / cols as f64)).round();
+    if d.abs() >= cols as f64 {
+        return false;
+    }
+    let d = d as isize;
+    if d != 0 {
+        // Column `j` on the new axis is where column `j + d` was on the old.
+        for row in batch.chunks_exact_mut(cols) {
+            if d > 0 {
+                let d = d as usize;
+                row.copy_within(d.., 0);
+                row[cols - d..].fill(0);
+            } else {
+                let d = d.unsigned_abs();
+                row.copy_within(..cols - d, d);
+                row[..d].fill(0);
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod slide_rows_tests {
+    use super::slide_rows;
+
+    /// 8 columns over 800 Hz centred on 1000: one column per 100 Hz.
+    fn axis(center: f64) -> (f64, f64, usize) {
+        (center, 800.0, 8)
+    }
+
+    /// The window moves up by two columns, so the picture moves down by two
+    /// and the top two columns are band nobody has heard yet.
+    #[test]
+    fn a_window_that_moved_up_carries_its_rows_down() {
+        let mut rows = vec![1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18];
+        assert!(slide_rows(&mut rows, axis(1000.0), axis(1200.0)));
+        assert_eq!(rows[..8], [3, 4, 5, 6, 7, 8, 0, 0]);
+        assert_eq!(rows[8..], [13, 14, 15, 16, 17, 18, 0, 0]);
+    }
+
+    /// And the other way.
+    #[test]
+    fn a_window_that_moved_down_carries_them_up() {
+        let mut rows = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(slide_rows(&mut rows, axis(1000.0), axis(900.0)));
+        assert_eq!(rows, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// Less than half a column is no move at all — a fractional shift applied
+    /// every frame would blur the batch away for nothing.
+    #[test]
+    fn a_move_shorter_than_a_column_leaves_the_rows_alone() {
+        let mut rows = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(slide_rows(&mut rows, axis(1000.0), axis(1040.0)));
+        assert_eq!(rows, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// A zoom is not a move, and neither is a width change: nothing lines up
+    /// column for column, so the caller has to start again.
+    #[test]
+    fn a_zoom_or_a_width_change_cannot_be_slid() {
+        let mut rows = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(!slide_rows(&mut rows, axis(1000.0), (1000.0, 400.0, 8)));
+        assert!(!slide_rows(&mut rows, axis(1000.0), (1000.0, 800.0, 4)));
+    }
+
+    /// Past the width of the window there is nothing left to carry.
+    #[test]
+    fn a_move_clear_of_the_window_keeps_nothing() {
+        let mut rows = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(!slide_rows(&mut rows, axis(1000.0), axis(1900.0)));
+    }
+}
+
 /// Max-pool dB bins down to `out_bins` and map them onto the u8 range clients
 /// draw, producing a frame with the axis the caller describes.
 ///
@@ -10687,6 +12465,8 @@ fn pool_window_to_frame(
             db_floor,
             db_ceil,
             bins: vec![0; out_bins],
+            rows: Vec::new(),
+            rows_clocked: false,
         };
     }
     let (frac_lo, frac_hi, out_center, out_span) = match viewport {
@@ -10701,14 +12481,216 @@ fn pool_window_to_frame(
     let lo_bin = frac_lo * n as f64;
     let bin_range = (frac_hi - frac_lo) * n as f64;
     let mut bins = Vec::with_capacity(out_bins);
-    for i in 0..out_bins {
-        let lo = ((lo_bin + i as f64 * bin_range / out_bins as f64) as usize).min(n - 1);
-        let hi =
-            ((lo_bin + (i + 1) as f64 * bin_range / out_bins as f64) as usize).clamp(lo + 1, n);
-        let peak = db[lo..hi].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        bins.push(((peak - db_floor) * scale).clamp(0.0, 255.0) as u8);
+    if bin_range < out_bins as f64 {
+        // Stretching, not pooling: the window holds fewer measurements than
+        // there are columns to fill, so each one has to cover several.
+        //
+        // Reading between them rather than repeating them. A rig's own scope is
+        // a fixed number of points however wide the panadapter is drawn — an
+        // IC-705 sends 475 across its whole span, so a view of a fifth of that
+        // span is 85 numbers spread over a couple of thousand pixels — and
+        // repeating each one seventeen times is the wall of hard blocks that
+        // gets reported as a broken waterfall. It is also self-inflicted: the
+        // waterfall's own sampler is linear and would have drawn exactly this
+        // gradient, had the frame not arrived pre-blocked.
+        //
+        // Only in this direction. Coarsening stays the peak below, because a
+        // carrier one bin wide has to survive being pooled into a column, and
+        // averaging or sampling it away is how a signal disappears from a
+        // zoomed-out panadapter.
+        for i in 0..out_bins {
+            // Centre of this column, in source-bin coordinates, with the half
+            // bin taken off so bin centres land on column centres.
+            let at = lo_bin + (i as f64 + 0.5) * bin_range / out_bins as f64 - 0.5;
+            let k = at.floor().clamp(0.0, (n - 1) as f64) as usize;
+            let t = (at - k as f64).clamp(0.0, 1.0) as f32;
+            let (a, b) = (db[k], db[(k + 1).min(n - 1)]);
+            bins.push(((a + (b - a) * t - db_floor) * scale).clamp(0.0, 255.0) as u8);
+        }
+    } else {
+        for i in 0..out_bins {
+            let lo = ((lo_bin + i as f64 * bin_range / out_bins as f64) as usize).min(n - 1);
+            let hi =
+                ((lo_bin + (i + 1) as f64 * bin_range / out_bins as f64) as usize).clamp(lo + 1, n);
+            let peak = db[lo..hi].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            bins.push(((peak - db_floor) * scale).clamp(0.0, 255.0) as u8);
+        }
     }
-    SpectrumFrame { seq, center_hz: out_center, span_hz: out_span, db_floor, db_ceil, bins }
+    SpectrumFrame {
+        seq,
+        center_hz: out_center,
+        span_hz: out_span,
+        db_floor,
+        db_ceil,
+        bins,
+        rows: Vec::new(),
+        rows_clocked: false,
+    }
+}
+
+#[cfg(test)]
+mod skim_window_tests {
+    use super::{SKIM_TARGET_HZ, skim_center_for};
+
+    /// An RX-888 handed the whole half-spectrum: 32.4 MHz of it, centred on
+    /// 16.2 MHz because that is the only place a window that wide can sit.
+    const WIDE: f64 = 32_400_000.0;
+    const WIDE_CENTER: f64 = 16_200_000.0;
+    /// Rounded off the decimation ladder from that rate; the exact figure only
+    /// matters to the arithmetic, not to the rule.
+    const WIN: f64 = 202_500.0;
+
+    /// The bug as reported: the skimmers on a wide front end decoded nothing at
+    /// all, because their window sat in the middle of the sampled span while the
+    /// operator watched a band 2 MHz away.
+    #[test]
+    fn the_window_goes_where_the_operator_is_looking() {
+        let view = (14_000_000.0, 14_100_000.0);
+        let c = skim_center_for(Some(view), 14_030_000.0, WIDE_CENTER, WIDE, WIN, None);
+        assert!(
+            c - WIN / 2.0 <= view.0 && c + WIN / 2.0 >= view.1,
+            "window at {c} does not cover {view:?}"
+        );
+    }
+
+    /// Nobody watching — a headless server, or a client that has not said what
+    /// it is showing yet — and the window starts where it always did.
+    #[test]
+    fn no_view_starts_on_the_hardware_centre() {
+        assert_eq!(skim_center_for(None, 14_030_000.0, WIDE_CENTER, WIDE, WIN, None), WIDE_CENTER);
+    }
+
+    /// A view the window already covers does not move it. Every move costs each
+    /// track in the window and each callsign half-read, and a drag reports a new
+    /// view several times a second.
+    #[test]
+    fn a_pan_inside_the_window_holds_it_still() {
+        let cur = 14_050_000.0;
+        for lo in [14_020_000.0, 14_000_000.0, 14_080_000.0] {
+            let view = Some((lo, lo + 20_000.0));
+            let c = skim_center_for(view, lo + 10_000.0, WIDE_CENTER, WIDE, WIN, Some(cur));
+            assert_eq!(c, cur, "view {view:?} moved the window");
+        }
+    }
+
+    /// ...and a pan that leaves it does, onto the view it can no longer see.
+    #[test]
+    fn a_pan_out_of_the_window_moves_it() {
+        let cur = 14_050_000.0;
+        let view = (14_200_000.0, 14_240_000.0);
+        let c = skim_center_for(Some(view), 14_220_000.0, WIDE_CENTER, WIDE, WIN, Some(cur));
+        assert_eq!(c, (view.0 + view.1) / 2.0);
+    }
+
+    /// A screen wider than the window can only ever be part-covered, so the part
+    /// is the one around the dial — a band-wide view of 20 m has its CW at one
+    /// end and its phone at the other, and the operator is in one of them.
+    #[test]
+    fn a_wide_view_keeps_the_dial_in_the_window() {
+        let view = Some((14_000_000.0, 14_350_000.0));
+        let dial = 14_025_000.0;
+        let c = skim_center_for(view, dial, WIDE_CENTER, WIDE, WIN, None);
+        assert!((c - dial).abs() < WIN / 2.0, "dial {dial} outside the window at {c}");
+        // ...without the window hanging off the end of the screen, where half of
+        // it would be skimming spectrum nobody is looking at.
+        assert!(c - WIN / 2.0 >= 14_000_000.0 - 0.5, "window at {c} runs past the view");
+    }
+
+    /// Tuning across that view does not re-cut the window every few kilohertz.
+    /// It has to be the dial that moves it, and only once the dial is well out
+    /// towards the edge, or a scrolled VFO would keep throwing the decoders away.
+    #[test]
+    fn ordinary_tuning_does_not_re_cut_a_wide_view() {
+        let view = Some((14_000_000.0, 14_350_000.0));
+        let cur = 14_101_250.0;
+        for dial in [14_090_000.0, 14_101_250.0, 14_120_000.0, 14_150_000.0] {
+            assert_eq!(
+                skim_center_for(view, dial, WIDE_CENTER, WIDE, WIN, Some(cur)),
+                cur,
+                "dial {dial} moved the window"
+            );
+        }
+        let far = 14_300_000.0;
+        assert_ne!(skim_center_for(view, far, WIDE_CENTER, WIDE, WIN, Some(cur)), cur);
+    }
+
+    /// The window is an NCO offset inside the stream, so both its edges stay
+    /// inside what was sampled however close to the end of the span the operator
+    /// is looking — including the bottom of 160 m on a front end that starts at
+    /// zero.
+    #[test]
+    fn the_window_stays_inside_the_span() {
+        for view in [(1_800_000.0, 1_840_000.0), (32_000_000.0, 32_400_000.0)] {
+            let c = skim_center_for(Some(view), view.0, WIDE_CENTER, WIDE, WIN, None);
+            assert!(c - WIN / 2.0 >= -0.5, "window at {c} starts below the span");
+            assert!(c + WIN / 2.0 <= WIDE + 0.5, "window at {c} ends above the span");
+        }
+    }
+
+    /// A front end no wider than the window has nothing to place: it is all
+    /// window, wherever the operator looks. This is every narrow SDR and every
+    /// I/Q rig, and the behaviour there must not change at all.
+    #[test]
+    fn a_narrow_front_end_is_all_window() {
+        let center = 14_100_000.0;
+        for span in [48_000.0, 192_000.0, SKIM_TARGET_HZ] {
+            let view = Some((center - 5_000.0, center + 5_000.0));
+            assert_eq!(skim_center_for(view, center, center, span, SKIM_TARGET_HZ, None), center);
+        }
+    }
+
+    /// A front end that retuned out from under a stationary window takes the
+    /// window with it rather than leaving it hanging outside the new span.
+    #[test]
+    fn a_retune_drags_a_window_left_outside_the_span() {
+        // 2 Msps on 14.1 MHz, then the dial jumps a band with the view.
+        let (span, cur) = (2_000_000.0, 14_050_000.0);
+        let view = Some((21_020_000.0, 21_060_000.0));
+        let c = skim_center_for(view, 21_030_000.0, 21_040_000.0, span, WIN, Some(cur));
+        assert!((c - 21_040_000.0).abs() < span / 2.0, "window at {c} is outside the new span");
+    }
+
+    /// A degenerate view — a client mid-layout, or one whose window has drifted
+    /// off the end of the span entirely — leaves the window where it is rather
+    /// than parking it somewhere arbitrary.
+    #[test]
+    fn a_view_the_front_end_cannot_reach_is_ignored() {
+        let cur = 14_050_000.0;
+        let view = Some((88_000_000.0, 88_200_000.0));
+        assert_eq!(skim_center_for(view, 88_100_000.0, WIDE_CENTER, WIDE, WIN, Some(cur)), cur);
+    }
+}
+
+#[cfg(test)]
+mod zoom_lane_fft_tests {
+    use super::zoom_lane_fft;
+
+    /// A client on the historic 2048-column panadapter gets the lane it always
+    /// had. The whole change has to be invisible to it.
+    #[test]
+    fn the_old_width_gets_the_old_lane() {
+        assert_eq!(zoom_lane_fft(2048), 4096);
+    }
+
+    /// Twice the columns, twice the transform — so the bins that land inside
+    /// the viewport still outnumber the columns drawing them at every rung of
+    /// the decimation ladder.
+    #[test]
+    fn a_wider_panadapter_gets_a_wider_transform() {
+        assert_eq!(zoom_lane_fft(4096), 8192);
+        assert_eq!(zoom_lane_fft(8192), 16_384);
+    }
+
+    /// Held at both ends: nothing below the lane's own floor, and nothing past
+    /// the point where one transform covers more signal than its hop can hide.
+    #[test]
+    fn it_is_a_power_of_two_inside_the_bounds() {
+        for w in [0usize, 1, 1000, 2048, 3000, 4096, 8192, 100_000] {
+            let n = zoom_lane_fft(w);
+            assert!((4096..=32_768).contains(&n), "{w} gave {n}");
+            assert!(n.is_power_of_two(), "{w} gave {n}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10721,10 +12703,42 @@ mod wide_frame_tests {
         // into two thousand — this is the whole reason for max-pooling.
         let mut db = vec![-120.0f32; 4096];
         db[1234] = -20.0;
-        let f = pool_window_to_frame(&db, 1, 16.2e6, 32.4e6, -120.0, -20.0, DISPLAY_BINS, None);
-        assert_eq!(f.bins.len(), DISPLAY_BINS);
-        assert_eq!(f.bins[1234 * DISPLAY_BINS / 4096], 255);
+        let f = pool_window_to_frame(&db, 1, 16.2e6, 32.4e6, -120.0, -20.0, WIDE_BINS, None);
+        assert_eq!(f.bins.len(), WIDE_BINS);
+        assert_eq!(f.bins[1234 * WIDE_BINS / 4096], 255);
         assert_eq!(f.bins[0], 0);
+    }
+
+    /// A rig's own scope is a fixed number of points, and a panadapter drawn
+    /// wider than that is stretching them. Repeating each one is what made an
+    /// IC-705's waterfall a wall of blocks; the ramp between two neighbours has
+    /// to actually be a ramp.
+    #[test]
+    fn a_stretched_sweep_is_a_gradient_and_not_a_staircase() {
+        // Eight points climbing evenly, drawn across 256 columns.
+        let db: Vec<f32> = (0..8).map(|i| -120.0 + i as f32 * 10.0).collect();
+        let f = pool_window_to_frame(&db, 1, 1e6, 1e6, -120.0, -40.0, 256, None);
+        assert_eq!(f.bins.len(), 256);
+
+        // Monotone, as the input is.
+        assert!(f.bins.windows(2).all(|w| w[1] >= w[0]), "the ramp went backwards");
+
+        // And it climbs continuously rather than in eight steps: between the
+        // first and last source points every column differs from its neighbour
+        // by at most a couple of levels, where replication would jump ~32 at
+        // each of seven boundaries.
+        let biggest = f.bins.windows(2).map(|w| w[1] as i32 - w[0] as i32).max().unwrap_or(0);
+        assert!(biggest <= 3, "the largest step between columns was {biggest}");
+    }
+
+    /// The other direction is untouched: coarsening still keeps the peak, which
+    /// is what stops a one-bin carrier vanishing from a zoomed-out view.
+    #[test]
+    fn stretching_does_not_change_how_a_wide_window_is_pooled() {
+        let mut db = vec![-120.0f32; 4096];
+        db[77] = -20.0;
+        let f = pool_window_to_frame(&db, 1, 1e6, 1e6, -120.0, -20.0, 512, None);
+        assert_eq!(f.bins[77 * 512 / 4096], 255);
     }
 
     #[test]
@@ -10752,8 +12766,8 @@ mod wide_frame_tests {
     #[test]
     fn fewer_input_bins_than_output_bins_still_produces_a_full_frame() {
         let db = vec![-50.0f32; 100];
-        let f = pool_window_to_frame(&db, 1, 0.0, 1.0, -120.0, -20.0, DISPLAY_BINS, None);
-        assert_eq!(f.bins.len(), DISPLAY_BINS);
+        let f = pool_window_to_frame(&db, 1, 0.0, 1.0, -120.0, -20.0, WIDE_BINS, None);
+        assert_eq!(f.bins.len(), WIDE_BINS);
         assert!(f.bins.iter().all(|b| *b > 0));
     }
 
@@ -10935,5 +12949,154 @@ mod auto_level_tests {
         let prev = (-115.0, -25.0);
         assert_eq!(auto_levels(&[], Some(prev)), prev);
         assert_eq!(auto_levels(&[f32::NAN, f32::NAN], Some(prev)), prev);
+    }
+}
+
+#[cfg(test)]
+mod hop_div_tests {
+    use super::{MAX_HOP_DIV, hop_div_for};
+
+    /// The case this rule exists for: a wide front end runs far more transforms
+    /// than any waterfall can draw, and half-overlapping them doubles that for
+    /// nothing. An RX-888 at 8.1 MHz through a 4096-point window makes 3955 a
+    /// second at the customary half-hop; a waterfall wants at most a couple of
+    /// hundred.
+    #[test]
+    fn a_wide_front_end_stops_overlapping() {
+        assert_eq!(hop_div_for(8_100_000.0, 4096, 28.0), 1);
+        assert_eq!(hop_div_for(8_100_000.0, 4096, 224.0), 1);
+    }
+
+    /// It is a rule, not a switch: a rate that produces only a handful of
+    /// transforms per row keeps its overlap. 2 Msps through a 32768-point
+    /// window is 122 transforms a second, which at 28 rows is already about
+    /// the four per row that is wanted — so nothing is taken away.
+    #[test]
+    fn a_lane_with_transforms_to_spare_only_just_keeps_its_overlap() {
+        assert_eq!(hop_div_for(2_000_000.0, 32_768, 28.0), 2);
+        // Scroll faster on the same lane and the overlap has to come back.
+        assert_eq!(hop_div_for(2_000_000.0, 32_768, 224.0), 8);
+    }
+
+    /// And the case it must not break: a zoomed lane at a few kilohertz fills a
+    /// window barely twice a second, and its eighth-hop is what puts rows on
+    /// the waterfall at all. The rule has to hand that back unchanged.
+    #[test]
+    fn a_zoomed_lane_keeps_its_fine_overlap() {
+        // The lane a 10 kHz view on an 8.1 Msps front end builds: 8.1e6/512.
+        assert_eq!(hop_div_for(15_820.0, 4096, 28.0), MAX_HOP_DIV);
+        assert_eq!(hop_div_for(48_000.0, 4096, 56.0), MAX_HOP_DIV);
+    }
+
+    /// Never coarser than one window per hop. Past that the analyser would skip
+    /// samples outright, and a signal shorter than a window could land entirely
+    /// in the gap — which is exactly what the peak hold between rows exists to
+    /// prevent.
+    #[test]
+    fn it_never_skips_samples() {
+        for rate in [48_000.0, 1_536_000.0, 8_100_000.0, 64_000_000.0] {
+            for fft in [1024usize, 4096, 32_768, 131_072] {
+                for rows in [5.0, 28.0, 224.0] {
+                    let d = hop_div_for(rate, fft, rows);
+                    assert!((1..=MAX_HOP_DIV).contains(&d), "{rate}/{fft}/{rows} gave {d}");
+                }
+            }
+        }
+    }
+
+    /// A rate or a scroll speed nobody has filled in yet falls back to the
+    /// half-overlap every build before this one used.
+    #[test]
+    fn an_unknown_rate_keeps_the_old_behaviour() {
+        assert_eq!(hop_div_for(0.0, 4096, 28.0), 2);
+        assert_eq!(hop_div_for(f64::NAN, 4096, 28.0), 2);
+        assert_eq!(hop_div_for(8_100_000.0, 4096, 0.0), 2);
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use super::collapse_superseded;
+    use sdroxide_types::{Command, Vfo};
+
+    fn kinds(batch: &[Command]) -> Vec<String> {
+        batch
+            .iter()
+            .map(|c| match c {
+                Command::SetCenter(hz) => format!("C{hz}"),
+                Command::SetVfo { vfo, hz } => format!("V{vfo:?}{hz}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn collapse(mut batch: Vec<Command>) -> Vec<String> {
+        collapse_superseded(&mut batch);
+        kinds(&batch)
+    }
+
+    /// What a drag delivers: one centre and one dial per frame of the UI, of
+    /// which only the last pair is a state anything ever sees. Sixty retunes a
+    /// second is what issue #188's remote client was asking a Pi for.
+    #[test]
+    fn a_drags_worth_of_frames_costs_one_retune() {
+        let drag: Vec<Command> = (0..4)
+            .flat_map(|i| {
+                let hz = 14_100_000.0 + f64::from(i) * 1000.0;
+                [Command::SetCenter(hz), Command::SetVfo { vfo: Vfo::A, hz }]
+            })
+            .collect();
+        assert_eq!(collapse(drag), ["C14103000", "VA14103000"]);
+    }
+
+    /// The two VFOs are separate settings, and each keeps its own last word.
+    #[test]
+    fn each_vfo_keeps_its_own_last_value() {
+        assert_eq!(
+            collapse(vec![
+                Command::SetVfo { vfo: Vfo::A, hz: 1.0 },
+                Command::SetVfo { vfo: Vfo::B, hz: 2.0 },
+                Command::SetVfo { vfo: Vfo::A, hz: 3.0 },
+            ]),
+            ["VB2", "VA3"]
+        );
+    }
+
+    /// The rule that keeps this honest: a command that could *read* the centre
+    /// or the dial is a wall, and nothing before it is dropped across it.
+    /// `CopyAtoB` is the one that proves it — collapsing the two `SetVfo`s
+    /// around it would copy a VFO that never held the value being copied.
+    #[test]
+    fn a_command_that_reads_the_dial_is_a_wall() {
+        assert_eq!(
+            collapse(vec![
+                Command::SetVfo { vfo: Vfo::A, hz: 100.0 },
+                Command::CopyAtoB,
+                Command::SetVfo { vfo: Vfo::A, hz: 200.0 },
+            ]),
+            ["VA100", "CopyAtoB", "VA200"]
+        );
+        // ...and the setters *after* the wall still collapse among themselves.
+        assert_eq!(
+            collapse(vec![
+                Command::SetCenter(1.0),
+                Command::SwapVfos,
+                Command::SetCenter(2.0),
+                Command::SetCenter(3.0),
+            ]),
+            ["C1", "SwapVfos", "C3"]
+        );
+    }
+
+    /// Nothing to collapse must change nothing — including the ordinary case of
+    /// a single command arriving on its own.
+    #[test]
+    fn a_batch_with_no_repeats_is_left_alone() {
+        assert_eq!(collapse(vec![]), Vec::<String>::new());
+        assert_eq!(collapse(vec![Command::SetCenter(1.0)]), ["C1"]);
+        assert_eq!(
+            collapse(vec![Command::SetPtt(true), Command::SetCenter(1.0)]),
+            ["SetPtt(true)", "C1"]
+        );
     }
 }

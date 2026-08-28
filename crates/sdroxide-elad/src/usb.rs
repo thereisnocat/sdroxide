@@ -140,19 +140,44 @@ impl UsbDev {
 
         let device = info.open().wait().map_err(|e| Error::from_open(e, &label))?;
 
-        // Only set the configuration if it is not already the one we want. On
-        // Linux `set_configuration` can re-enumerate the device — which would
-        // invalidate the handle we are holding — and on Windows it is not
-        // supported at all.
+        // Select the configuration — and on a sampler, select it even when it is
+        // already the active one.
+        //
+        // That last part is not a formality, it is the second half of issue
+        // #178. A SET_CONFIGURATION is what makes the Cypress bridge run its own
+        // re-initialisation, and on an FDM-S1/S2 that is where EP6 is put into
+        // slave FIFO mode — the step the FDM-DUO has an explicit vendor command
+        // for (`DuoSub::FifoInit`) and the samplers have none. Both programs
+        // that are known to stream from a real FDM-S2 go through libusb, whose
+        // `set_configuration` is documented to re-issue the request for the
+        // configuration already in force ("a lightweight device reset:
+        // altsetting reset to zero, endpoint halts cleared, toggles reset"), so
+        // they get it without asking. nusb does exactly what it is told, and
+        // skipping it left a correctly programmed FPGA with nowhere to put its
+        // samples: sixteen queued transfers, four seconds, not one byte, no
+        // error anywhere.
+        //
+        // The FDM-DUO keeps the old behaviour. It initialises its FIFO with a
+        // command of its own and it is the one model anybody has actually
+        // streamed from here, so it is left on the open sequence that is known
+        // to work.
+        let reselect = model != Model::Duo;
         match device.active_configuration() {
-            Ok(c) if c.configuration_value() == CONFIGURATION => {}
+            Ok(c) if c.configuration_value() == CONFIGURATION && !reselect => {}
             Ok(c) => {
-                trace.note(format!(
-                    "device is on configuration {}, selecting {CONFIGURATION}",
-                    c.configuration_value()
-                ));
-                if let Err(e) = device.set_configuration(CONFIGURATION).wait() {
-                    trace.note(format!("set_configuration failed ({e}); continuing"));
+                if c.configuration_value() != CONFIGURATION {
+                    trace.note(format!(
+                        "device is on configuration {}, selecting {CONFIGURATION}",
+                        c.configuration_value()
+                    ));
+                }
+                // Not fatal: Windows cannot do this at all, and a device that
+                // refuses it is still worth trying to stream from.
+                match device.set_configuration(CONFIGURATION).wait() {
+                    Ok(()) => trace.note(format!(
+                        "selected configuration {CONFIGURATION} (re-initialises the bridge)"
+                    )),
+                    Err(e) => trace.note(format!("set_configuration failed ({e}); continuing")),
                 }
             }
             Err(e) => trace.note(format!("no active configuration reported ({e}); continuing")),

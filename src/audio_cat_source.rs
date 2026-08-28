@@ -51,6 +51,10 @@ pub struct AudioCatSource {
     tx_scratch: Vec<f32>,
 
     cat: sdroxide_cat::CatHandle,
+    /// Top of the `27 00` amplitude scale on the rig the model list names —
+    /// 160 on the IC-7300 generation, 200 on an IC-7760. Taken at open, since
+    /// the model cannot change under a session.
+    scope_full_scale: f32,
     /// Whether the CW panel keys this rig as audio (`CwKeying::Audio`), so the
     /// rig must be held on a sideband instead of being put in CW. See
     /// [`IqSource::cw_audio_keyed`].
@@ -291,6 +295,9 @@ impl AudioCatSource {
         } else {
             status
         };
+        // Read off the model before the configuration is handed to the link,
+        // which takes it by value.
+        let scope_full_scale = f32::from(cfg.icom_model.scope_full_scale());
         let cat = sdroxide_cat::spawn(cfg);
 
         Ok(AudioCatSource {
@@ -307,6 +314,7 @@ impl AudioCatSource {
             tx_resampler,
             tx_scratch: Vec::new(),
             cat,
+            scope_full_scale,
             cw_mcw,
             dial: Dial::at(center),
             dial_reachable,
@@ -667,17 +675,17 @@ impl IqSource for AudioCatSource {
     /// it over the serial link — the same `27 00` sweeps, and the same two
     /// lanes, as the Icom LAN backend: the full-band strip always, and on the
     /// demod-audio path the *main* panadapter too (the engine decides — see
-    /// its `scope_main_window`). Finished magnitude bins on the radio's
-    /// 0..=160 scale, mapped to dB with the same uncalibrated slope the LAN
-    /// backend uses; the engine's auto-levelling makes the picture right even
-    /// where the absolute numbers are not.
+    /// its `scope_main_window`). Finished magnitude bins on the radio's own
+    /// scale, mapped to dB with the same uncalibrated slope the LAN backend
+    /// uses; the engine's auto-levelling makes the picture right even where the
+    /// absolute numbers are not.
     fn wide_spectrum_db(&mut self, out: &mut Vec<f32>) -> Option<(f64, f64)> {
         let sweep = self.cat.take_scope_sweep()?;
         if sweep.bins.is_empty() || sweep.span_hz <= 0.0 {
             return None;
         }
         out.clear();
-        out.extend(sweep.bins.iter().map(|&b| (f32::from(b) - 160.0) * 0.5));
+        out.extend(sweep.bins.iter().map(|&b| (f32::from(b) - self.scope_full_scale) * 0.5));
         Some((sweep.center_hz, sweep.span_hz))
     }
 
@@ -716,6 +724,11 @@ impl IqSource for AudioCatSource {
                 // commanding the rig back — the radio's own setting is the
                 // operator's, not a stale one to overwrite.
                 sdroxide_cat::CatUpdate::Power(frac) => out.push(ControlUpdate::TxDrive(frac)),
+                // And the squelch it came up on, read at the same moment and
+                // adopted the same way. On demod audio this is the gate the
+                // operator actually hears, so the rail has to start where the
+                // radio's knob already is.
+                sdroxide_cat::CatUpdate::Squelch(frac) => out.push(ControlUpdate::Squelch(frac)),
                 // The operator keyed the radio itself — mic button, foot
                 // switch, VOX, its own keyer. Passed up as the thing it is, not
                 // as a request to transmit: see `ControlUpdate::RigTx`.
@@ -775,6 +788,27 @@ impl IqSource for AudioCatSource {
     /// let through. The rig's own filter is the one that does the work.
     fn set_control_filter(&mut self, mode: Mode, lo_hz: f64, hi_hz: f64) {
         self.cat.set_filter(mode, lo_hz as f32, hi_hz as f32);
+    }
+
+    // ── Squelch ──────────────────────────────────────────────────────────────
+    /// The rig's own squelch, over CAT. On demod audio it is the only one there
+    /// is: what reaches the sound card has already been through it, so a
+    /// threshold applied on this side can close further on what got through but
+    /// can never open what was shut out (issue #192).
+    fn set_squelch(&mut self, frac: f32) {
+        self.cat.set_squelch(frac);
+    }
+
+    /// True on a family whose squelch sdroxide can address — but only while the
+    /// rig is the one doing the demodulating.
+    ///
+    /// On quadrature it is the wrong gate entirely: the stream is raw baseband,
+    /// sdroxide demodulates it, and the radio's squelch decides nothing but
+    /// what comes out of the radio's own speaker. There the engine's own
+    /// threshold is the honest one, and handing the SQL rail to a control that
+    /// does not reach the audio would be the same fault the other way round.
+    fn commands_squelch(&self) -> bool {
+        self.cat.commands_squelch() && matches!(self.format, SoundFormat::DemodAudio)
     }
 
     // ── Output power ─────────────────────────────────────────────────────────
@@ -893,10 +927,16 @@ impl IqSource for AudioCatSource {
     }
 
     fn tx_write_audio(&mut self, audio: &[f32]) -> Result<()> {
-        let Some((_, producer)) = self.out.as_mut() else {
+        let Some((out, producer)) = self.out.as_mut() else {
             return Ok(()); // no TX audio device — PTT still keyed the rig
         };
-        // Resample 48 kHz → card rate, then interleave to stereo (both channels).
+        // How many copies of each sample the stream expects. Read from the
+        // stream rather than assumed to be two: `start_output` falls back
+        // through its candidate configurations, and on a card that opened mono
+        // a hardcoded pair wrote every sample twice — which is not a louder
+        // over, it is one transmitted at half speed.
+        let channels = usize::from(out.channels.max(1));
+        // Resample 48 kHz → card rate, then write one sample per channel.
         self.tx_scratch.clear();
         match self.tx_resampler.as_mut() {
             Some(rs) => rs.push(audio, &mut self.tx_scratch),
@@ -907,7 +947,7 @@ impl IqSource for AudioCatSource {
         // (e.g. a 110 s SSTV image) is generated at CPU speed and mostly dropped
         // on a full ring, so the radio only transmits the first buffer-full.
         for &s in &self.tx_scratch {
-            for _ in 0..2 {
+            for _ in 0..channels {
                 let mut v = s;
                 let mut tries = 0u32;
                 while let Err(rtrb::PushError::Full(x)) = producer.push(v) {

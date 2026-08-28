@@ -472,17 +472,47 @@ impl BlockSync {
 /// Application identification for RadioText+, from a group 3A.
 const AID_RT_PLUS: u16 = 0x4BD7;
 
-/// Printable text from one RDS character code.
+/// The RDS basic code table (G0), IEC 62106 annex E table E.1, in order from
+/// code 0x20 to 0xff.
 ///
-/// The standard defines its own code table. Its lower half agrees with ASCII,
-/// which is what stations overwhelmingly use, and that part is passed through.
-/// The upper half — the accented and Greek letters — is a table this build does
-/// not reproduce, so those codes become a middle dot rather than a guess. A wrong
-/// letter in a station name is indistinguishable from a decoding fault, and the
-/// dot at least says which one it is.
+/// Its lower half is nearly ASCII but not quite, and the four places it parts
+/// company are the standard's, not typos: 0x24 is the international currency
+/// sign — a dollar is at 0xab — 0x5e a horizontal bar, 0x60 a double vertical
+/// line, 0x7e a macron, and 0x7f is blank. A station that sends ASCII anyway
+/// only ever loses a piece of punctuation by it; reading the table the other way
+/// would lose every accented letter in the upper half, which is what the letters
+/// in a station's own name are made of.
+///
+/// One glyph the published table does not settle: 0x8d is drawn as a sharp s and
+/// read either as ß or as a Greek β. RDS text is words in a language, and only
+/// the German ß ever appears in one, so that is the reading taken here.
+#[rustfmt::skip]
+const RDS_G0: [char; 224] = [
+    ' ', '!', '"', '#', '¤', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
+    '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '―', '_',
+    '‖', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '¯', ' ',
+    'á', 'à', 'é', 'è', 'í', 'ì', 'ó', 'ò', 'ú', 'ù', 'Ñ', 'Ç', 'Ş', 'ß', '¡', 'Ĳ',
+    'â', 'ä', 'ê', 'ë', 'î', 'ï', 'ô', 'ö', 'û', 'ü', 'ñ', 'ç', 'ş', 'ǧ', 'ı', 'ĳ',
+    'ª', 'α', '©', '‰', 'Ǧ', 'ě', 'ň', 'ő', 'π', '€', '£', '$', '←', '↑', '→', '↓',
+    'º', '¹', '²', '³', '±', 'İ', 'ń', 'ű', 'µ', '¿', '÷', '°', '¼', '½', '¾', '§',
+    'Á', 'À', 'É', 'È', 'Í', 'Ì', 'Ó', 'Ò', 'Ú', 'Ù', 'Ř', 'Č', 'Š', 'Ž', 'Ð', 'Ŀ',
+    'Â', 'Ä', 'Ê', 'Ë', 'Î', 'Ï', 'Ô', 'Ö', 'Û', 'Ü', 'ř', 'č', 'š', 'ž', 'đ', 'ŀ',
+    'Ã', 'Å', 'Æ', 'Œ', 'ŷ', 'Ý', 'Õ', 'Ø', 'Þ', 'Ŋ', 'Ŕ', 'Ć', 'Ś', 'Ź', 'Ŧ', 'ð',
+    'ã', 'å', 'æ', 'œ', 'ŵ', 'ý', 'õ', 'ø', 'þ', 'ŋ', 'ŕ', 'ć', 'ś', 'ź', 'ŧ', ' ',
+];
+
+/// Printable text from one RDS character code, through [`RDS_G0`].
+///
+/// Everything below 0x20 is a control code with no glyph in the table. Those
+/// become a middle dot rather than a guess: a station padding with NUL and a
+/// block the error correction let through with a wrong byte look the same from
+/// here, and the dot says the character did not decode.
 fn rds_char(code: u8) -> char {
     match code {
-        0x20..=0x7e => code as char,
+        0x20..=0xff => RDS_G0[(code - 0x20) as usize],
         _ => '·',
     }
 }
@@ -545,6 +575,10 @@ struct Assembler {
     /// Programme identification awaiting a second sighting.
     pi_candidate: Option<u16>,
 
+    /// Extended country code awaiting a second sighting, for the same reason
+    /// the programme identification does — see [`Assembler::group1a`].
+    ecc_candidate: Option<u8>,
+
     /// The five-bit group code group 3A assigned to RadioText+, if any.
     rt_plus_group: Option<u8>,
 }
@@ -564,6 +598,7 @@ impl Assembler {
             ptyn_buf: [b' '; 8],
             ptyn_seen: 0,
             pi_candidate: None,
+            ecc_candidate: None,
             rt_plus_group: None,
         }
     }
@@ -674,14 +709,38 @@ impl Assembler {
         }
     }
 
-    /// Group 1A: the extended country code, which settles RDS versus RBDS.
+    /// Group 1A: the extended country code, accepted only on a second sighting.
+    ///
+    /// The same rule as [`Assembler::programme_id`], and for a sharper reason.
+    /// This byte decides which of two entirely different 32-entry programme-type
+    /// tables the station is read against — 5 is "Education" under one and
+    /// "Rock" under the other — and whether its identity code is spelled out as
+    /// a call sign. It has no redundancy beyond its own block check, it does not
+    /// change while a station is tuned, and a block the corrector repaired is
+    /// trusted like any other.
+    ///
+    /// Accepting it on one sighting is measurable, not theoretical: over a
+    /// minute of a marginal station transmitting nothing but `E0`, the decoder
+    /// published `E0`, `E1` and `92`. Land one of those on a high nibble of
+    /// `0xA` — one chance in sixteen — and the whole window re-labels itself
+    /// RBDS until the next real 1A arrives, which is how a station that never
+    /// moved appears to flip between the two standards.
     fn group1a(&mut self, blocks: [u16; 4], valid: u8) {
         if valid & 0b0100 == 0 {
             return;
         }
         let c = blocks[2];
-        if (c >> 12) & 0x7 == 0 {
-            Self::set(&mut self.data.ecc, Some((c & 0xff) as u8), &mut self.changed);
+        if (c >> 12) & 0x7 != 0 {
+            return;
+        }
+        let ecc = (c & 0xff) as u8;
+        if self.data.ecc == Some(ecc) {
+            return;
+        }
+        if self.ecc_candidate == Some(ecc) {
+            Self::set(&mut self.data.ecc, Some(ecc), &mut self.changed);
+        } else {
+            self.ecc_candidate = Some(ecc);
         }
     }
 
@@ -1257,12 +1316,67 @@ mod tests {
     }
 
     #[test]
-    fn text_is_ascii_and_says_so_when_it_is_not() {
+    fn text_reads_the_standards_code_table() {
         assert_eq!(finish_text(b"ROCK FM "), "ROCK FM");
         assert_eq!(finish_text(b"        "), "");
-        // The upper half of the standard's table is not reproduced, and a dot
-        // says that rather than guessing a letter.
-        assert_eq!(finish_text(&[b'A', 0xE1, b'B']), "A·B");
+        // The upper half is where the accented letters live — the reason a
+        // Nordic or German station's own name used to come out full of dots.
+        assert_eq!(finish_text(&[0x91, 0x97, 0xF1]), "äöå");
+        assert_eq!(finish_text(&[0xD1, 0xD7, 0xE1]), "ÄÖÅ");
+        assert_eq!(finish_text(&[b'S', b't', b'r', b'a', 0x8D, b'e']), "Straße");
+        // Each code is one character, which is what RadioText+ indexes into.
+        assert_eq!(finish_text(&[0x91, b'X']).chars().count(), 2);
+        // The four lower-half codes that are not their ASCII namesakes.
+        assert_eq!(finish_text(&[0x24, 0xAB]), "¤$");
+        // Below 0x20 there is no glyph to read, and a dot says so.
         assert_eq!(finish_text(&[0x00, b'X']), "·X");
+    }
+
+    /// One group 1A, correct in every bit as far as the block layer can tell,
+    /// carrying an extended country code the station never sent.
+    fn group_1a(ecc: u8) -> ([u16; 4], u8) {
+        // Block B: group 1, version A. Block C: variant 0, then the code.
+        ([0xD3C2, 0x1000, ecc as u16, 0], 0b1111)
+    }
+
+    #[test]
+    fn a_single_country_code_does_not_relabel_the_station() {
+        // Issue #173. The extended country code chooses between two entirely
+        // different programme-type tables and decides whether the identity is
+        // spelled out as a call sign, so it is held to the same rule as the
+        // programme identification: seen twice, or not believed. Over a minute
+        // of a marginal station sending nothing but E0, the decoder used to
+        // publish E0, E1 and 92.
+        let mut a = Assembler::new();
+        let (g, valid) = group_1a(0xE0);
+        a.group(g, valid);
+        assert_eq!(a.data.ecc, None, "one sighting is not evidence");
+        a.group(g, valid);
+        assert_eq!(a.data.ecc, Some(0xE0), "the second settles it");
+
+        // And a corrupted one arriving afterwards does not take it away.
+        let (bad, valid) = group_1a(0xA5);
+        a.group(bad, valid);
+        assert_eq!(a.data.ecc, Some(0xE0), "a lone stray does not move a settled code");
+        // Only a code that arrives twice replaces it — a station really can be
+        // retuned onto another that shares the dial.
+        a.group(bad, valid);
+        assert_eq!(a.data.ecc, Some(0xA5));
+    }
+
+    #[test]
+    fn a_country_code_needs_block_c_and_the_right_variant() {
+        let mut a = Assembler::new();
+        // Block C lost: nothing to read, and nothing left half-accepted either.
+        let (g, _) = group_1a(0xE0);
+        a.group(g, 0b1011);
+        a.group(g, 0b1011);
+        assert_eq!(a.data.ecc, None);
+        // Variant 1 puts something else in those bits, not a country code.
+        let mut other = g;
+        other[2] = 0x1000 | 0xE0;
+        a.group(other, 0b1111);
+        a.group(other, 0b1111);
+        assert_eq!(a.data.ecc, None);
     }
 }

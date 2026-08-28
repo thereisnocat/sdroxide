@@ -6,6 +6,8 @@
 
 #include "DrmReceiver.h"
 #include "GlobalDefinitions.h"
+#include "MSC/aacsuperframe.h"
+#include "MSC/xheaacsuperframe.h"
 #include "Parameter.h"
 #include "util/Settings.h"
 #include "sourcedecoders/AudioCodec.h"
@@ -394,6 +396,11 @@ static void status_body(sdrx_drm* h, sdrx_drm_status* out)
             out->bitrate_kbps =
                 double(p.GetBitRateKbps(cur, service.eAudDataFlag != CService::SF_AUDIO));
             out->audio_codec = int32_t(service.AudioParam.eAudioCoding);
+            /* Reads the flags CAudioSourceDecoder's constructor set by asking
+               the codec list what it registered, so it answers for the build
+               and, for xHE-AAC, for whether libfdk-aac was found at run time. */
+            out->audio_codec_supported =
+                h->receiver.GetAudSorceDec()->CanDecode(service.AudioParam.eAudioCoding) ? 1 : 0;
             out->audio_mode = int32_t(service.AudioParam.eAudioMode);
             out->audio_sample_rate = int32_t(service.AudioParam.eAudioSamplRate);
             out->is_stereo = service.AudioParam.eAudioMode == CAudioParam::AM_STEREO ? 1 : 0;
@@ -428,6 +435,101 @@ int32_t sdrx_drm_test_throw(int32_t kind)
     return ok ? 0 : -1;
 }
 
+/* One parser of each kind, kept between calls. The xHE-AAC parser buffers
+   payload across super frames and does its border arithmetic relative to what
+   it is still holding, so a parser rebuilt for every call would never reach
+   half of the code the caller wants to fuzz. */
+static thread_local XHEAACSuperFrame tls_xhe_superframe;
+static thread_local AACSuperFrame tls_aac_superframe;
+
+int32_t sdrx_drm_test_parse_superframe(int32_t kind, int32_t len_part_a,
+                                       int32_t len_part_b, const uint8_t* bytes,
+                                       int32_t len, int32_t* frame_sizes,
+                                       int32_t max_sizes)
+{
+    int32_t frames = -1;
+    const bool ok = sdrx_guard("test parse superframe", [&] {
+        if (len_part_a < 0 || len_part_b < 0 || len < 0)
+        {
+            return;
+        }
+
+        CAudioParam param;
+        ERobMode mode = RM_ROBUSTNESS_MODE_B;
+        AudioSuperFrame* sf = nullptr;
+        switch (kind)
+        {
+        case SDRX_DRM_SF_AAC_12KHZ:
+            param.eAudioSamplRate = CAudioParam::AS_12KHZ;
+            sf = &tls_aac_superframe;
+            break;
+        case SDRX_DRM_SF_AAC_24KHZ:
+            param.eAudioSamplRate = CAudioParam::AS_24KHZ;
+            sf = &tls_aac_superframe;
+            break;
+        case SDRX_DRM_SF_AAC_MODE_E:
+            param.eAudioSamplRate = CAudioParam::AS_24KHZ;
+            mode = RM_ROBUSTNESS_MODE_E;
+            sf = &tls_aac_superframe;
+            break;
+        default:
+            sf = &tls_xhe_superframe;
+            break;
+        }
+
+        if (bytes == nullptr)
+        {
+            if (sf == &tls_xhe_superframe)
+            {
+                /* What CAudioSourceDecoder passes: the two protection parts
+                   together are the super frame. */
+                tls_xhe_superframe.init(param, unsigned(len_part_a + len_part_b));
+            }
+            else
+            {
+                tls_aac_superframe.init(param, mode, unsigned(len_part_a),
+                                        unsigned(len_part_b));
+            }
+            frames = 0;
+            return;
+        }
+
+        /* Dream's parsers read bits, MSB of each byte first. */
+        CVectorEx<_BINARY> asf;
+        asf.Init(len * 8);
+        for (int32_t i = 0; i < len; i++)
+        {
+            for (int b = 0; b < 8; b++)
+            {
+                asf[i * 8 + b] = (bytes[i] >> (7 - b)) & 1;
+            }
+        }
+        asf.ResetBitAccess();
+
+        if (!sf->parse(asf))
+        {
+            frames = -2;
+            return;
+        }
+
+        /* Read every frame back: getFrame indexes what parse() produced, and
+           an index that outruns it is the same class of bug. */
+        std::vector<uint8_t> frame;
+        uint8_t crc = 0;
+        const unsigned n = sf->getNumFrames();
+        for (unsigned i = 0; i < n; i++)
+        {
+            sf->getFrame(frame, crc, i);
+            if (frame_sizes != nullptr && int32_t(i) < max_sizes)
+            {
+                frame_sizes[i] = int32_t(frame.size());
+            }
+        }
+        frames = int32_t(n);
+    });
+    return ok ? frames : -1;
+}
+
 const char* sdrx_drm_codec_version(void)
 {
     /* Per thread, like the codec list it reads and like sdrx_drm_last_error:
@@ -436,10 +538,40 @@ const char* sdrx_drm_codec_version(void)
     if (version.empty())
     {
         /* GetDecoder indexes the codec list, which is empty until a receiver
-           has been built — hence the null check, and hence the guard. */
+           has been built — hence the null check, and hence the guard.
+           Both decoders, not just AAC: the whole point of the xHE-AAC line is
+           that it is absent unless libfdk-aac was found, and a log that only
+           ever names faad2 cannot say so. */
         sdrx_guard("codec version", [&] {
-            CAudioCodec* codec = CAudioCodec::GetDecoder(CAudioParam::AC_AAC, true);
-            version = codec != nullptr ? codec->DecGetVersion() : std::string();
+            const CAudioParam::EAudCod wanted[] = {CAudioParam::AC_AAC,
+                                                   CAudioParam::AC_xHE_AAC};
+            std::string all;
+            for (CAudioParam::EAudCod c : wanted)
+            {
+                CAudioCodec* codec = CAudioCodec::GetDecoder(c, true);
+                if (codec == nullptr)
+                {
+                    continue;
+                }
+                std::string one = codec->DecGetVersion();
+                /* DecGetVersion ends in a newline on the FDK codec. */
+                while (!one.empty() && (one.back() == '\n' || one.back() == '\r'))
+                {
+                    one.pop_back();
+                }
+                if (one.empty())
+                {
+                    continue;
+                }
+                if (!all.empty())
+                {
+                    all += "; ";
+                }
+                all += one;
+            }
+            /* Left empty when the codec list has not been built yet, so the
+               next call tries again rather than caching "nothing". */
+            version = all;
         });
     }
     return version.c_str();

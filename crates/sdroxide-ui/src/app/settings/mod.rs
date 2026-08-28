@@ -385,6 +385,31 @@ pub(in crate::app) fn enum_combo<T: PartialEq + Copy>(
     });
 }
 
+/// The device list an interface draws itself from, where asking for it is
+/// free: a USB enumeration that opens nothing, a sound-card list, or the
+/// SDRplay service's own device table.
+///
+/// `None` for the interfaces with no list (an address is typed, not picked)
+/// and for the three whose enumeration is *not* free — SoapySDR loads every
+/// installed module, LimeSuite opens each board to read its identity, and the
+/// HPSDR / FlexRadio / Pluto scans take seconds on the network. Those stay on
+/// the buttons the operator presses deliberately.
+fn free_device_probe(backend: sdroxide_types::Backend) -> Option<sdroxide_types::DeviceProbe> {
+    use sdroxide_types::{Backend as B, DeviceProbe as P};
+    Some(match backend {
+        B::Cat => P::RadioAudio,
+        B::RtlSdr => P::RtlSdr,
+        B::Rx888 => P::Rx888,
+        B::AirspyHf => P::AirspyHf,
+        B::Airspy => P::Airspy,
+        B::HydraSdr => P::HydraSdr,
+        B::HackRf => P::HackRf,
+        B::SdrPlay => P::SdrPlay,
+        B::Elad => P::Elad,
+        _ => return None,
+    })
+}
+
 impl SdroxideApp {
     /// Ask the machine the radio is attached to a question about its devices.
     ///
@@ -480,6 +505,10 @@ impl SdroxideApp {
             // last scrolled to — the offset is one shared egui memory for all
             // the tabs, and it outlives the process.
             self.settings_scroll_top = true;
+            // ...and asks again for the device list of whatever interface it
+            // opens on: a dongle can be unplugged between one open and the
+            // next.
+            self.iface_probed = None;
             return;
         } else if !self.audio_devices_queried {
             self.audio_devices = self.ctrl.audio_devices();
@@ -510,48 +539,25 @@ impl SdroxideApp {
             {
                 self.ask_device(ctx, sdroxide_types::DeviceProbe::Soapy);
             }
-            // The sound cards the rig itself is wired to, which are the CAT
-            // interface's *device* — on any other backend the audio is in-band
-            // and there is nothing here to choose.
-            if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Cat) {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::RadioAudio);
-            }
             if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Lime) {
                 self.ask_device(ctx, sdroxide_types::DeviceProbe::Lime);
             }
-            // The RSP tab draws itself from the model in this list — which
-            // antenna ports exist, whether there is an HDR path, how far the
-            // LNA goes. Asking the service is one round trip and opens no
-            // device, so it happens on open: without it the tab falls back to
-            // the RSP1B feature set, and an RSPdx owner is left with no
-            // antenna selector until they think to press Rescan.
-            if self
-                .radio_cfg
-                .as_ref()
-                .is_some_and(|c| c.backend == sdroxide_types::Backend::SdrPlay)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::SdrPlay);
-            }
-            // Cheap and opens nothing, same as the RTL-SDR list — and without
-            // it a HackRF owner arriving on this tab sees an empty device combo
-            // until they think to press Rescan.
-            if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::HackRf)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::HackRf);
-            }
-            if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Airspy)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::Airspy);
-            }
-            if self
-                .radio_cfg
-                .as_ref()
-                .is_some_and(|c| c.backend == sdroxide_types::Backend::HydraSdr)
-            {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::HydraSdr);
+            // Whichever interface is configured, its device list — the sound
+            // cards a CAT rig is wired to, the dongles on the bus, the RSPs the
+            // service reports. Every one of these is cheap and opens nothing,
+            // and each tab draws itself from its own list: which antenna ports
+            // exist, whether there is an HDR path, how far the LNA goes. Asked
+            // here so the tab is furnished when it is first looked at, and
+            // remembered so switching *to* another interface asks for that
+            // one's (see below) — a list that never arrived is a tab that
+            // silently falls back to a different model's feature set, which is
+            // issue #165.
+            let applied = self.radio_cfg.as_ref().map(|c| c.backend);
+            self.iface_probed = applied;
+            if let Some(p) = applied.and_then(free_device_probe) {
+                self.ask_device(ctx, p);
             }
             if self.radio_cfg.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Elad) {
-                self.ask_device(ctx, sdroxide_types::DeviceProbe::Elad);
                 // An FDM-DUO's control link is a serial port like any other
                 // rig's, and its transmit audio is a sound card, so this tab
                 // needs both lists the CAT tab needs. The ports are asked for
@@ -1128,15 +1134,27 @@ impl SdroxideApp {
         if pluto_copy_report {
             self.ask_device(ctx, P::Report(R::Pluto));
         }
-        // Switching *to* the CAT interface inside the open dialog: its sound
-        // cards were not among the questions asked when it opened, and the two
-        // pickers are the whole of choosing that interface's device.
-        if radio_edit.as_ref().is_some_and(|c| c.backend == sdroxide_types::Backend::Cat)
-            && self.radio_audio_devices.is_none()
+        // Switching to another interface inside the open dialog: its device
+        // list was not among the questions asked when the dialog opened, and
+        // that list is what its tab draws itself from. Once per switch, not
+        // once per frame — and only the free enumerations, never the ones that
+        // open devices to identify them (SoapySDR, LimeSuite) or scan a
+        // network, which stay on their Rescan buttons.
+        let editing = radio_edit.as_ref().map(|c| c.backend);
+        if editing.is_some()
+            && editing != self.iface_probed
             && self.probes_answered
             && self.probe_waiting == 0
         {
-            self.ask_device(ctx, P::RadioAudio);
+            self.iface_probed = editing;
+            if let Some(p) = editing.and_then(free_device_probe) {
+                self.ask_device(ctx, p);
+            }
+            // The FDM-DUO's second list, for the same reason as on the
+            // dialog-open path above: its transmit audio is a sound card.
+            if editing == Some(sdroxide_types::Backend::Elad) {
+                self.ask_device(ctx, P::RadioAudio);
+            }
         }
         if apply_iface {
             // The fields that wait for this moment, so the radio is never
@@ -3154,9 +3172,9 @@ impl SdroxideApp {
                         RichText::new(if chip.enabled { "ON" } else { "OFF" }).size(11.0),
                     )
                     .on_hover_text(if chip.enabled {
-                        "Switch this radio off: its interface is closed, its settings are kept"
+                        crate::chrome::POWER_OFF_TIP
                     } else {
-                        "Switch this radio on"
+                        crate::chrome::POWER_ON_TIP
                     })
                     .clicked()
                 {
@@ -3168,20 +3186,31 @@ impl SdroxideApp {
                 // The first radio is the station: it runs the shared network
                 // services and the legacy configuration, and it stays.
                 //
-                // On a connection this hangs up and nothing more — the radio at
-                // the other end is closed with **Close on station** below, and
-                // the two say which they are.
-                let closing = if chip.station.is_empty() {
-                    "Close this radio (its configuration is kept)"
-                } else {
-                    "Close this tab — the connection is dropped and the radio stays on its station"
-                };
-                if chip.id != station_id
-                    && crate::chrome::chip(ui, false, RichText::new("×").size(11.0))
-                        .on_hover_text(closing)
-                        .clicked()
-                {
-                    requests.push(crate::app::RadioTabRequest::Close(chip.id));
+                // On one of this machine's own radios "×" closes it, as it
+                // always has. On a *connection* it opens a menu instead,
+                // because there are two things it could mean and they are not
+                // the same thing at all: hanging up leaves the radio where it
+                // is, and closing it on the station takes it out of somebody's
+                // roster. Both live here, where the operator reaches for the
+                // close box — a second button somewhere else is a button that
+                // does not get found (issue #188) — and the second asks again
+                // before it acts, so taking a radio out of a station is still
+                // never one stray click.
+                if chip.id != station_id {
+                    let closing = if chip.station.is_empty() {
+                        "Close this radio (its configuration is kept)"
+                    } else {
+                        "Close this tab, or close the radio on its station"
+                    };
+                    let close = crate::chrome::chip(ui, false, RichText::new("×").size(11.0))
+                        .on_hover_text(closing);
+                    if chip.station.is_empty() {
+                        if close.clicked() {
+                            requests.push(crate::app::RadioTabRequest::Close(chip.id));
+                        }
+                    } else {
+                        Self::close_station_radio_menu(ui, &close, chip, requests);
+                    }
                 }
                 ui.add_space(6.0);
             }
@@ -3197,7 +3226,10 @@ impl SdroxideApp {
             // dongle in here and plugging one in at the remote site.
             match targets.as_slice() {
                 [] => {}
-                [only] => {
+                // One destination, and it is this computer: press and it is
+                // made. Nobody has to be told which machine their own radio
+                // goes on.
+                [only] if only.key.is_empty() => {
                     if crate::chrome::chip(ui, false, RichText::new("+").size(13.0))
                         .on_hover_text(only.hint())
                         .clicked()
@@ -3206,13 +3238,24 @@ impl SdroxideApp {
                             .push(crate::app::RadioTabRequest::Add { station: only.key.clone() });
                     }
                 }
+                // One destination, and it is somebody else's station — which is
+                // every browser client, since a browser has no hardware of its
+                // own and so no second roster to disambiguate against. It still
+                // names the station and asks: creating a radio on a machine at
+                // the other end of a network is not what "+" looks like it
+                // does, and a station that grew radios 2, 3 and 4 nobody meant
+                // to ask for is what that cost (issue #188).
                 many => {
                     // Plain "+", like the single-destination case: the arrow
                     // that would mark it as a menu is not in the text font and
                     // comes out as an empty box. What it opens is a menu, and
                     // the hover text says which rosters are in it.
+                    let tip = match many {
+                        [only] => only.hint(),
+                        _ => "Add a radio — here, or on a station you are connected to".to_string(),
+                    };
                     let btn = crate::chrome::chip(ui, false, RichText::new("+").size(13.0))
-                        .on_hover_text("Add a radio — here, or on a station you are connected to");
+                        .on_hover_text(tip);
                     crate::chrome::menu_popup(ui, &btn, |ui| {
                         for t in many {
                             if ui.button(t.label()).on_hover_text(t.hint()).clicked() {
@@ -3252,44 +3295,60 @@ impl SdroxideApp {
                         requests.push(crate::app::RadioTabRequest::Rename { id: chip.id, name });
                     }
                 }
-                // Closing a radio that lives on another machine. Deliberately
-                // not the "×" on the chip: there, on a connection, "×" means
-                // hang up — and hanging up must never be one stray click away
-                // from taking somebody's radio out of their station. So it sits
-                // here, on the radio actually being looked at, says which
-                // station it will reach, and asks first.
-                //
-                // The station's own first radio is not offered: it holds the
-                // shared network services and the address every client that
-                // knows nothing of a roster arrives at, and the station refuses
-                // to close it.
-                if !chip.station.is_empty() && chip.roster_editable && !chip.first_of_station {
-                    let btn = crate::chrome::chip(
-                        ui,
-                        false,
-                        RichText::new("Close on station").size(11.5),
-                    )
-                    .on_hover_text(format!(
-                        "Take this radio out of {}'s roster — its settings are kept there",
-                        station_label(&chip.station)
-                    ));
-                    crate::chrome::menu_popup(ui, &btn, |ui| {
-                        ui.label(format!(
-                            "Close {} on {}? Its configuration stays on that machine; the tab \
-                             here closes with it.",
-                            chip.display_name(),
-                            station_label(&chip.station)
-                        ));
-                        if ui.button(RichText::new("Close it").strong()).clicked() {
-                            requests.push(crate::app::RadioTabRequest::RemoveFromStation(chip.id));
-                            ui.close();
-                        }
-                    });
-                }
             });
         }
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(6.0);
+    }
+
+    /// What the "×" on a *connection's* chip opens: hang up, or close the radio
+    /// on the station it lives at.
+    ///
+    /// Two answers rather than one, because "close" means two different things
+    /// to a radio on somebody else's machine and neither is obviously the one
+    /// meant. Hanging up is the first entry and acts at once — it is what "×"
+    /// has always done, and it changes nothing anywhere else. Taking the radio
+    /// out of the station's roster is the second, and asks again: it reaches
+    /// across the network, every other client on that station sees it, and its
+    /// device is released.
+    ///
+    /// The station's own first radio is never offered the second: it holds the
+    /// shared network services and the address every client that knows nothing
+    /// of a roster arrives at, and the station refuses to close it.
+    fn close_station_radio_menu(
+        ui: &mut egui::Ui,
+        button: &egui::Response,
+        chip: &crate::app::RadioChip,
+        requests: &mut Vec<crate::app::RadioTabRequest>,
+    ) {
+        let where_ = station_label(&chip.station).to_string();
+        let removable = chip.roster_editable && !chip.first_of_station;
+        crate::chrome::menu_popup(ui, button, |ui| {
+            if ui
+                .button("Close this tab")
+                .on_hover_text(format!("Hang up. The radio stays on {where_}."))
+                .clicked()
+            {
+                requests.push(crate::app::RadioTabRequest::Close(chip.id));
+                ui.close();
+            }
+            if !removable {
+                return;
+            }
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "Close {} on {where_}? Its configuration stays on that machine; the tab here \
+                     closes with it, and so does everyone else's.",
+                    chip.display_name(),
+                ))
+                .size(11.5),
+            );
+            if ui.button(RichText::new(format!("Close it on {where_}")).strong()).clicked() {
+                requests.push(crate::app::RadioTabRequest::RemoveFromStation(chip.id));
+                ui.close();
+            }
+        });
     }
 }

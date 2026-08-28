@@ -374,7 +374,9 @@ fn a_beacon_is_rate_matched_when_the_radio_transmits_at_another_rate() {
 }
 
 /// The transmit audio level reaches the radio, and only where the radio is the
-/// thing doing the modulating.
+/// thing doing the modulating. APRS is FM data, so it is the FM level of the
+/// two — `digi_tx_level::the_sideband_level_is_the_one_a_data_mode_uses` holds
+/// the other end of that.
 ///
 /// On FM that level is the deviation and nothing else sets it: an over that
 /// over-deviates sounds completely normal and decodes for nobody, which is a
@@ -387,7 +389,7 @@ fn the_transmit_audio_level_scales_what_the_radio_is_given() {
             true,
             vec![
                 Command::SetMode { rx: RxId::Main, mode: Mode::Aprs },
-                Command::SetDigiConfig(DigiConfig { tx_audio_level: level, ..station() }),
+                Command::SetDigiConfig(DigiConfig { tx_audio_level_fm: level, ..station() }),
                 Command::AprsBeacon,
             ],
         );
@@ -405,7 +407,7 @@ fn the_transmit_audio_level_scales_what_the_radio_is_given() {
         true,
         vec![
             Command::SetMode { rx: RxId::Main, mode: Mode::Aprs },
-            Command::SetDigiConfig(DigiConfig { tx_audio_level: 0.5, ..station() }),
+            Command::SetDigiConfig(DigiConfig { tx_audio_level_fm: 0.5, ..station() }),
             Command::AprsBeacon,
         ],
     );
@@ -437,4 +439,219 @@ fn measure_headroom() {
             100.0 * at_full as f32 / loud.len() as f32
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The third shape: a radio that takes modulated I/Q.
+// ---------------------------------------------------------------------------
+
+/// Every I/Q sample the transmitter was handed, in order.
+#[derive(Default)]
+struct Radiated {
+    iq: Vec<Complex32>,
+    blocks: usize,
+}
+
+/// A transmitting SDR: quadrature in, quadrature out, half duplex, a zero-IF
+/// LO parked clear of the dial.
+///
+/// A HackRF is this shape, and so is every other SDR that transmits. The engine
+/// modulates for it — `Engine::tx_block_digi`, modulator and DUC — which is a
+/// third path through the transmit side, and the only one nothing above
+/// reaches: both radios above hand the *rig* audio and let it modulate.
+struct TransmittingSdr {
+    heard: Arc<Mutex<Radiated>>,
+    rate: f64,
+    rng: u32,
+}
+
+impl IqSource for TransmittingSdr {
+    fn sample_rate(&self) -> f64 {
+        self.rate
+    }
+    fn center_hz(&self) -> f64 {
+        DIAL_HZ
+    }
+    fn set_center_hz(&mut self, _hz: f64) -> Result<()> {
+        Ok(())
+    }
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        std::thread::sleep(Duration::from_millis(5));
+        let n = buf.len().min(4096);
+        // Noise in both components, as a quadrature front end delivers it: the
+        // packet channel counts its channel-access slots on the receive sample
+        // clock, so a source that hands back nothing is a station that can
+        // never decide to key.
+        for z in &mut buf[..n] {
+            self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let i = (self.rng >> 16) as f32 / 32_768.0 - 1.0;
+            self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let q = (self.rng >> 16) as f32 / 32_768.0 - 1.0;
+            *z = Complex32::new(i * 0.05, q * 0.05);
+        }
+        Ok(n)
+    }
+    fn describe(&self) -> String {
+        "mock transmitting SDR".into()
+    }
+    fn lo_offset_hz(&self) -> f64 {
+        sdroxide_radio::lo_offset_for(self.rate, self.rate * 0.75)
+    }
+    fn tx_begin(&mut self, _center_hz: f64, _rate: f64) -> Result<f64> {
+        Ok(self.rate)
+    }
+    fn tx_write(&mut self, samples: &[Complex32]) -> Result<()> {
+        let mut h = self.heard.lock().unwrap();
+        h.blocks += 1;
+        h.iq.extend_from_slice(samples);
+        Ok(())
+    }
+    fn tx_end(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn sdr_caps() -> DeviceCaps {
+    DeviceCaps {
+        driver: "mock-sdr".into(),
+        label: "mock transmitting SDR".into(),
+        rx_channels: 1,
+        tx_channels: 1,
+        full_duplex: false,
+        freq_ranges_rx: vec![(1_000_000.0, 6_000_000_000.0)],
+        freq_ranges_tx: vec![(1_000_000.0, 6_000_000_000.0)],
+        ..DeviceCaps::default()
+    }
+}
+
+/// Run `cmds` on an APRS station whose radio takes I/Q, and hand back
+/// everything that reached the transmitter.
+fn radiated_for(rate: f64, cmds: Vec<Command>) -> Vec<Complex32> {
+    isolate_config();
+    let heard = Arc::new(Mutex::new(Radiated::default()));
+    let src = TransmittingSdr { heard: Arc::clone(&heard), rate, rng: 0x2345_6789 };
+    let (producer, _consumer) = rtrb::RingBuffer::<f32>::new(48_000);
+    let cfg = EngineConfig {
+        // The shipped default rather than the test-friendly one: an APRS
+        // channel is inside an amateur band, so the lockout has no business
+        // refusing it, and a station whose only radio is an SDR meets that
+        // lockout on every over.
+        tx_ham_only: true,
+        remember_session: false,
+        audio: Some(AudioParams { producer, out_rate: 48_000.0 }),
+        ..Default::default()
+    };
+    let mut h = start_engine(Box::new(src), sdr_caps(), cfg);
+    let thread = h.thread.take();
+    std::thread::sleep(Duration::from_millis(200));
+    for c in cmds {
+        h.cmd_tx.send(c).expect("engine gone");
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut quiet_since: Option<Instant> = None;
+    while Instant::now() < deadline {
+        while h.event_rx.try_recv().is_ok() {}
+        let blocks = heard.lock().unwrap().blocks;
+        std::thread::sleep(Duration::from_millis(50));
+        let after = heard.lock().unwrap().blocks;
+        if after > 0 && after == blocks {
+            match quiet_since {
+                Some(t) if t.elapsed() > Duration::from_millis(250) => break,
+                Some(_) => {}
+                None => quiet_since = Some(Instant::now()),
+            }
+        } else {
+            quiet_since = None;
+        }
+    }
+    let out = std::mem::take(&mut *heard.lock().unwrap());
+    drop(h.cmd_tx);
+    drop(h.event_rx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+    out.iq
+}
+
+/// FM-demodulate radiated I/Q back to audio at `rate / decim`, the way a
+/// receiver on the channel would.
+///
+/// Scaled by the deviation the mode transmits at, so full scale here means
+/// [`sdroxide_dsp::PACKET_DEVIATION_HZ`] and the modem is handed the same
+/// numbers a rig's discriminator would give it. A raw phase step would shrink
+/// with the sample rate instead — 0.002 radians at 10 Msps — and read as a
+/// station that had barely modulated.
+///
+/// The mean is removed because the signal does not sit on the centre of the
+/// span: a carrier offset is a constant term out of a discriminator, and a real
+/// receiver tunes it out.
+fn discriminate(iq: &[Complex32], rate: f64, decim: usize) -> Vec<f32> {
+    let scale = (rate / (std::f64::consts::TAU * sdroxide_dsp::PACKET_DEVIATION_HZ)) as f32;
+    let mut audio: Vec<f32> = Vec::with_capacity(iq.len() / decim);
+    for w in iq.chunks(decim) {
+        let mut acc = 0.0f32;
+        for p in w.windows(2) {
+            acc += (p[1] * p[0].conj()).arg();
+        }
+        audio.push(acc / w.len().max(1) as f32 * scale);
+    }
+    let mean = audio.iter().sum::<f32>() / audio.len().max(1) as f32;
+    for a in &mut audio {
+        *a -= mean;
+    }
+    audio
+}
+
+/// A beacon from the button, through the modulator and the upconverter, off the
+/// transmitter and back through a receiver on the channel.
+fn beacon_over_iq(rate: f64, decim: usize) {
+    let iq = radiated_for(
+        rate,
+        vec![
+            Command::SetMode { rx: RxId::Main, mode: Mode::Aprs },
+            Command::SetDigiConfig(station()),
+            Command::AprsBeacon,
+        ],
+    );
+    let msps = rate / 1e6;
+    assert!(!iq.is_empty(), "{msps} Msps: nothing reached the transmitter at all");
+    let secs = iq.len() as f32 / rate as f32;
+    assert!(secs > 0.5, "{msps} Msps: the over was only {secs:.3} s");
+
+    let audio = discriminate(&iq, rate, decim);
+    let frames = frames_in_at(&audio, rate / decim as f64);
+    assert_eq!(
+        frames.len(),
+        1,
+        "{msps} Msps: {secs:.3} s went out and {} frames came back",
+        frames.len()
+    );
+    let p = Packet::parse(&frames[0], None).expect("the frame does not parse");
+    assert_eq!(p.src().call(), "OE3JJS");
+}
+
+/// The whole transmit path on a radio that takes I/Q, at the rate a HackRF
+/// comes up on.
+#[test]
+fn a_beacon_reaches_a_transmitting_sdr() {
+    beacon_over_iq(2_000_000.0, 40);
+}
+
+/// Issue #180: the same station on a wider sample rate put nothing on the air
+/// that anyone could read.
+///
+/// 10 Msps is not incidental. The decimation chain lands the channel on
+/// 44642.857 Hz there — 37.2 samples to a 1200 baud bit, where 48 kHz gives
+/// exactly 40 — and the transmit modem was rounding every bit up to a whole
+/// sample. The over went out at 1174.8 baud, 2.1 % slow, which is past what a
+/// receiver's clock recovery will follow: a transmission that looked perfect on
+/// a spectrum display and decoded for nobody.
+///
+/// Every rate whose channel works out to a whole number of samples a bit still
+/// passed throughout, which is why a sound card never showed this and the test
+/// above would not have caught it.
+#[test]
+fn a_beacon_survives_a_channel_rate_that_is_not_whole_samples_a_bit() {
+    beacon_over_iq(10_000_000.0, 200);
 }

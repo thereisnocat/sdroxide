@@ -31,7 +31,9 @@
 
 #include "AudioCodec.h"
 #include <fdk-aac/aacdecoder_lib.h>
-#include <fdk-aac/aacenc_lib.h>
+#ifndef SDROXIDE_NO_AAC_ENCODER
+# include <fdk-aac/aacenc_lib.h>
+#endif
 
 class FdkAacCodec : public CAudioCodec
 {
@@ -57,7 +59,9 @@ public:
     virtual std::string fileName(const CParameter& Parameters) const;
 protected:
     HANDLE_AACDECODER hDecoder;
+#ifndef SDROXIDE_NO_AAC_ENCODER
     HANDLE_AACENCODER hEncoder;
+#endif
     bool bUsac;
     int16_t decode_buf[13840];
 };

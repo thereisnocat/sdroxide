@@ -132,6 +132,10 @@ impl<'a> Speaker<'a> {
             Mode::Rtty => "ritty",
             Mode::Hell => "hell",
             Mode::Sstv => "S S T V",
+            // Which radio it is on matters here as much as the picture does,
+            // so it is said rather than spelt at: "S S T V F M" run together
+            // is a fifth and sixth letter of the mode's name.
+            Mode::SstvFm => "S S T V on F M",
             Mode::Olivia => "olivia",
             Mode::Thor => "thor",
             Mode::Fsq => "F S Q",
@@ -147,6 +151,7 @@ impl<'a> Speaker<'a> {
             // Pronounced "whisper" — the joke the name is built on.
             Mode::Wspr => "whisper",
             Mode::Drm => "D R M",
+            Mode::Adsb => "A D S B",
         }
     }
 

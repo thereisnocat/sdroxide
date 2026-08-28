@@ -620,9 +620,9 @@ impl MultiApp {
                             RichText::new(if tab.enabled { "ON" } else { "OFF" }).size(11.0),
                         );
                         let tip = if tab.enabled {
-                            "Switch this radio off: its interface is closed, its settings are kept"
+                            crate::chrome::POWER_OFF_TIP
                         } else {
-                            "Switch this radio on"
+                            crate::chrome::POWER_ON_TIP
                         };
                         if power.on_hover_text(tip).clicked() {
                             actions.push(StripAction::Power { id, on: !tab.enabled });
@@ -1062,8 +1062,30 @@ impl eframe::App for MultiApp {
                 // by itself. A station asks each of its radios separately, so
                 // without this the tabs behind the one on screen would each
                 // wait at a challenge nobody is looking at.
-                tab.app.poll_auth();
+                //
+                // A tab waiting its turn — the station judges one sign-in at a
+                // time — needs the frames to take it: nothing arrives on its
+                // own socket while it waits, so without this it would sit at
+                // the challenge until something else happened to redraw.
+                if tab.app.poll_auth() {
+                    crate::repaint::after_ms(&ctx, 120);
+                }
             }
+        }
+        // A link that has dropped is redialled here rather than on the error
+        // screen, for the same reason: the screen belongs to one tab, and a
+        // station's other radios have nobody looking at them to press anything.
+        // Every tab is asked, the one on screen included — its own frame draws
+        // the countdown but does not drive it.
+        //
+        // The clock is what releases these, so a window with nothing else
+        // happening in it has to be woken to let them go.
+        let mut waiting = false;
+        for tab in &mut self.tabs {
+            waiting |= tab.app.poll_reconnect();
+        }
+        if waiting {
+            crate::repaint::after_ms(&ctx, 250);
         }
         // Publish the roster before the frame (the settings dialog draws it),
         // act on what the strips and the dialogs asked for after it. Which

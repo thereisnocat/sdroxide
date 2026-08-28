@@ -8,6 +8,11 @@
 //! in that order and nothing says what happens if it is not; a driver written
 //! against a device nobody has is not the place to find out. [`Device::open`]
 //! is therefore one function rather than a set of setters the caller sequences.
+//!
+//! The samplers differ in one place and it is the last step: their FIFO is
+//! started by [`Device::start_pending`] from the stream thread, once the bulk
+//! transfers are already queued. That is the order of the only driver anybody
+//! has streamed an FDM-S2 with, and the reverse of `gr-elad`'s. See issue #178.
 
 use sdroxide_types::EladConfig;
 
@@ -41,13 +46,41 @@ pub struct Device {
     /// Warnings gathered at open that the operator should see rather than have
     /// to find in a log — a slow USB port, a calibration that would not read.
     pub warnings: Vec<String>,
+    /// Whether the FIFO has been started yet. See [`Device::start_pending`].
+    started: bool,
     trace: Trace,
 }
 
 impl Device {
     /// Open the device named by `cfg`, configure it, and leave it streaming.
     pub fn open(cfg: &EladConfig, center_hz: f64, trace: &Trace) -> Result<Device> {
-        let usb = UsbDev::open(&cfg.serial, trace)?;
+        let mut usb = UsbDev::open(&cfg.serial, trace)?;
+
+        // A sampler's down-converter does not exist until its FPGA is loaded,
+        // and nothing below would notice: the bridge answers out of its EEPROM,
+        // so the whole sequence that follows succeeds against an empty FPGA and
+        // the bulk endpoint then stays silent for ever (issue #178). The image
+        // also *is* the sample rate, which is why this is the one place
+        // `sample_rate_hz` is a command rather than a description.
+        //
+        // The device is claimed first and let go again rather than the other way
+        // round: the model decides whether any of this applies, and it is the
+        // product id of the device the configured serial actually picked — not
+        // of whatever else is on the bus.
+        let mut fpga_warning = None;
+        match crate::fpga::wanted(usb.model(), cfg.sample_rate_hz) {
+            crate::fpga::Load::NotNeeded => {}
+            crate::fpga::Load::Unavailable(w) => fpga_warning = Some(w),
+            crate::fpga::Load::Run(run) => {
+                // ELAD's loader claims the interface itself, so ours has to be
+                // gone before it starts.
+                drop(usb);
+                if let Err(w) = run.execute(trace) {
+                    fpga_warning = Some(w);
+                }
+                usb = crate::fpga::reclaim(&cfg.serial, trace)?;
+            }
+        }
         let model = usb.model();
 
         let mut dev = Device {
@@ -62,11 +95,18 @@ impl Device {
             hw_version: None,
             firmware: None,
             warnings: Vec::new(),
+            started: false,
             trace: trace.clone(),
         };
 
         dev.identify();
         dev.read_calibration();
+
+        if let Some(w) = fpga_warning {
+            tracing::warn!("{w}");
+            dev.trace.note(&w);
+            dev.warnings.push(w);
+        }
 
         if let Some(w) = dev.usb.link_too_slow_for(dev.rate_hz) {
             tracing::warn!("{w}");
@@ -82,7 +122,13 @@ impl Device {
         }
         dev.retune()?;
         dev.apply_front_end()?;
-        dev.start()?;
+        // On the FDM-DUO the start belongs here, at the end of the sequence
+        // `gr-elad` performs. On a sampler it is deliberately left until the
+        // host is already reading — see `start_pending`.
+        if model == Model::Duo {
+            dev.start()?;
+            dev.started = true;
+        }
 
         tracing::info!(
             "opened {} (usb {:04x}:{:04x}, serial {}, {}) at {} Hz",
@@ -245,6 +291,29 @@ impl Device {
             1,
         )?;
         expect_ack("front-end setting", Request::SamplerFrontEnd.code(), &reply)
+    }
+
+    /// Start the FIFO if the open did not, and say nothing if it did.
+    ///
+    /// The samplers are started here, from the stream thread, *after* the bulk
+    /// transfers are already queued — which is the order the one driver
+    /// verified against a real FDM-S2 uses, and the opposite of the order
+    /// `gr-elad` uses. Starting first leaves the device pushing into a FIFO
+    /// nobody is emptying for as long as it takes to submit sixteen transfers;
+    /// at 6144 kHz that is longer than the bridge's own buffering, and there is
+    /// no evidence about what ELAD's FPGA does when it overruns on its very
+    /// first block.
+    ///
+    /// The transceiver is not changed: it initialises its FIFO explicitly, its
+    /// sequence is the one `gr-elad` documents, and it is the only model anybody
+    /// has streamed from here.
+    pub fn start_pending(&mut self) -> Result<()> {
+        if self.started {
+            return Ok(());
+        }
+        self.start()?;
+        self.started = true;
+        Ok(())
     }
 
     /// Start the sample FIFO. The device echoes `0xE9`.

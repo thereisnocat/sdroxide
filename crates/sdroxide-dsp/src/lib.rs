@@ -1,3 +1,4 @@
+mod adc;
 pub mod afsk;
 mod agc;
 mod ctcss;
@@ -45,6 +46,7 @@ mod wbspectrum;
 pub mod wefax;
 mod window;
 
+pub use adc::AdcMeter;
 pub use afsk::{AFSK_TX_PEAK, AfskProfile, AfskRx, AfskTx};
 pub use agc::Agc;
 pub use ctcss::{SubToneDetect, golay23_decode, golay23_encode};
@@ -62,7 +64,7 @@ pub use g3ruh::{G3RUH_TX_PEAK, G3ruhRx, G3ruhTx, Scrambler};
 pub use hell::{HELL_CELL_COLS, HELL_ROWS, HellRx, HellTx, render_columns as hell_columns};
 pub use interp::{Duc, HalfbandInterp};
 pub use iqcorrect::IqCorrect;
-pub use modulator::{Modulator, SsbMod, make_modulator};
+pub use modulator::{Modulator, PACKET_DEVIATION_HZ, SsbMod, make_modulator};
 pub use nb::NoiseBlanker;
 pub use nco::Nco;
 pub use nnr::NeuralNr;

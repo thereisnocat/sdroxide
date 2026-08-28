@@ -106,6 +106,10 @@ fn is_dial_frame(frame: &str) -> bool {
 /// Throughput and health accounting.
 pub(crate) struct RxStats {
     nominal_hz: f64,
+    /// Which ELAD this is, for the one message whose remedy depends on it: a
+    /// sampler's rate is an FPGA image sdroxide loads, and the transceiver's is
+    /// whatever mode it was left in.
+    model: Model,
     /// When the first sample arrived, and the sample count since then.
     ///
     /// Deliberately *not* the thread start: identifying and configuring the
@@ -132,9 +136,10 @@ pub(crate) struct RxStats {
 }
 
 impl RxStats {
-    pub(crate) fn new(nominal_hz: f64) -> RxStats {
+    pub(crate) fn new(nominal_hz: f64, model: Model) -> RxStats {
         RxStats {
             nominal_hz,
+            model,
             first_iq: None,
             since: Instant::now(),
             win_samples: 0,
@@ -218,12 +223,16 @@ impl RxStats {
 
     /// Check the stream's real rate against the one it is being read as, once.
     ///
-    /// This exists because nothing this driver knows how to send programs the
-    /// DDC's decimation: the configured rate is a guess at the state the device
-    /// was left in, and the throughput is the only evidence available either
-    /// way. A guess that is wrong is not subtle — the rates are octaves apart —
-    /// but it is *silent*, because a stream read at the wrong rate is still a
-    /// perfectly healthy-looking panadapter of the wrong width.
+    /// The throughput is the only evidence there is either way, and a mismatch
+    /// is not subtle — the rates are octaves apart — but it *is* silent,
+    /// because a stream read at the wrong rate is still a perfectly
+    /// healthy-looking panadapter of the wrong width.
+    ///
+    /// What a disagreement means depends on the model. On a sampler the rate is
+    /// which FPGA image [`crate::fpga`] loaded, so the two can only differ if
+    /// the load did not happen or did not take. On an FDM-DUO nothing sdroxide
+    /// can send programs the decimation at all, so the configured rate is a
+    /// guess at the state the radio was left in.
     ///
     /// Returns a sentence for the operator when the two disagree.
     pub(crate) fn check_rate(&mut self, trace: &Trace) -> Option<String> {
@@ -251,14 +260,28 @@ impl RxStats {
                 d(*a).partial_cmp(&d(*b)).unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap_or(sdroxide_types::ELAD_DEFAULT_RATE_HZ);
+        let remedy = if self.model.needs_fpga_load() {
+            format!(
+                "the rate is decided by which FPGA image is loaded, so either ELAD's \
+                 `{}` loader did not run or it loaded a different one — set the sample \
+                 rate in Settings → Radio to {:.0} kHz to match what is in the device, \
+                 or check the loader.",
+                crate::fpga::LOADER,
+                nearest as f64 / 1000.0,
+            )
+        } else {
+            format!(
+                "nothing sdroxide can send changes this radio's decimation, so set the \
+                 sample rate in Settings → Radio to {:.0} kHz to match (or use ELAD's own \
+                 software once to put the device in the mode you want).",
+                nearest as f64 / 1000.0,
+            )
+        };
         Some(format!(
             "the stream is arriving at about {:.0} kHz but is being read as {:.0} kHz — \
-             the device is most likely in its {:.0} kHz mode. Nothing sdroxide can send \
-             changes the decimation, so set the sample rate in Settings → Radio to {:.0} kHz \
-             to match (or use ELAD's own software once to put the device in the mode you want).",
+             the device is most likely in its {:.0} kHz mode. {remedy}",
             measured / 1000.0,
             self.nominal_hz / 1000.0,
-            nearest as f64 / 1000.0,
             nearest as f64 / 1000.0,
         ))
     }
@@ -643,7 +666,7 @@ mod tests {
     #[test]
     fn push_iq_drops_whole_blocks_rather_than_splitting_a_pair() {
         let (mut prod, mut cons) = RingBuffer::<f32>::new(8);
-        let mut stats = RxStats::new(192_000.0);
+        let mut stats = RxStats::new(192_000.0, Model::Duo);
         push_iq(&mut prod, &[1.0, 2.0, 3.0, 4.0], &mut stats, false);
         assert_eq!(cons.slots(), 4);
         // Six more floats into four free slots: nothing goes in.
@@ -653,11 +676,12 @@ mod tests {
         assert_eq!(cons.pop(), Ok(1.0));
     }
 
-    /// The rate cannot be commanded, so this check is the only thing standing
-    /// between an operator and a panadapter that is quietly the wrong width.
+    /// On a transceiver the rate cannot be commanded at all, so this check is
+    /// the only thing standing between an operator and a panadapter that is
+    /// quietly the wrong width.
     #[test]
     fn a_rate_that_disagrees_with_the_stream_is_reported_once_and_named() {
-        let mut s = RxStats::new(192_000.0);
+        let mut s = RxStats::new(192_000.0, Model::Duo);
         // Nothing to say before any samples have arrived.
         let t = Trace::new();
         assert_eq!(s.check_rate(&t), None);
@@ -673,9 +697,27 @@ mod tests {
         assert_eq!(s.check_rate(&t), None);
     }
 
+    /// A sampler's rate *is* a command — it is which FPGA image was loaded — so
+    /// it must not be sent after ELAD's Windows software the way the
+    /// transceiver's is.
+    #[test]
+    fn a_sampler_is_pointed_at_the_loader_rather_than_at_windows() {
+        let mut s = RxStats::new(192_000.0, Model::S2);
+        s.first_iq = Some(Instant::now() - Duration::from_secs(4));
+        s.total_samples = 384_000 * 4;
+        let msg = s.check_rate(&Trace::new()).expect("a doubled rate has to be reported");
+        assert!(msg.contains(crate::fpga::LOADER), "{msg}");
+
+        let mut duo = RxStats::new(192_000.0, Model::Duo);
+        duo.first_iq = Some(Instant::now() - Duration::from_secs(4));
+        duo.total_samples = 384_000 * 4;
+        let msg = duo.check_rate(&Trace::new()).expect("a doubled rate has to be reported");
+        assert!(!msg.contains(crate::fpga::LOADER), "{msg}");
+    }
+
     #[test]
     fn a_rate_that_agrees_within_tolerance_says_nothing() {
-        let mut s = RxStats::new(192_000.0);
+        let mut s = RxStats::new(192_000.0, Model::Duo);
         s.first_iq = Some(Instant::now() - Duration::from_secs(4));
         // 3% slow: a busy machine, not a wrong setting.
         s.total_samples = (192_000.0 * 4.0 * 0.97) as u64;
@@ -689,7 +731,7 @@ mod tests {
     #[test]
     fn a_full_ring_while_paused_is_not_an_overrun() {
         let (mut prod, mut cons) = RingBuffer::<f32>::new(4);
-        let mut stats = RxStats::new(192_000.0);
+        let mut stats = RxStats::new(192_000.0, Model::Duo);
 
         push_iq(&mut prod, &[1.0, 2.0, 3.0, 4.0], &mut stats, true);
         // The over: nobody is draining, so everything after this is discarded.

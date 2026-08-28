@@ -52,6 +52,11 @@ typedef struct {
     int32_t cur_service;
     double  bitrate_kbps;
     int32_t audio_codec;         /* CAudioParam::EAudCod */
+    /* 1 when this build can actually decode `audio_codec`. Dream substitutes a
+       null codec for anything it cannot, which gives a locked receiver, a
+       service label, a text message and silence - a state no other field here
+       distinguishes from an audio decode that is merely failing. */
+    int32_t audio_codec_supported;
     int32_t audio_mode;          /* mono / p-stereo / stereo */
     int32_t audio_sample_rate;
     int32_t is_stereo;
@@ -130,6 +135,42 @@ const char* sdrx_drm_last_error(void);
  * aborts the process. Exists only for the test of that property.
  * 0 = std::bad_alloc, 1 = CGenErr, 2 = std::string, 3 = const char*, else int. */
 int32_t sdrx_drm_test_throw(int32_t kind);
+
+/* Which of Dream's audio super frame parsers `sdrx_drm_test_parse_superframe`
+   drives, and with what the receiver would have configured it. */
+#define SDRX_DRM_SF_XHE_AAC   0  /* xHE-AAC, any robustness mode */
+#define SDRX_DRM_SF_AAC_12KHZ 1  /* AAC, modes A-D at 12 kHz: 5 frames */
+#define SDRX_DRM_SF_AAC_24KHZ 2  /* AAC, modes A-D at 24 kHz: 10 frames */
+#define SDRX_DRM_SF_AAC_MODE_E 3 /* AAC, mode E at 24 kHz: 5 frames */
+
+/* Drive one audio super frame parser directly, with no receiver around it, so
+ * a test can throw corrupt headers and directories at it the way a fading
+ * broadcast does. The parsers work on lengths the broadcast itself supplies and
+ * are reached long before any CRC has vouched for them, which is what makes
+ * them worth fuzzing on their own.
+ *
+ * `bytes == NULL` (re)initialises the parser named by `kind` for a stream of
+ * `len_part_a` + `len_part_b` byte super frames, and returns 0. Otherwise
+ * `bytes`/`len` is one super frame to parse, and the return is the number of
+ * audio frames it yielded - each of which is also read back out, so the frame
+ * accessor is covered too. A rejected super frame is -2 and a call that threw
+ * is -1; a healthy broadcast never sees either, noise sees -2 constantly.
+ *
+ * The parsers carry payload between super frames, so successive calls
+ * accumulate until the next initialisation. One parser of each kind per thread.
+ *
+ * `frame_sizes`, when not NULL, receives the length of each of the first
+ * `max_sizes` audio frames. The count alone cannot tell a correct framing from
+ * a misaligned one - both yield one frame per declared border - so the sizes
+ * are what pins where the borders actually fell.
+ *
+ * Exists only for the test that a corrupt super frame cannot take the process
+ * down, and for the test that the frame borders land where the standard puts
+ * them. */
+int32_t sdrx_drm_test_parse_superframe(int32_t kind, int32_t len_part_a,
+                                       int32_t len_part_b, const uint8_t* bytes,
+                                       int32_t len, int32_t* frame_sizes,
+                                       int32_t max_sizes);
 
 #ifdef __cplusplus
 }

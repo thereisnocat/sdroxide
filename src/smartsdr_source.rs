@@ -18,25 +18,54 @@ use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
 use sdroxide_smartsdr::{FlexHandle, FlexUpdate};
 use sdroxide_types::TxTelemetry;
 
-/// The last session's trace, kept after the source is dropped.
-///
-/// A connection that fails or misbehaves is usually replaced immediately — by
-/// the engine's background retry, or by the operator pressing Apply — and the
-/// trace of the *interesting* session would go with it. Holding the most recent
-/// one here is what lets Settings → Radio still offer it afterwards.
-static LAST_TRACE: Mutex<Option<String>> = Mutex::new(None);
+use crate::session_trace::TraceStore;
 
-/// The most recent SmartSDR session trace, for a bug report.
-pub fn last_diagnostics() -> Option<String> {
-    LAST_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+/// The last session's trace of each radio, kept after the source is dropped.
+/// See [`crate::session_trace`] — including why there is one per radio rather
+/// than one for the process.
+static TRACES: TraceStore = TraceStore::new();
+
+/// Radios that have thrown one of our sessions off for a duplicate GUI client
+/// id, keyed the same way as [`TRACES`].
+///
+/// The engine reconnects a dead source on its own ([`IqSource::needs_reopen`]),
+/// and reconnecting under the id we were just evicted over does not recover the
+/// session — it evicts whoever took it, who reconnects and evicts us back. Two
+/// sdroxide windows, or one that overlapped its own reconnect, then trade the
+/// radio forever at a few seconds a turn.
+///
+/// So the eviction is remembered for the life of the process and the next
+/// connection to that radio goes out under a transient identity, which nobody
+/// can be holding. The cost is the radio's slice restore, which an operator who
+/// wants it back can buy with an explicit `gui_client_id` in the config.
+static EVICTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn evicted_here(key: &str) -> bool {
+    EVICTED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| k == key)
 }
 
-fn record_trace(trace: &sdroxide_smartsdr::Trace) {
-    *LAST_TRACE.lock().unwrap_or_else(|e| e.into_inner()) = Some(trace.dump());
+fn remember_eviction(key: &str) {
+    let mut list = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+    if !list.iter().any(|k| k == key) {
+        list.push(key.to_string());
+    }
+}
+
+/// Which FlexRadio a session was with: the address it was dialled at, the one
+/// thing both the source and the tab asking for the report can spell.
+fn session_key(cfg: &sdroxide_types::SmartSdrConfig) -> String {
+    cfg.target().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+fn record_trace(key: &str, trace: &sdroxide_smartsdr::Trace) {
+    TRACES.record(key, trace.dump());
 }
 
 pub struct SmartSdrSource {
     handle: FlexHandle,
+    /// Which radio this session is with, for [`TRACES`] — see the field of the
+    /// same name on [`crate::icomnet_source::IcomNetSource`].
+    key: String,
     center: f64,
     scratch: Vec<f32>,
     label: String,
@@ -66,17 +95,39 @@ impl SmartSdrSource {
             })?
             .to_string();
 
-        let handle =
-            FlexHandle::connect(&address, cfg.iq_sample_rate_hz, cfg.iq_channel, &cfg.station)?;
+        let key = session_key(cfg);
+        let handle = FlexHandle::connect_with(&sdroxide_smartsdr::ConnectOptions {
+            address: address.clone(),
+            iq_rate_hz: cfg.iq_sample_rate_hz,
+            iq_channel: cfg.iq_channel,
+            station: cfg.station.clone(),
+            client_id: cfg.gui_client_id.clone(),
+            transient_identity: evicted_here(&key),
+            network_mtu: cfg.network_mtu,
+        })?;
         let trace = handle.trace.clone();
 
-        // The radio creates every DAX IQ stream at 48 kHz and only moves on a
-        // follow-up command; if it refused that, the engine would run its whole
-        // DSP chain at a rate the samples are not arriving at, which sounds like
-        // a badly detuned receiver rather than like an error. Say so instead.
         let mut warning = None;
         let actual = wait_for_rate(&handle, cfg.iq_sample_rate_hz);
-        if (actual - cfg.iq_sample_rate_hz).abs() > 1.0 {
+
+        // Nothing at all is a different fault from the wrong rate, and it is the
+        // one an operator can act on: the control link is up (we got this far),
+        // so what is missing is the radio's UDP reaching us. Naming the port it
+        // was told to use is the difference between "it doesn't work" and a
+        // firewall rule.
+        if handle.trace.stream_counters().is_empty() {
+            warning = Some(format!(
+                "connected, but no VITA-49 data has arrived from the radio. \
+                 Its spectrum rides UDP, which the control link does not — check that \
+                 UDP from {address} can reach this machine (host firewall, VPN, or a \
+                 router between the two)."
+            ));
+            tracing::warn!(target: "smartsdr", "{}", warning.as_deref().unwrap_or(""));
+        } else if (actual - cfg.iq_sample_rate_hz).abs() > 1.0 {
+            // The radio creates every DAX IQ stream at 48 kHz and only moves on a
+            // follow-up command; if it refused that, the engine would run its whole
+            // DSP chain at a rate the samples are not arriving at, which sounds like
+            // a badly detuned receiver rather than like an error. Say so instead.
             warning = Some(format!(
                 "the radio is streaming {:.0} kHz IQ, not the {:.0} kHz requested — \
                  DAX IQ channel {} may be shared, or the radio declined the rate",
@@ -99,6 +150,7 @@ impl SmartSdrSource {
             scratch: Vec::new(),
             label,
             handle,
+            key,
             if_offset: 0.0,
             last_telem: None,
             trace,
@@ -130,7 +182,7 @@ fn wait_for_rate(handle: &FlexHandle, requested: f64) -> f64 {
 
 impl Drop for SmartSdrSource {
     fn drop(&mut self) {
-        record_trace(&self.trace);
+        record_trace(&self.key, &self.trace);
     }
 }
 
@@ -247,8 +299,18 @@ impl IqSource for SmartSdrSource {
     /// The control thread stops when the radio closes the TCP session (powered
     /// off, or another client evicted ours); the engine then reconnects on its
     /// own.
+    ///
+    /// An eviction is filed on the way past. The engine's retry has no idea why
+    /// the session ended, and reconnecting under an id we were just thrown off
+    /// for would only start the trade again — see [`EVICTED`].
     fn needs_reopen(&self) -> bool {
-        !self.handle.is_alive()
+        if self.handle.is_alive() {
+            return false;
+        }
+        if self.handle.evicted_for_duplicate_id() {
+            remember_eviction(&self.key);
+        }
+        true
     }
 
     fn set_if_offset(&mut self, hz: f64) {
@@ -265,7 +327,7 @@ impl IqSource for SmartSdrSource {
     /// reconnect that raced its own predecessor for channel 1 would fail with
     /// "channel in use" against a stream we ourselves had just abandoned.
     fn release(&mut self) {
-        record_trace(&self.trace);
+        record_trace(&self.key, &self.trace);
         self.handle.tx_end();
     }
 }
@@ -287,12 +349,14 @@ pub fn discover() -> Vec<sdroxide_types::SmartSdrDevice> {
         .collect()
 }
 
-/// Shared with the settings UI's "Copy diagnostic report" button.
-pub fn diagnostics_or_hint() -> String {
-    match last_diagnostics() {
+/// Shared with the settings UI's "Copy diagnostic report" button: the trace of
+/// the radio *this* configuration names, never another one's.
+pub fn diagnostics_or_hint(cfg: &sdroxide_types::SmartSdrConfig) -> String {
+    match TRACES.get(&session_key(cfg)) {
         Some(t) => format!("{t}\n{}\n", sdroxide_smartsdr::FIELD_REPORT_HINT),
         None => format!(
-            "No SmartSDR session has run yet — connect to a radio first.\n\n{}\n",
+            "No SmartSDR session has run yet for {} — connect to that radio first.\n\n{}\n",
+            cfg.target().unwrap_or("this radio"),
             sdroxide_smartsdr::FIELD_REPORT_HINT
         ),
     }

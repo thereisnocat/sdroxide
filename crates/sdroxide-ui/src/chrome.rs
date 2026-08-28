@@ -584,6 +584,31 @@ pub fn menu_caption(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text.to_uppercase()).color(theme::CYAN_DIM()).size(9.5).strong());
 }
 
+/// A captioned box around a run of related controls — the caption
+/// [`menu_caption`] would have drawn on its own, plus a hairline border around
+/// exactly what it names. A popup that covers two subjects then reads as two
+/// subjects rather than as one long list.
+///
+/// `width` is the content width, and every group in the same popup is given
+/// the same one so the boxes come out matching whatever each holds. It is
+/// pinned as both the minimum and the maximum for the reason [`angled_frame`]
+/// gives: a `Frame` auto-sizes by measuring its content with unbounded width,
+/// and a `horizontal_wrapped` row measured that way never wraps.
+pub fn menu_group<R>(ui: &mut Ui, title: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(theme::ROW_BG())
+        .stroke(Stroke::new(1.0, theme::LINE()))
+        .corner_radius(window_corner_radius())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            menu_caption(ui, title);
+            add(ui)
+        })
+        .inner
+}
+
 /// Small L-shaped corner accents (page decoration, reference-style).
 pub fn corner_brackets(p: &Painter, rect: Rect, color: Color32) {
     let len = 16.0;
@@ -1342,6 +1367,23 @@ impl Accent {
 pub fn chip(ui: &mut Ui, selected: bool, text: impl Into<RichText>) -> Response {
     chip_impl(ui, selected, text.into(), None, Sense::click(), None)
 }
+
+/// What sdroxide's own power switch does, in the one place all three of its
+/// homes read it from: the frequency box, the tab strip and the settings
+/// roster.
+///
+/// It says what is let go of, because the alternative reading — that this is
+/// the rig's own power button — is a fair guess and a wrong one, and an
+/// operator who believed it would think a radio that is still connected had
+/// been switched off (issue #169).
+pub const POWER_OFF_TIP: &str = "Switch this radio off: sdroxide lets its interface go — the \
+     device released, a CAT port closed, a network session hung up — so it can neither receive \
+     nor transmit. Its settings are kept. This is sdroxide's switch, not the rig's: the radio \
+     itself stays powered.";
+
+/// The other half of [`POWER_OFF_TIP`].
+pub const POWER_ON_TIP: &str =
+    "Switch this radio on: its interface is opened again, where it was left";
 
 /// A chip carrying the IEC power symbol (⏻) instead of a label, at an exact
 /// size. The symbol is painted, not typed: no bundled font has U+23FB, so as

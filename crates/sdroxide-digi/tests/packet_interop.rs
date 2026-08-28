@@ -356,7 +356,7 @@ fn the_codec_parses_direwolfs_frames() {
     // Both are UI frames — Direwolf's `gen_packets` sends APRS-style unproto.
     let first = sdroxide_ax25::Packet::parse(&frames[0], Some(false)).expect("parsing frame 1");
     match first.packet_type() {
-        sdroxide_ax25::PacketType::Ui(ui) => {
+        PacketType::Ui(ui) => {
             assert_eq!(ui.payload, b"Hello from sdroxide packet\n");
             assert_eq!(ui.pid, 0xF0, "no layer 3");
         }
@@ -368,7 +368,7 @@ fn the_codec_parses_direwolfs_frames() {
     // mangle frame 2.
     let second = sdroxide_ax25::Packet::parse(&frames[1], Some(false)).expect("parsing frame 2");
     match second.packet_type() {
-        sdroxide_ax25::PacketType::Ui(ui) => {
+        PacketType::Ui(ui) => {
             assert_eq!(ui.payload, b"=4812.00N/01620.00E-test\n");
         }
         other => panic!("expected a UI frame, got {other:?}"),
@@ -620,7 +620,7 @@ fn our_own_transmission_appears_in_the_monitor() {
 
 // ───────────────────────── connected mode, back to back ─────────────────────
 
-use sdroxide_ax25::{Addr, LinkConfig, PortEvent, PortRequest, port_pair};
+use sdroxide_ax25::{Addr, LinkConfig, Packet, PacketType, PortEvent, PortRequest, port_pair};
 use sdroxide_digi::{DigiAction, DigiEngine, PacketController};
 use sdroxide_types::{DigiConfig, Mode, PacketBaud};
 
@@ -630,23 +630,139 @@ struct Station {
     port: sdroxide_ax25::PortHandle,
 }
 
-fn station(call: &str) -> Station {
-    let cfg = DigiConfig {
+fn station_config(call: &str) -> DigiConfig {
+    DigiConfig {
         packet_baud: PacketBaud::Vhf1200,
         packet_mycall: call.into(),
         // Key promptly: CSMA's timing is pinned by its own unit tests, and a
-        // realistic slot here would make this test take minutes.
+        // realistic slot here would make these tests take minutes.
         packet_persist: 255,
         packet_slottime_ms: 1,
         packet_txdelay_ms: 60,
         packet_accept_incoming: true,
+        // Nothing unasked-for on the air, so a test that counts frames counts
+        // only the ones it caused.
+        packet_connect_text: String::new(),
         ..Default::default()
-    };
-    let mut ctl = PacketController::new(Mode::Packet, cfg, 48_000.0);
+    }
+}
+
+fn station(call: &str) -> Station {
+    let mut ctl = PacketController::new(Mode::Packet, station_config(call), 48_000.0);
     let (port, endpoint) =
         port_pair(LinkConfig { me: Addr::new(call).unwrap(), paclen: 128, maxframe: 4 });
     ctl.attach_port(endpoint);
     Station { ctl, port }
+}
+
+/// A SABM addressed to us, arriving through `path` — every hop marked as having
+/// repeated it, the way one really would.
+fn sabm_via(src: &str, dst: &str, path: &[&str]) -> Vec<u8> {
+    let enc = |call: &str, last: bool, hi: bool| {
+        let (base, ssid) = match call.split_once('-') {
+            Some((b, s)) => (b, s.parse::<u8>().unwrap()),
+            None => (call, 0),
+        };
+        let mut v: Vec<u8> =
+            base.bytes().chain(std::iter::repeat(b' ')).take(6).map(|c| c << 1).collect();
+        v.push((ssid << 1) | 0b0110_0000 | u8::from(last) | if hi { 0x80 } else { 0 });
+        v
+    };
+    // Destination carries the command bit; the source's is clear (4.3.3).
+    let mut f = enc(dst, false, true);
+    f.extend(enc(src, path.is_empty(), false));
+    for (n, d) in path.iter().enumerate() {
+        f.extend(enc(d, n + 1 == path.len(), true));
+    }
+    f.push(0b0011_1111); // SABM, P=1
+    f
+}
+
+/// An idle channel: receiver noise, not digital silence.
+///
+/// The carrier detect is a *ratio* between the two tone branches, and it is
+/// calibrated against the fact that noise puts the same energy in both — "an
+/// unmodulated channel sits near zero, because the two tone branches see the
+/// same noise". Exact zeros put nothing in either, the ratio is whatever the
+/// last real signal left behind, and the station reads a dead band as busy for
+/// ever and never keys. A radio never delivers exact zeros; nor should a test.
+///
+/// Deterministic, so a failure is reproducible.
+fn quiet(n: usize) -> Vec<f32> {
+    let mut x = 0x1234_5678u32;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((x >> 8) as f32 / f32::from(u16::MAX) - 128.0) * 1e-4
+        })
+        .collect()
+}
+
+/// Put a frame on the air in front of a station, through the real modem.
+///
+/// Not a back door into the controller: it goes out as audio and comes back
+/// through the deframer, so what the station sees is what a radio would give
+/// it.
+fn hear_frame(s: &mut Station, frame: &[u8]) {
+    let mut fr = sdroxide_ax25::Framer::new();
+    fr.push_flags(60);
+    fr.push_frame(frame);
+    fr.push_flags(4);
+    let bits = fr.take();
+    let mut tx = sdroxide_dsp::AfskTx::new(48_000.0, AfskProfile::Vhf1200);
+    tx.push_bits(&bits);
+    let n = (bits.len() as f64 * 48_000.0 / AfskProfile::Vhf1200.baud()).ceil() as usize + 4800;
+    let mut audio = vec![0.0f32; n];
+    tx.next_block(&mut audio);
+    hear(s, &audio);
+    // Quiet afterwards, so carrier detect falls and the station may answer.
+    hear(s, &quiet(48_000));
+}
+
+/// Put frames back on the air, for a test that inspected an over before
+/// handing it to the far end.
+fn render(frames: &[Vec<u8>]) -> Vec<f32> {
+    let mut fr = sdroxide_ax25::Framer::new();
+    fr.push_flags(60);
+    for f in frames {
+        fr.push_frame(f);
+        fr.push_flags(1);
+    }
+    fr.push_flags(4);
+    let bits = fr.take();
+    let mut tx = sdroxide_dsp::AfskTx::new(48_000.0, AfskProfile::Vhf1200);
+    tx.push_bits(&bits);
+    let n = (bits.len() as f64 * 48_000.0 / AfskProfile::Vhf1200.baud()).ceil() as usize + 4800;
+    let mut audio = vec![0.0f32; n];
+    tx.next_block(&mut audio);
+    audio.extend(quiet(24_000));
+    audio
+}
+
+/// Whatever a station just put on the air, demodulated back into frames.
+///
+/// Through the modem rather than out of a queue: "what went out" is the only
+/// question worth asking of a transmitter, and a queue does not answer it.
+fn keyed_frames(s: &mut Station) -> Vec<Vec<u8>> {
+    let audio = step(s);
+    if audio.is_empty() {
+        return Vec::new();
+    }
+    let mut rx = AfskRx::new(48_000.0, AfskProfile::Vhf1200);
+    let mut levels = Vec::new();
+    // Settle the detector on idle first. A real station's receiver has been
+    // running all along; one started cold on the first flag of a 60 ms preamble
+    // loses the first frame of the over, and a test that read three frames
+    // where four went out would blame the transmitter.
+    rx.process(&quiet(4_800), &mut levels);
+    levels.clear();
+    rx.process(&audio, &mut levels);
+    let mut de = Deframer::new();
+    let mut frames = Vec::new();
+    for l in levels {
+        de.push_level(l, &mut frames);
+    }
+    frames
 }
 
 /// Give a station a slice of time: poll it, and if it keys, play the whole over
@@ -661,8 +777,9 @@ fn step(s: &mut Station) -> Vec<f32> {
     // testing nothing but its own impatience. A real receiver has continuous
     // audio; this stands in for the quiet after the other station stops.
     let mut actions = Vec::new();
+    let idle = quiet(480);
     for _ in 0..60 {
-        s.ctl.on_rx_audio(&[0.0f32; 480]);
+        s.ctl.on_rx_audio(&idle);
         actions = s.ctl.poll(std::time::SystemTime::now(), 144_800_000.0);
         if actions.iter().any(|a| matches!(a, DigiAction::KeyTx)) {
             break;
@@ -697,11 +814,20 @@ fn hear(s: &mut Station, audio: &[f32]) {
 /// deframer, the codec, CSMA and the port bridge. The only thing standing in
 /// for reality is the channel, which here is a `Vec<f32>` handed straight
 /// across instead of a radio.
+///
+/// The two ends own their link differently, and deliberately: A dials out
+/// through the port with a lease, which is exactly what `Ax25Transport` does
+/// for a Winlink session, and B answers the call into the operator's terminal,
+/// which is what a station with "answer calls" switched on does. So one test
+/// covers both owners and both directions.
 #[test]
 fn two_stations_connect_and_exchange_data() {
     let mut a = station("OE3JJS-10");
     let mut b = station("OE3JJS-1");
 
+    // The lease, as the real transport takes it. Without it the link is one
+    // nobody owns, and the reaper is entitled to hang it up.
+    let _lease = a.port.try_claim().expect("the link was already claimed");
     a.port
         .send(PortRequest::Connect {
             peer: Addr::new("OE3JJS-1").unwrap(),
@@ -727,9 +853,10 @@ fn two_stations_connect_and_exchange_data() {
     }
     assert!(connected, "the two stations never completed a SABM/UA handshake");
 
-    // Now push data across and wait for it to be delivered at the far end.
+    // Now push data across and wait for it to be delivered at the far end —
+    // which for B is the terminal, because B answered the call.
     a.port.send(PortRequest::Data(b"hello over the air".to_vec())).unwrap();
-    let mut got = Vec::new();
+    let mut arrived = false;
     for _ in 0..400 {
         let from_a = step(&mut a);
         if !from_a.is_empty() {
@@ -739,18 +866,276 @@ fn two_stations_connect_and_exchange_data() {
         if !from_b.is_empty() {
             hear(&mut a, &from_b);
         }
-        while let Ok(Some(ev)) = b.port.recv_timeout(std::time::Duration::ZERO) {
-            if let PortEvent::Data(d) = ev {
-                got.extend(d);
-            }
-        }
-        if !got.is_empty() {
+        arrived = term_text(&b.ctl).contains("hello over the air");
+        if arrived {
             break;
         }
     }
-    assert_eq!(
-        String::from_utf8_lossy(&got),
-        "hello over the air",
-        "data never arrived at the far end"
+    assert!(arrived, "data never arrived at the far end: {:?}", term_text(&b.ctl));
+}
+
+/// Everything the terminal has printed, as one string.
+fn term_text(c: &PacketController) -> String {
+    let st = DigiEngine::status(c).packet.expect("packet status");
+    let mut out: String =
+        st.term.iter().map(|l| format!("{}\n", l.text)).collect::<Vec<_>>().concat();
+    out.push_str(&st.term_partial);
+    out
+}
+
+/// The link as the panel sees it.
+fn link_of(c: &PacketController) -> sdroxide_types::PacketLink {
+    DigiEngine::status(c).packet.expect("packet status").link.expect("no link")
+}
+
+/// Run both stations until `done`, or give up.
+fn pump(
+    a: &mut Station,
+    b: &mut Station,
+    rounds: usize,
+    mut done: impl FnMut(&Station, &Station) -> bool,
+) -> bool {
+    for _ in 0..rounds {
+        let from_a = step(a);
+        if !from_a.is_empty() {
+            hear(b, &from_a);
+        }
+        let from_b = step(b);
+        if !from_b.is_empty() {
+            hear(a, &from_b);
+        }
+        if done(a, b) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The headline: an operator calls a station and the two type at each other.
+///
+/// A dials with `term_connect`, B answers with its connect text, and each side
+/// reads the other in its own transcript — the whole path an operator uses to
+/// reach a node or a BBS, over the real modem.
+#[test]
+fn an_operator_terminal_session_crosses_the_air() {
+    let mut a = station("OE3JJS-10");
+    let mut b = station("OE3JJS-1");
+    let mut cfg = DigiConfig {
+        packet_connect_text: "Welcome to the test BBS.".into(),
+        ..station_config("OE3JJS-1")
+    };
+    cfg.packet_accept_incoming = true;
+    b.ctl.set_config(cfg);
+
+    a.ctl.term_connect("OE3JJS-1", "", false);
+    assert!(
+        pump(&mut a, &mut b, 400, |a, _| link_of(&a.ctl).state == "Connected"),
+        "the call never came up: {:?}",
+        term_text(&a.ctl)
     );
+    assert!(
+        pump(&mut a, &mut b, 400, |a, _| term_text(&a.ctl).contains("Welcome to the test BBS.")),
+        "B never greeted the caller: {:?}",
+        term_text(&a.ctl)
+    );
+
+    a.ctl.term_send("HELP".into());
+    assert!(
+        pump(&mut a, &mut b, 400, |_, b| term_text(&b.ctl).contains("HELP")),
+        "what the operator typed never arrived: {:?}",
+        term_text(&b.ctl)
+    );
+
+    // ...and the far end is the operator's session too, so it can answer.
+    b.ctl.term_send("no commands here, this is a test".into());
+    assert!(
+        pump(&mut a, &mut b, 400, |a, _| {
+            term_text(&a.ctl).contains("no commands here, this is a test")
+        }),
+        "the answer never came back: {:?}",
+        term_text(&a.ctl)
+    );
+
+    // And a hangup is a hangup at both ends.
+    a.ctl.term_disconnect();
+    assert!(
+        pump(&mut a, &mut b, 400, |a, b| {
+            link_of(&a.ctl).state == "Disconnected" && link_of(&b.ctl).state == "Disconnected"
+        }),
+        "the link never came down"
+    );
+    assert!(term_text(&b.ctl).contains("disconnected"), "B was not told: {:?}", term_text(&b.ctl));
+}
+
+/// A BBS is usually a hop or two away. The path used to be destructured away
+/// in `poll_link`, so the SABM went out addressed to a station the far end
+/// could not hear and the call failed with nothing on screen to explain it.
+#[test]
+fn a_connect_carries_its_digipeater_path() {
+    let mut a = station("OE3JJS-10");
+    a.ctl.term_connect("OE1XAB-8", "OE3XLR-1, OE3XMS-1", false);
+    let sent = keyed_frames(&mut a);
+    let sabm = sent
+        .iter()
+        .filter_map(|f| Packet::parse(f, Some(false)).ok())
+        .find(|p| matches!(p.packet_type(), PacketType::Sabm(_)))
+        .expect("no SABM went out");
+    let path: Vec<_> = sabm.digipeaters().iter().map(|d| d.call().to_string()).collect();
+    assert_eq!(path, vec!["OE3XLR-1", "OE3XMS-1"]);
+    assert_eq!(sabm.dst().call(), "OE1XAB-8");
+}
+
+/// A typo in the path is named rather than skipped: a connect that quietly
+/// dropped a hop would fail against a station that was never called.
+#[test]
+fn a_bad_digipeater_path_is_refused_with_a_reason() {
+    let mut a = station("OE3JJS-10");
+    a.ctl.term_connect("OE1XAB-8", "OE3XLR-1,nope!", false);
+    let said = term_text(&a.ctl);
+    assert!(said.contains("nope!"), "the bad hop was not named: {said:?}");
+    assert!(keyed_frames(&mut a).is_empty(), "a connect went out with a bad path");
+}
+
+/// Answer through the path the call arrived on. A UA sent direct to a station
+/// reached through a node never gets there, and both ends see a station that
+/// heard them and would not talk.
+#[test]
+fn the_link_answers_a_digipeated_call_through_the_same_path() {
+    let mut b = station("OE3JJS-1");
+    let mut cfg = station_config("OE3JJS-1");
+    cfg.packet_accept_incoming = true;
+    b.ctl.set_config(cfg);
+
+    // A SABM that reached us through two digipeaters, both marked repeated.
+    hear_frame(&mut b, &sabm_via("OE3JJS-10", "OE3JJS-1", &["OE3XLR-1", "OE3XMS-1"]));
+    let sent = keyed_frames(&mut b);
+    let ua = sent
+        .iter()
+        .filter_map(|f| Packet::parse(f, Some(false)).ok())
+        .find(|p| matches!(p.packet_type(), PacketType::Ua(_)))
+        .expect("the call was never answered");
+    let path: Vec<_> = ua.digipeaters().iter().map(|d| d.call().to_string()).collect();
+    assert_eq!(path, vec!["OE3XMS-1", "OE3XLR-1"], "the answer did not retrace the path");
+}
+
+/// The operator's packet length and window have to reach the link. They used to
+/// stop at `port_pair`, and the bug that leaves is silent: the link works at the
+/// state machine's own 256 on the bench and stops working on the marginal path
+/// the operator set 32 for.
+///
+/// Sized to one window on purpose — seven frames of 32 bytes is 224, so 200
+/// bytes goes out in a single over. Anything longer would sit waiting for an
+/// acknowledgement that only arrives when T1 polls for it, because the vendored
+/// state machine has no T2; see `vendor/rax25/PROVENANCE.md`.
+#[test]
+fn paclen_and_maxframe_bound_the_i_frames_that_go_out() {
+    let mut a = station("OE3JJS-10");
+    let mut b = station("OE3JJS-1");
+    let mut cfg = station_config("OE3JJS-10");
+    cfg.packet_paclen = 32;
+    cfg.packet_maxframe = 7;
+    a.ctl.set_config(cfg);
+
+    a.ctl.term_connect("OE3JJS-1", "", false);
+    assert!(pump(&mut a, &mut b, 400, |a, _| link_of(&a.ctl).state == "Connected"));
+
+    a.ctl.term_send("x".repeat(200));
+    let out = keyed_frames(&mut a);
+    let lengths: Vec<_> = out
+        .iter()
+        .filter_map(|f| Packet::parse(f, Some(false)).ok())
+        .filter_map(|p| match p.packet_type() {
+            PacketType::Iframe(i) => Some(i.payload.len()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        lengths.iter().all(|&n| n <= 32),
+        "an I frame broke the packet length of 32: {lengths:?}"
+    );
+    // 200 bytes and a carriage return, cut at 32: seven frames.
+    assert_eq!(lengths.len(), 7, "the window did not reach the link: {lengths:?}");
+
+    hear(&mut b, &render(&out));
+    assert!(
+        term_text(&b.ctl).contains(&"x".repeat(200)),
+        "the message did not arrive whole: {:?}",
+        term_text(&b.ctl)
+    );
+}
+
+/// One link, one radio. The MAIL window and the packet panel are two ways to
+/// use it, and the second to ask is told so rather than interleaving.
+#[test]
+fn an_operator_connect_is_refused_while_a_session_holds_the_link() {
+    let mut a = station("OE3JJS-10");
+    let lease = a.port.try_claim().expect("the link was already claimed");
+    a.ctl.term_connect("OE1XAB-8", "", false);
+    assert!(
+        term_text(&a.ctl).contains("MAIL window"),
+        "the refusal did not say why: {:?}",
+        term_text(&a.ctl)
+    );
+    assert!(keyed_frames(&mut a).is_empty(), "a connect went out over a link somebody else holds");
+
+    // ...and once the session lets go, the operator may have it.
+    drop(lease);
+    a.ctl.term_connect("OE1XAB-8", "", false);
+    assert!(!keyed_frames(&mut a).is_empty(), "the link never came free: {:?}", term_text(&a.ctl));
+}
+
+/// ...and the other way round.
+#[test]
+fn a_session_is_refused_while_the_operator_holds_the_link() {
+    let mut a = station("OE3JJS-10");
+    a.ctl.term_connect("OE1XAB-8", "", false);
+    assert!(a.port.try_claim().is_none(), "a session took a link the operator is using");
+    assert_eq!(link_of(&a.ctl).owner, sdroxide_types::PacketLinkOwner::Terminal);
+}
+
+/// A station whose link is held by a forwarding session must not answer calls:
+/// accepting one would drop a session into a conversation with a stranger.
+#[test]
+fn a_station_stops_answering_calls_while_a_session_holds_the_link() {
+    let mut b = station("OE3JJS-1");
+    let mut cfg = station_config("OE3JJS-1");
+    cfg.packet_accept_incoming = true;
+    b.ctl.set_config(cfg);
+    let _lease = b.port.try_claim().expect("the link was already claimed");
+    // A poll to let the lease reach the state machine.
+    b.ctl.poll(std::time::SystemTime::now(), 144_800_000.0);
+
+    hear_frame(&mut b, &sabm_via("OE3JJS-10", "OE3JJS-1", &[]));
+    let sent = keyed_frames(&mut b);
+    let kinds: Vec<_> = sent
+        .iter()
+        .filter_map(|f| Packet::parse(f, Some(false)).ok())
+        .map(|p| format!("{:?}", p.packet_type()))
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k.starts_with("Dm")),
+        "a busy station answered a call instead of refusing it: {kinds:?}"
+    );
+    assert_eq!(link_of(&b.ctl).state, "Disconnected");
+}
+
+/// The state machine takes a SABM in the connected state as a reset and never
+/// asks who sent it, so any station on the channel could tear down a session in
+/// progress — and the operator would watch their BBS vanish with nothing on
+/// screen to explain it.
+#[test]
+fn a_stray_sabm_does_not_reset_a_live_link() {
+    let mut a = station("OE3JJS-10");
+    let mut b = station("OE3JJS-1");
+    let mut bcfg = station_config("OE3JJS-1");
+    bcfg.packet_accept_incoming = true;
+    b.ctl.set_config(bcfg);
+
+    a.ctl.term_connect("OE3JJS-1", "", false);
+    assert!(pump(&mut a, &mut b, 400, |a, _| link_of(&a.ctl).state == "Connected"));
+
+    // Somebody else calls us in the middle of it.
+    hear_frame(&mut a, &sabm_via("OE1XYZ-3", "OE3JJS-10", &[]));
+    assert_eq!(link_of(&a.ctl).state, "Connected", "a third station reset a live link");
+    assert_eq!(link_of(&a.ctl).peer.as_deref(), Some("OE3JJS-1"));
 }

@@ -57,7 +57,10 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         | Mode::PacketHf
         | Mode::Rade => Some(Box::new(SsbMod::new(rate, lo, hi))),
         Mode::Am | Mode::Sam | Mode::Dsb => Some(Box::new(AmMod::new(rate))),
-        Mode::Nfm => Some(Box::new(FmMod::new(rate))),
+        // VHF SSTV modulates the carrier through the voice FM path — see the
+        // demodulator, which is its other half: the picture goes into an FM
+        // transmitter exactly as speech would.
+        Mode::Nfm | Mode::SstvFm => Some(Box::new(FmMod::new(rate))),
         // RIFP keys the carrier itself rather than a sideband of it.
         Mode::Rifp => Some(Box::new(CpfskMod::new(rate))),
         // VHF packet frequency-modulates the carrier, at both bauds — the
@@ -73,7 +76,7 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         // DRM joins them for a plainer reason than CW's: it is a broadcast
         // system. There is no amateur DRM transmission to make, and a
         // receiver that could key one has no business doing so.
-        Mode::Cw | Mode::Wfm | Mode::Spec | Mode::Drm => None,
+        Mode::Cw | Mode::Wfm | Mode::Spec | Mode::Drm | Mode::Adsb => None,
     }
 }
 

@@ -26,6 +26,15 @@
 //! so and the engine commands the VFO for every tune, exactly as it does for a
 //! transceiver sending I/Q down a sound card ([`crate::audio_cat_source`]).
 //!
+//! CW is the one exception, and it is not really one. The window still rides the
+//! VFO — that is the point — but sdroxide's CW dial is a zero-beat and the tone
+//! being copied sits a sidetone pitch above it, while the DUO keys its own
+//! transmitter on the VFO. So there the VFO goes on the station and the dial
+//! stays a pitch under it: [`IqSource::cw_iq_on_vfo`] is this radio saying which
+//! of the two CW families it belongs to, and the engine's `rig_cw_offset_hz` is
+//! what it costs. Leaving the two equal answered every station a sidetone low
+//! ([issue #170]).
+//!
 //! It used to be the other way round — the VFO was parked on the panadapter
 //! centre and the dial moved inside the window in software — and every way that
 //! could go wrong, did. The rig's display never agreed with sdroxide's readout;
@@ -51,6 +60,7 @@
 //!
 //! [issue #111]: https://github.com/dividebysandwich/sdroxide/issues/111
 //! [issue #146]: https://github.com/dividebysandwich/sdroxide/issues/146
+//! [issue #170]: https://github.com/dividebysandwich/sdroxide/issues/170
 //!
 //! # Not verified against hardware
 //!
@@ -191,6 +201,15 @@ pub struct EladSource {
     /// Warnings from the open, plus the one the stream thread can only raise
     /// once samples have been flowing.
     status: Vec<String>,
+    /// The stream thread's own warnings, kept once they have been taken.
+    ///
+    /// Sticky because [`IqSource::open_status`] is asked in two places and only
+    /// one of them shows the answer: the engine also asks it to decide whether a
+    /// source that wants reopening already has a reason on screen. Taking the
+    /// stream thread's sentence there and dropping it is how the one message
+    /// that explains a receiver delivering nothing — see `sdroxide_elad::fpga`
+    /// and issue #178 — was thrown away on every cycle of the reopen loop.
+    late: std::sync::Mutex<Vec<String>>,
 }
 
 impl EladSource {
@@ -325,6 +344,7 @@ impl EladSource {
             last_signal: None,
             signal_max_age,
             status,
+            late: std::sync::Mutex::new(Vec::new()),
         };
         // Put the transceiver's VFO on the window centre before the first
         // sample is looked at. On a DUO that is where the window *is*, so the
@@ -437,6 +457,19 @@ impl IqSource for EladSource {
     /// walks out of the receiver instead of into it.
     fn center_is_dial(&self) -> bool {
         self.dial_reachable
+    }
+
+    /// The DDC on this USB interface is the receiver's, not the demodulator's:
+    /// it is handed out centred on the VFO whatever mode the rig is in, and the
+    /// sidetone offset lives in whatever demodulates it — the DUO's own audio
+    /// stage, or ours.
+    ///
+    /// Which means that in CW the station being copied is a pitch *above* the
+    /// VFO, and the VFO is what the rig keys its own transmitter on. Issue #170
+    /// is what that costs when the two are left equal: a signal copied
+    /// perfectly at 700 Hz, answered 700 Hz below, and nobody coming back.
+    fn cw_iq_on_vfo(&self) -> bool {
+        true
     }
 
     /// The transceiver in front of us owns its mode, and a mode chosen here has
@@ -629,11 +662,14 @@ impl IqSource for EladSource {
                 // `Protocol::tx_state_requests`), so this never arrives — but
                 // the day it does, it means the same thing here as anywhere.
                 sdroxide_cat::CatUpdate::Ptt(on) => out.push(ControlUpdate::RigTx(on)),
-                // The meters arrive on their own telemetry channels, not here.
+                // The meters arrive on their own telemetry channels, not here;
+                // and the ELAD dialect has no squelch command, so that read is
+                // never asked for either.
                 sdroxide_cat::CatUpdate::Swr(_)
                 | sdroxide_cat::CatUpdate::Alc(_)
                 | sdroxide_cat::CatUpdate::Po(_)
                 | sdroxide_cat::CatUpdate::FwdW(_)
+                | sdroxide_cat::CatUpdate::Squelch(_)
                 | sdroxide_cat::CatUpdate::Signal(_) => {}
             }
         }
@@ -816,12 +852,18 @@ impl IqSource for EladSource {
 
     /// Surface what an operator needs to know but cannot see.
     fn open_status(&self) -> Option<String> {
-        let mut parts = self.status.clone();
-        // The sample-rate check needs a couple of seconds of stream before it
-        // can say anything, so it arrives long after the open did.
-        if let Some(w) = self.handle.take_late_warning() {
-            parts.push(w);
+        // The sample-rate check and the nothing-has-arrived warning both need a
+        // second or two of stream before they can say anything, so they arrive
+        // long after the open did — and once taken they are kept, because the
+        // caller that asked first is not always the one that displays it.
+        let mut late = self.late.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = self.handle.take_late_warning()
+            && !late.contains(&w)
+        {
+            late.push(w);
         }
+        let mut parts = self.status.clone();
+        parts.extend(late.iter().cloned());
         parts.push(
             "ELAD support is new and has not been verified against real hardware. \
              If it misbehaves, Settings → Radio has a Copy diagnostic report button."

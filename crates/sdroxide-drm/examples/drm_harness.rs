@@ -8,6 +8,10 @@
 //!
 //!     cargo run -p sdroxide-drm --example drm_harness -- recording.wav
 //!
+//! `--out decoded.wav` writes what came out of the decoder, which is the only
+//! way to tell audio that decoded from audio the codec concealed its way
+//! through: a misframed stream still returns samples, just not the broadcast's.
+//!
 //! Sample recordings live at
 //! <https://sourceforge.net/projects/drm/files/samples/DRM%20sample%20recordings/>.
 
@@ -25,14 +29,17 @@ fn main() {
     let mut path = None;
     let mut real = false;
     let mut shift_hz = f64::NAN;
+    let mut out_path = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--real" => real = true,
             "--shift" => shift_hz = args.next().and_then(|v| v.parse().ok()).unwrap_or(f64::NAN),
+            "--out" => out_path = args.next(),
             _ => path = Some(a),
         }
     }
-    let path = path.expect("usage: drm_harness [--real] [--shift HZ] recording.wav");
+    let path =
+        path.expect("usage: drm_harness [--real] [--shift HZ] [--out decoded.wav] recording.wav");
 
     let mut reader = hound::WavReader::open(&path).expect("open the recording");
     let spec = reader.spec();
@@ -49,15 +56,31 @@ fn main() {
     assert_eq!(spec.sample_rate as f64, RATE, "the harness expects a 48 kHz recording");
 
     if real {
-        run_real(&mono);
+        run_real(&mono, out_path.as_deref());
     } else {
         run_iq(&mono, shift_hz);
     }
 }
 
+/// Write the decoder's stereo output, so it can be listened to or measured.
+fn write_wav(path: &str, interleaved: &[i16]) {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: RATE as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec).expect("create the output");
+    for &s in interleaved {
+        w.write_sample(s).expect("write");
+    }
+    w.finalize().expect("finalize");
+    eprintln!("wrote {} samples per channel to {path}", interleaved.len() / 2);
+}
+
 /// Feed the recording as Dream's own file input would: a real signal in both
 /// channels, with the decoder left to find the carrier anywhere in the band.
-fn run_real(mono: &[f32]) {
+fn run_real(mono: &[f32], out_path: Option<&str>) {
     let worker = DrmWorker::new(false, false).expect("start the decoder");
     worker.set_constellation(Some(DrmChannel::Msc));
     let mut interleaved = Vec::with_capacity(mono.len() * 2);
@@ -68,6 +91,7 @@ fn run_real(mono: &[f32]) {
     }
     let mut audio = vec![0i16; 8192];
     let mut frames = 0usize;
+    let mut decoded = Vec::new();
     for block in interleaved.chunks(4800) {
         while worker.push(block) > 0 {
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -77,11 +101,17 @@ fn run_real(mono: &[f32]) {
             if n == 0 {
                 break;
             }
+            if out_path.is_some() {
+                decoded.extend_from_slice(&audio[..n]);
+            }
             frames += n / 2;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     report(&worker.status(), frames);
+    if let Some(p) = out_path {
+        write_wav(p, &decoded);
+    }
 }
 
 /// Convert the recording to the zero-IF baseband the receive chain produces,
@@ -238,6 +268,11 @@ fn report(st: &sdroxide_types::DrmStatus, audio_frames: usize) {
         st.service.codec.map(|c| c.label()).unwrap_or("?"),
         if st.service.stereo { "stereo" } else { "mono" },
     );
+    // The distinction between "no audio because the signal is bad" and "no
+    // audio because nothing here can decode this codec".
+    if st.service.codec.is_some() && !st.service.codec_supported {
+        println!("codec   NOT DECODABLE — xHE-AAC needs libfdk-aac on the system");
+    }
     if !st.service.text.is_empty() {
         println!("text    {}", st.service.text);
     }
@@ -247,4 +282,16 @@ fn report(st: &sdroxide_types::DrmStatus, audio_frames: usize) {
     }
 }
 
-fn tracing_subscriber_init() {}
+/// The harness printed nothing from `tracing`, so every `warn!` the decode path
+/// emits — including the one that says a codec has no decoder — was invisible
+/// exactly where it would have been most use.
+fn tracing_subscriber_init() {
+    if std::env::var("RUST_LOG").is_err() {
+        // SAFETY: single-threaded, before anything else starts.
+        unsafe { std::env::set_var("RUST_LOG", "sdroxide_drm=debug") };
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+}

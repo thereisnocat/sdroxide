@@ -223,8 +223,19 @@ impl SdroxideApp {
     /// the log until the parse has returned, so a failed one leaves it as it
     /// was.
     pub(in crate::app) fn poll_adif_import(&mut self) {
-        let text = self.adif_import_inbox.lock().ok().and_then(|mut g| g.take());
-        let Some(text) = text else { return };
+        let loaded = self.adif_import_inbox.lock().ok().and_then(|mut g| g.take());
+        let Some(loaded) = loaded else { return };
+        // Whatever went wrong is said here rather than on stderr: the operator
+        // who clicked Import is looking at the window, and on Windows there is
+        // no console behind it to print to.
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.push_net_log(format!("ADIF import failed: {e}"));
+                return;
+            }
+        };
+        let text = loaded.text;
         let parsed = catch_unwind(AssertUnwindSafe(|| sdroxide_types::adif_to_qso_log(&text)));
         let Ok(records) = parsed else {
             self.push_net_log("ADIF import failed: the file could not be parsed".to_string());
@@ -263,6 +274,15 @@ impl SdroxideApp {
         if added > 0 {
             persist_qso_log(&self.qso_log);
         }
-        self.push_net_log(format!("ADIF import: {added} added, {skipped} duplicates skipped"));
+        // Naming the guessed code page is the point of carrying it this far: a
+        // name that came out as nonsense is then a code page to report, not a
+        // decoder to doubt.
+        let assumed = match loaded.assumed {
+            Some(enc) => format!(" (not Unicode; read as {enc})"),
+            None => String::new(),
+        };
+        self.push_net_log(format!(
+            "ADIF import: {added} added, {skipped} duplicates skipped{assumed}"
+        ));
     }
 }

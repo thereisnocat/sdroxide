@@ -17,6 +17,13 @@ const OUT_RATE: f64 = 48_000.0;
 pub struct SstvController {
     cfg: DigiConfig,
     dial_hz: f64,
+    /// Which of the two SSTV modes this controller is running —
+    /// [`Mode::Sstv`] on a sideband, [`Mode::SstvFm`] on an FM carrier. The
+    /// picture, the decoder and the panel are identical; only the radio
+    /// underneath differs, and the engine has already arranged that. Carried so
+    /// the mode reported back is the one the operator chose, exactly as
+    /// `PacketController` carries its own.
+    mode: Mode,
 
     // RX
     rx: SstvRx,
@@ -44,13 +51,14 @@ pub struct SstvController {
 }
 
 impl SstvController {
-    pub fn new(cfg: DigiConfig, tap_rate: f64) -> Self {
+    pub fn new(mode: Mode, cfg: DigiConfig, tap_rate: f64) -> Self {
         let mut rx = SstvRx::new(tap_rate);
         // Default to Auto: the RX auto-detects the mode; TX defaults to Martin 1.
         rx.set_expected(None);
         SstvController {
             cfg,
             dial_hz: 0.0,
+            mode,
             rx,
             rx_scratch: Vec::new(),
             rx_image: Vec::new(),
@@ -91,7 +99,7 @@ impl SstvController {
     /// A minimal FT8-style status; SSTV state travels via `DigiAction::SstvStatus`.
     fn digi_status(&self) -> DigiStatus {
         DigiStatus {
-            mode: Mode::Sstv,
+            mode: self.mode,
             step: QsoStep::Idle,
             dx_call: None,
             dx_grid: None,
@@ -123,7 +131,7 @@ impl SstvController {
 
 impl DigiEngine for SstvController {
     fn mode(&self) -> Mode {
-        Mode::Sstv
+        self.mode
     }
 
     fn on_rx_audio(&mut self, tap: &[f32]) {

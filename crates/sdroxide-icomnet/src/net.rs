@@ -567,7 +567,7 @@ impl SessionThread {
                                 },
                             );
                             phase = Phase::Streaming;
-                            let model = proto::model_for(radio.civ_address);
+                            let model = proto::model_for_radio(&radio.name, radio.civ_address);
                             let i = SessionInfo {
                                 radio_name: radio.name.clone(),
                                 civ_address: radio.civ_address,

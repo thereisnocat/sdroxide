@@ -68,6 +68,32 @@ impl RdsStandard {
         }
     }
 
+    /// Whether this station's programme identification may be read out *as a
+    /// call sign*. Asked of what the operator selected, not of what
+    /// [`RdsStandard::resolve`] made of it.
+    ///
+    /// The distinction is the whole point. `resolve`'s fallback is a guess, and
+    /// a guess is good enough to pick between two programme-type tables — one
+    /// of the two labels is wrong and the other is right, and the operator can
+    /// see which. It is *not* good enough to print four letters that look like
+    /// the station's name: `pi_callsign` accepts `0x1000..=0x994F`, which is
+    /// nine countries' worth of RDS country codes, so YLE Radio Suomi on
+    /// `0x6201` reads as "WFBL" and DR P1 on `0x9101` as "WWWF" until their
+    /// first group 1A arrives — and on a signal poor enough that 1A takes a
+    /// while, the fabricated name is what sits on screen.
+    ///
+    /// So the name is only ever spelled out on evidence: the operator said
+    /// RBDS, or the station's own extended country code put it in the Americas.
+    /// Guessed RBDS still picks the RBDS programme-type table; it just does not
+    /// get to name the station.
+    pub fn names_from_pi(self, ecc: Option<u8>) -> bool {
+        match self {
+            RdsStandard::Rbds => true,
+            RdsStandard::Rds => false,
+            RdsStandard::Auto => ecc.is_some_and(|e| e >> 4 == 0xA),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             RdsStandard::Auto => "Auto",
@@ -408,16 +434,30 @@ impl RdsData {
         self.pi.is_none() && self.ps.is_none() && self.radiotext.is_none() && self.pty.is_none()
     }
 
+    /// The call sign this station's programme identification spells out, or
+    /// `None` when that reading is not to be trusted.
+    ///
+    /// `chosen` is the operator's selection, *not* the resolved standard — see
+    /// [`RdsStandard::names_from_pi`] for why the difference matters here and
+    /// nowhere else.
+    pub fn call_sign(&self, chosen: RdsStandard) -> Option<String> {
+        if !chosen.names_from_pi(self.ecc) {
+            return None;
+        }
+        self.pi.and_then(pi_callsign)
+    }
+
     /// What to head the display with: the station name if one has arrived, else
     /// the call sign its PI decodes to under RBDS, else the PI in hex.
-    pub fn title(&self, standard: RdsStandard) -> Option<String> {
+    ///
+    /// Takes the operator's selection rather than the resolved standard,
+    /// because the call sign is the one thing a guessed RBDS may not produce.
+    pub fn title(&self, chosen: RdsStandard) -> Option<String> {
         if let Some(ps) = self.ps.as_ref().filter(|s| !s.trim().is_empty()) {
             return Some(ps.trim().to_string());
         }
         let pi = self.pi?;
-        if standard == RdsStandard::Rbds
-            && let Some(call) = pi_callsign(pi)
-        {
+        if let Some(call) = self.call_sign(chosen) {
             return Some(call);
         }
         Some(format!("{pi:04X}"))
@@ -501,6 +541,41 @@ mod tests {
     }
 
     #[test]
+    fn a_guessed_rbds_picks_a_table_but_never_spells_out_a_call_sign() {
+        // The guess is welcome to choose the programme-type table — one of the
+        // two labels is right and the operator can see which. It is not welcome
+        // to put four letters on screen that look like the station's name.
+        assert!(!RdsStandard::Auto.names_from_pi(None));
+        assert!(!RdsStandard::Auto.names_from_pi(Some(0xE0)));
+        // Evidence, from either direction, does settle it.
+        assert!(RdsStandard::Auto.names_from_pi(Some(0xA0)));
+        assert!(RdsStandard::Rbds.names_from_pi(None));
+        assert!(!RdsStandard::Rds.names_from_pi(Some(0xA0)));
+    }
+
+    #[test]
+    fn a_nordic_station_is_not_given_an_american_call_sign() {
+        // Issue #173. The derived-call-sign blocks run 0x1000..=0x994F, which is
+        // PI country codes 1 through 9 — and Finland is 6, Denmark 9. Before
+        // either sends the group 1A that settles it, the fallback reads their
+        // identity as a call sign, and on a signal poor enough that 1A takes a
+        // while it is the fabricated name that sits on screen.
+        for (pi, invented) in [(0x6201u16, "WFBL"), (0x9101, "WWWF")] {
+            assert_eq!(pi_callsign(pi).as_deref(), Some(invented), "the trap itself");
+            let d = RdsData { pi: Some(pi), ..Default::default() };
+            assert_eq!(d.call_sign(RdsStandard::Auto), None);
+            assert_eq!(d.title(RdsStandard::Auto).as_deref(), Some(&format!("{pi:04X}")[..]));
+        }
+        // A North American station that never sends an ECC is the case this
+        // costs, and the selector is what it costs: chosen RBDS still names it.
+        let d = RdsData { pi: Some(0x54A8), ..Default::default() };
+        assert_eq!(d.call_sign(RdsStandard::Rbds).as_deref(), Some("WAAA"));
+        // …as does one that does send it.
+        let d = RdsData { pi: Some(0x54A8), ecc: Some(0xA0), ..Default::default() };
+        assert_eq!(d.call_sign(RdsStandard::Auto).as_deref(), Some("WAAA"));
+    }
+
+    #[test]
     fn alternative_frequencies_span_the_broadcast_band_and_reject_the_markers() {
         assert_eq!(af_code_hz(1), Some(87_600_000));
         assert_eq!(af_code_hz(204), Some(107_900_000));
@@ -537,9 +612,11 @@ mod tests {
     #[test]
     fn the_display_title_falls_back_the_way_a_receiver_does() {
         let mut d = RdsData { pi: Some(0x54A8), ..Default::default() };
-        // No name yet: RBDS can name the station from its PI, RDS cannot.
+        // No name yet: a settled RBDS can name the station from its PI, RDS
+        // cannot, and neither can a bare `Auto` — see the test above.
         assert_eq!(d.title(RdsStandard::Rbds).as_deref(), Some("WAAA"));
         assert_eq!(d.title(RdsStandard::Rds).as_deref(), Some("54A8"));
+        assert_eq!(d.title(RdsStandard::Auto).as_deref(), Some("54A8"));
         // A name, once it arrives, wins under either.
         d.ps = Some("ROCK FM ".to_string());
         assert_eq!(d.title(RdsStandard::Rbds).as_deref(), Some("ROCK FM"));

@@ -19,6 +19,14 @@
 //! exactly as `SetVfo` does — and on a radio whose window is its own, both
 //! still leave the hardware alone while the VFO stays inside the span.
 //!
+//! CW is where the two numbers stop being one. sdroxide's CW dial is a
+//! zero-beat and the tone being copied sits a sidetone pitch above it, while a
+//! transceiver in CW keys its own transmitter on its VFO — so on a radio whose
+//! I/Q comes out on that VFO, the VFO belongs on the station and the dial a
+//! pitch under it, or every over goes out a sidetone low and nobody answers
+//! (issue #170). A radio that shifts its own I.F. by the pitch instead has
+//! already done that arithmetic and is left alone; the source says which it is.
+//!
 //! All of which needs a dial that answers. A transceiver sending I/Q down a
 //! sound card with no control cable on it has one synthesiser and no way to
 //! command it, so the last two tests here hold the other end of the same
@@ -52,6 +60,9 @@ struct Rig {
     dial_reachable: bool,
     /// Modes the engine commanded, in order.
     modes: Vec<sdroxide_types::Mode>,
+    /// Whether this radio hands out its I/Q on the VFO in CW, or a sidetone
+    /// below it because it moves its own I.F. See [`IqSource::cw_iq_on_vfo`].
+    cw_iq_on_vfo: bool,
 }
 
 /// A stand-in for a CAT rig whose I/Q output is the capture device: the dial is
@@ -77,6 +88,13 @@ impl IqSource for MockIqRig {
     /// long as there is a control link to command it through.
     fn center_is_dial(&self) -> bool {
         self.rig.lock().unwrap().dial_reachable
+    }
+    /// Which of the two CW families this radio belongs to. The fixture's
+    /// default is the ELAD FDM-DUO's answer — the DDC comes out on the VFO —
+    /// which is why CW there has to put the VFO on the station and not on our
+    /// dial.
+    fn cw_iq_on_vfo(&self) -> bool {
+        self.rig.lock().unwrap().cw_iq_on_vfo
     }
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         std::thread::sleep(Duration::from_millis(5));
@@ -135,7 +153,16 @@ fn engine() -> (sdroxide_radio::EngineHandles, Arc<Mutex<Rig>>) {
 
 /// [`engine`], choosing whether the rig's control port answers at all.
 fn engine_with_link(dial_reachable: bool) -> (sdroxide_radio::EngineHandles, Arc<Mutex<Rig>>) {
-    let rig = Arc::new(Mutex::new(Rig { dial: DIAL, dial_reachable, ..Rig::default() }));
+    engine_shaped(dial_reachable, true)
+}
+
+/// [`engine`], choosing which CW family the radio belongs to as well.
+fn engine_shaped(
+    dial_reachable: bool,
+    cw_iq_on_vfo: bool,
+) -> (sdroxide_radio::EngineHandles, Arc<Mutex<Rig>>) {
+    let rig =
+        Arc::new(Mutex::new(Rig { dial: DIAL, dial_reachable, cw_iq_on_vfo, ..Rig::default() }));
     let src = MockIqRig { rig: Arc::clone(&rig) };
     let cfg = EngineConfig { tx_ham_only: false, ..Default::default() };
     let h = start_engine(Box::new(src), iq_rig_caps(), cfg);
@@ -398,6 +425,114 @@ fn a_mode_chosen_here_reaches_a_rig_that_owns_its_mode() {
         rig.lock().unwrap().modes.last().copied(),
         Some(Mode::Cw),
         "the operator's mode has to be commanded at the radio that is doing the receiving"
+    );
+    shutdown(h);
+}
+
+/// Wait for CW to settle, and report the pitch the engine is actually copying
+/// at along with the state it left behind.
+///
+/// The pitch is read from the panel's own status rather than assumed: it comes
+/// out of the operator's saved configuration, so the only figure this test can
+/// trust is the one the engine says it is using.
+fn settle_cw(h: &sdroxide_radio::EngineHandles) -> (f32, sdroxide_types::RadioState) {
+    let mut pitch = None;
+    let mut state = None;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        while let Ok(ev) = h.event_rx.try_recv() {
+            match ev {
+                RadioEvent::Ft8Status(st) => pitch = Some(st.audio_hz),
+                RadioEvent::State(s) => state = Some(s),
+                _ => {}
+            }
+        }
+        if let (Some(p), Some(s)) = (pitch, state.as_ref())
+            && s.rx[0].mode == Mode::Cw
+            && (s.center_hz - (s.vfo_a_hz + f64::from(p))).abs() < 0.5
+        {
+            return (p, state.unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the rig's VFO never reached a sidetone above the dial");
+}
+
+/// CW on a radio that keys its own transmitter: the VFO belongs on the station,
+/// not on the dial.
+///
+/// sdroxide's CW dial is a zero-beat and the tone being copied sits a sidetone
+/// pitch above it. An SDR is consistent about that — its keyer puts the carrier
+/// where the tone was — but a transceiver in CW makes the carrier itself, on
+/// its VFO, whether the key is a paddle in its socket or text handed to its
+/// keyer. Leave the VFO on our dial and every over goes out a whole sidetone
+/// below the station being answered, which is issue #170: an ELAD FDM-DUO
+/// copying a station perfectly at 700 Hz and working nobody.
+///
+/// So the VFO carries the offset and the DDC takes the difference. What the
+/// operator reads does not move.
+#[test]
+fn cw_puts_a_self_keying_rig_on_the_station_and_not_on_the_dial() {
+    let (h, rig) = engine();
+    settle(&h, |s| s.vfo_a_hz == DIAL);
+    rig.lock().unwrap().commanded.clear();
+
+    h.cmd_tx.send(Command::SetMode { rx: RxId::Main, mode: Mode::Cw }).unwrap();
+    let (pitch, state) = settle_cw(&h);
+    let station = DIAL + f64::from(pitch);
+
+    assert_eq!(
+        state.vfo_a_hz, DIAL,
+        "the readout is the operator's zero-beat and has no reason to move"
+    );
+    assert_eq!(
+        rig.lock().unwrap().commanded.last().copied(),
+        Some(station),
+        "the radio keys its own transmitter on its VFO, so the VFO has to be on the station"
+    );
+    assert_eq!(state.center_hz, station, "and the window is centred on the VFO, as it always is");
+
+    // The other direction: what the rig reports back is that same VFO, and
+    // taking the sidetone out again is what stops the readout climbing by one
+    // pitch on every poll.
+    let moved = station + 5_000.0;
+    rig.lock().unwrap().knob = Some(moved);
+    let state = settle(&h, |s| s.center_hz == moved);
+    assert_eq!(
+        state.vfo_a_hz,
+        moved - f64::from(pitch),
+        "a VFO the rig reported is a station frequency; the dial sits a sidetone under it"
+    );
+
+    // And leaving CW gives the offset back: nothing else in the app puts a
+    // transceiver's VFO anywhere but on the dial.
+    h.cmd_tx.send(Command::SetMode { rx: RxId::Main, mode: Mode::Usb }).unwrap();
+    let state = settle(&h, |s| s.rx[0].mode == Mode::Usb && s.center_hz == s.vfo_a_hz);
+    assert_eq!(state.center_hz, state.vfo_a_hz, "off CW the VFO is the dial again");
+    shutdown(h);
+}
+
+/// And the other CW family is left exactly alone.
+///
+/// A radio that moves its own I.F. by the sidetone pitch — a K3 on
+/// `CONFIG:CW WGHT: VFO OFS`, a QMX sending I/Q — is already handing out a
+/// stream a pitch below its readout, so a station on its displayed frequency
+/// arrives where the passband is looking and the rig keys its transmitter on
+/// the same number. There the dial and the VFO are one, and moving either would
+/// be the bug rather than the fix.
+#[test]
+fn a_rig_that_shifts_its_own_if_keeps_the_dial_and_the_vfo_together() {
+    let (h, rig) = engine_shaped(true, false);
+    settle(&h, |s| s.vfo_a_hz == DIAL);
+    rig.lock().unwrap().commanded.clear();
+
+    h.cmd_tx.send(Command::SetMode { rx: RxId::Main, mode: Mode::Cw }).unwrap();
+    let state = settle(&h, |s| s.rx[0].mode == Mode::Cw);
+    assert_eq!(state.vfo_a_hz, DIAL);
+    assert_eq!(state.center_hz, DIAL, "this radio's I/Q is already offset; ours must not be");
+    assert!(
+        rig.lock().unwrap().commanded.iter().all(|&hz| hz == DIAL),
+        "nothing about entering CW moves a radio that has already moved itself"
     );
     shutdown(h);
 }

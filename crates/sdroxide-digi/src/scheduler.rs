@@ -35,12 +35,14 @@ impl SlotScheduler {
         (Self::unix_now(now) / self.period_s).floor() as i64
     }
 
-    /// Index of the slot containing Unix time `unix` (floor(unix / period)).
-    pub fn slot_index_unix(&self, unix: f64) -> i64 {
-        (unix / self.period_s).floor() as i64
-    }
-
     /// Unix seconds at the start of slot `idx`.
+    ///
+    /// Not every slot starts on a whole second — FT4's odd slots begin on a half
+    /// second and FT2's on a quarter — so a caller that has to *compare* slots
+    /// (which period a station transmits in, say) must carry the index around
+    /// rather than this figure rounded off. Rounding it reads back as the slot
+    /// before, and a reply then goes out on top of the station being answered
+    /// (issue #191).
     pub fn slot_start_unix(&self, idx: i64) -> f64 {
         idx as f64 * self.period_s
     }

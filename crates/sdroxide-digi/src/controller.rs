@@ -106,6 +106,15 @@ pub enum DigiAction {
 
 struct DecodeJob {
     audio: Vec<i16>,
+    /// Which slot this audio was captured in, as the scheduler's own index.
+    ///
+    /// The index rather than the Unix start time: only FT8's slots begin on a
+    /// whole second. FT4's odd slots start on a half second and FT2's on a
+    /// quarter, so a start time carried as whole seconds reads back as the slot
+    /// *before* it — which inverted the parity of every reply and put it on top
+    /// of the station being answered (issue #191).
+    slot_idx: i64,
+    /// The same slot as a Unix time, which is what stamps each [`Decode`].
     slot_utc: i64,
     /// Our callsign and the DX's. They seed the worker's hash table, so a hashed
     /// `<...>` naming either resolves on first sight, and they bias the decoder
@@ -131,14 +140,18 @@ pub struct DigiController {
     /// we key at most once per slot.
     tx_even: bool,
     tx_fired_slot: i64,
-    /// Slot (Unix start time) we last decoded each station in, so a reply always
-    /// lands in the slot *opposite* to when the DX actually transmitted — even if
-    /// stations run out of the usual even/odd sequence. Pruned to recent slots.
+    /// Slot index we last decoded each station in, so a reply always lands in
+    /// the slot *opposite* to when the DX actually transmitted — even if
+    /// stations run out of the usual even/odd sequence.
+    ///
+    /// Kept for [`HEARD_SLOTS`], which is much longer than the frequency
+    /// chooser's window below: what this answers is "which period does that
+    /// station keep", and a station keeps one all evening.
     last_heard: std::collections::HashMap<String, i64>,
-    /// `(slot, tone offset)` of every recent decode, so we can see which part of
-    /// the band is busy *in the period we transmit in*. Pruned alongside
-    /// `last_heard`. Duplicated tones are kept: two stations on one frequency
-    /// is exactly the situation worth avoiding.
+    /// `(slot index, tone offset)` of every recent decode, so we can see which
+    /// part of the band is busy *in the period we transmit in*. Duplicated tones
+    /// are kept: two stations on one frequency is exactly the situation worth
+    /// avoiding.
     recent_activity: Vec<(i64, f32)>,
     // Decode worker.
     job_tx: Sender<DecodeJob>,
@@ -167,6 +180,17 @@ pub struct BurstPlayer {
 const TX_PICK_MIN_HZ: f32 = 400.0;
 const TX_PICK_MAX_HZ: f32 = 2600.0;
 const TX_PICK_STEP_HZ: f32 = 10.0;
+/// How many slots back the transmit-frequency chooser counts as "now". Who is
+/// on the air this minute is what it is asking about.
+const ACTIVITY_SLOTS: i64 = 8;
+/// How many slots a station's transmit period is remembered for.
+///
+/// Long enough to cover the rows the decode list can still be showing — it
+/// holds two hundred of them, which on a quiet band is a good many minutes.
+/// Answering one of those from a record of when they last transmitted is right;
+/// guessing at it is a coin toss that lands on top of them half the time.
+const HEARD_SLOTS: i64 = 40;
+
 /// Separation past which a spot counts as simply clear. An FT8 signal is about
 /// 50 Hz wide, so a couple of signal-widths either side is all the room there
 /// is any point in having — beyond it, nearness to where we already are is the
@@ -214,7 +238,7 @@ impl DigiController {
                     modem.seed_hashes(&job.ap.calls());
                     let decodes =
                         modem.decode_slot(&job.audio, job.slot_utc, &job.ap, job.audio_hz);
-                    if res_tx.send((job.slot_utc, decodes)).is_err() {
+                    if res_tx.send((job.slot_idx, decodes)).is_err() {
                         break;
                     }
                 }
@@ -321,14 +345,18 @@ impl DigiController {
         audio_hz: f32,
         wait_for_cq: bool,
     ) {
-        let now = SlotScheduler::unix_now(SystemTime::now()) as i64;
+        let now_sys = SystemTime::now();
+        let now = SlotScheduler::unix_now(now_sys) as i64;
         // Reply in the slot *opposite* to when the DX actually transmitted, using
         // the slot we last heard them in — so a late reply never lands in their
-        // slot. Fall back to "the slot before now" only if we've no record of
-        // them (which reproduces the old parity == parity(now) behaviour).
-        let dx_slot =
-            self.last_heard.get(&from).copied().unwrap_or(now - self.params.slot_s as i64);
-        self.tx_even = !self.scheduler.is_even(self.scheduler.slot_index_unix(dx_slot as f64));
+        // slot. Fall back to "the slot before this one" only if we've no record
+        // of them (which reproduces the old parity == parity(now) behaviour).
+        let dx_slot = self
+            .last_heard
+            .get(&from)
+            .copied()
+            .unwrap_or_else(|| self.scheduler.slot_index(now_sys) - 1);
+        self.tx_even = !self.scheduler.is_even(dx_slot);
         // Where to answer from. Moving onto the DX's own frequency is the
         // obvious choice and the wrong one — see `pick_tx_freq`. A Hound is
         // exempt twice over: its calling frequency is the operator's, and the
@@ -370,9 +398,7 @@ impl DigiController {
         let busy: Vec<f32> = self
             .recent_activity
             .iter()
-            .filter(|(slot, _)| {
-                self.scheduler.is_even(self.scheduler.slot_index_unix(*slot as f64)) == self.tx_even
-            })
+            .filter(|(slot, _)| self.scheduler.is_even(*slot) == self.tx_even)
             .map(|(_, hz)| *hz)
             .collect();
         let hz = clearest_tx_hz(&busy, self.audio_hz, |hz| self.emission_permitted(hz));
@@ -575,19 +601,19 @@ impl DigiController {
         // 1. Drain finished decodes from the worker.
         loop {
             match self.res_rx.try_recv() {
-                Ok((slot_utc, decodes)) => {
+                Ok((slot_idx, decodes)) => {
                     if !decodes.is_empty() {
+                        let slot_utc = self.scheduler.slot_start_unix(slot_idx) as i64;
                         // Remember which slot we heard each station in (reply
-                        // timing), pruning to the last ~8 slots to stay bounded.
+                        // timing), pruned to stay bounded.
                         for d in &decodes {
                             if let Some(from) = d.from.as_deref().filter(|s| !s.is_empty()) {
-                                self.last_heard.insert(from.to_string(), slot_utc);
+                                self.last_heard.insert(from.to_string(), slot_idx);
                             }
-                            self.recent_activity.push((slot_utc, d.audio_hz));
+                            self.recent_activity.push((slot_idx, d.audio_hz));
                         }
-                        let cutoff = slot_utc - (8.0 * self.params.slot_s) as i64;
-                        self.last_heard.retain(|_, &mut t| t >= cutoff);
-                        self.recent_activity.retain(|(t, _)| *t >= cutoff);
+                        self.last_heard.retain(|_, &mut s| s >= slot_idx - HEARD_SLOTS);
+                        self.recent_activity.retain(|(s, _)| *s >= slot_idx - ACTIVITY_SLOTS);
                         // What everyone else's timing says about ours.
                         if self.clock.observe(&decodes) {
                             self.status_dirty = true;
@@ -607,8 +633,7 @@ impl DigiController {
                         // they shift the even/odd sequence mid-QSO.
                         if let Some(dx) = self.qso.dx_call().map(str::to_string) {
                             if let Some(&slot) = self.last_heard.get(&dx) {
-                                let idx = self.scheduler.slot_index_unix(slot as f64);
-                                self.tx_even = !self.scheduler.is_even(idx);
+                                self.tx_even = !self.scheduler.is_even(slot);
                             }
                         }
                         actions.push(DigiAction::Decodes(decodes));
@@ -626,13 +651,15 @@ impl DigiController {
                 let min_samples = (self.params.slot_s * DECODE_RATE * 0.5) as usize;
                 if self.slot_buf.len() >= min_samples {
                     let audio = std::mem::take(&mut self.slot_buf);
-                    let slot_utc = self.scheduler.slot_start_unix(self.last_slot_idx) as i64;
+                    let slot_idx = self.last_slot_idx;
+                    let slot_utc = self.scheduler.slot_start_unix(slot_idx) as i64;
                     let ap = ApHints {
                         my_call: self.qso.my_call().to_string(),
                         dx_call: self.qso.dx_call().map(str::to_string),
                     };
                     let _ = self.job_tx.send(DecodeJob {
                         audio,
+                        slot_idx,
                         slot_utc,
                         ap,
                         audio_hz: self.audio_hz,
@@ -695,6 +722,12 @@ impl DigiController {
     pub fn status(&self) -> DigiStatus {
         let mut s = self.qso.status(self.tx_burst_active());
         s.audio_hz = self.audio_hz;
+        // The period we will actually transmit in, which is not always the
+        // configured one: answering a station takes the slot opposite theirs,
+        // whatever the operator set for calling CQ. The readout said otherwise,
+        // so an operator whose reply went out in the wrong period was told it
+        // had gone out in the right one.
+        s.tx_even = self.tx_even;
         s.clock_offset_s = self.clock.offset_s();
         s
     }
@@ -858,12 +891,13 @@ mod tests {
 
     // 1_609_459_200 / 15 = 107_297_280, an even slot index.
     const EVEN_SLOT_UNIX: f64 = 1_609_459_200.0;
+    const EVEN_SLOT_IDX: i64 = 107_297_280;
 
     #[test]
     fn reply_targets_slot_opposite_the_dx() {
         let mut c = DigiController::new(Mode::Ft8, cfg(), 12_000.0);
         // We heard the DX in an even slot → we must reply in odd slots.
-        c.last_heard.insert("W9XYZ".into(), EVEN_SLOT_UNIX as i64);
+        c.last_heard.insert("W9XYZ".into(), EVEN_SLOT_IDX);
         c.start_qso("W9XYZ".into(), Some("EM48".into()), -10, 1500.0, false);
         assert!(!c.tx_even, "reply slot should be odd (opposite the even DX slot)");
 
@@ -1043,7 +1077,7 @@ mod tests {
         // Simulate pressing reply late — during a slot with the *same* parity as
         // the DX (the old code would then transmit right on top of them).
         let mut c = DigiController::new(Mode::Ft8, cfg(), 12_000.0);
-        c.last_heard.insert("W9XYZ".into(), EVEN_SLOT_UNIX as i64);
+        c.last_heard.insert("W9XYZ".into(), EVEN_SLOT_IDX);
         c.start_qso("W9XYZ".into(), Some("EM48".into()), -10, 1500.0, false);
 
         // A later even slot (the DX's parity): must NOT key here.

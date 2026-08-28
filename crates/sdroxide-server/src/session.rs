@@ -178,6 +178,7 @@ async fn run_session(
         rds,
         ism_reports,
         ism_status,
+        adsb_status,
         drm,
     ) = {
         let latest = shared.latest.lock().unwrap();
@@ -198,6 +199,7 @@ async fn run_session(
             latest.rds.clone(),
             latest.ism_reports.clone(),
             latest.ism_status.clone(),
+            latest.adsb_status.clone(),
             latest.drm.clone(),
         )
     };
@@ -246,6 +248,10 @@ async fn run_session(
     }
     if !ism_reports.is_empty() {
         let _ = socket.send(msg(&ServerMsg::IsmReports(ism_reports))).await;
+    }
+    // The aircraft table, for the same reason: what is overhead is a condition.
+    if let Some(st) = adsb_status {
+        let _ = socket.send(msg(&ServerMsg::AdsbStatus(st))).await;
     }
     // And the transmit-image presets, for the same reason. The received
     // galleries are not replayed: a panel lists its store when it opens, which

@@ -345,10 +345,13 @@ fn mode_digit(m: Mode) -> (char, bool) {
     match m {
         Mode::Lsb => ('1', false),
         Mode::Cw => ('3', false),
-        Mode::Nfm | Mode::Wfm => ('4', false),
+        // No rig has an ADS-B mode and none ever will: the dial is at
+        // 1090 MHz. Grouped with FM so nothing downstream has to special-case
+        // a mode a radio can neither be put into nor report back.
+        Mode::Nfm | Mode::Wfm | Mode::Adsb => ('4', false),
         // RIFP keys the carrier itself and VHF packet frequency-modulates it:
         // data over FM, not over a sideband.
-        Mode::Rifp | Mode::Packet | Mode::Aprs => ('4', true),
+        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm => ('4', true),
         Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => ('5', false),
         Mode::Digl => ('1', true),
         Mode::Digu
@@ -583,7 +586,8 @@ impl Protocol for Kenwood {
             | Mode::Dsb
             | Mode::Rifp
             | Mode::Packet
-            | Mode::Aprs => Vec::new(),
+            | Mode::Aprs
+            | Mode::SstvFm => Vec::new(),
             // Everything else rides a sideband, where the filter is not a width
             // at all but a pair of cuts — which is exactly what sdroxide's own
             // filter edges are, so the two map onto each other directly.

@@ -23,10 +23,16 @@ use crate::Shared;
 /// How a host answers device questions. Built by whoever starts the server —
 /// the binary, which is the only place that knows how to reach each backend.
 ///
+/// The second argument is the roster id of the radio whose session asked. Most
+/// of these questions are about the machine and answer the same whoever asks;
+/// the diagnostic report is about *a radio*, and a station with two of a kind
+/// on it — two Icoms on the LAN is the ordinary case — has to answer with the
+/// asking radio's own session and no other's.
+///
 /// `Fn` rather than `FnMut`: it is called from the worker thread only, but
 /// nothing about a device question is stateful, and requiring `Sync` keeps it
 /// shareable without a second lock.
-pub type ProbeFn = Box<dyn Fn(DeviceProbe) -> ProbeAnswer + Send + Sync>;
+pub type ProbeFn = Box<dyn Fn(DeviceProbe, u32) -> ProbeAnswer + Send + Sync>;
 
 /// Requests waiting for the worker. Small on purpose: an operator pressing
 /// Rescan five times while a scan runs wants the scan, not five more of them,
@@ -53,7 +59,7 @@ impl ProbeHub {
             .name("sdroxide-probe".into())
             .spawn(move || {
                 for (shared, req) in rx {
-                    let answer = probe(req);
+                    let answer = probe(req, shared.id);
                     reply(&shared, answer);
                 }
             })

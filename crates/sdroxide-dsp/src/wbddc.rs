@@ -250,11 +250,24 @@ impl WbDdc {
             // has to land at index 0 and the bins below it wrap to the top half.
             // Copying the band contiguously instead looks plausible and puts
             // every signal half an output bandwidth off frequency.
+            //
+            // Two straight runs rather than a wrap test and an index
+            // computation per bin: the centre bin and those above it fill the
+            // first half of the inverse FFT's input, the ones below it the
+            // second. Both runs are contiguous in the spectrum and in the
+            // taper, which is what lets the copy widen — this loop runs `m`
+            // times per block and sixteen thousand blocks a second on an
+            // RX-888. `set_center_hz` clamps `kc` to `half ..= n/2 - half`, so
+            // neither run can leave the half-spectrum.
             let half = self.m / 2;
-            for i in 0..self.m {
-                let off = if i < half { i as isize } else { i as isize - self.m as isize };
-                let bin = (self.kc as isize + off) as usize;
-                self.band[i] = self.spectrum[bin] * self.taper[i];
+            let kc = self.kc;
+            let (band_lo, band_hi) = self.band.split_at_mut(half);
+            let (taper_lo, taper_hi) = self.taper.split_at(half);
+            for ((b, s), t) in band_lo.iter_mut().zip(&self.spectrum[kc..kc + half]).zip(taper_lo) {
+                *b = s * *t;
+            }
+            for ((b, s), t) in band_hi.iter_mut().zip(&self.spectrum[kc - half..kc]).zip(taper_hi) {
+                *b = s * *t;
             }
 
             self.fft_inv.process_with_scratch(&mut self.band, &mut self.scratch_inv);
@@ -270,12 +283,13 @@ impl WbDdc {
 
             // Overlap-add: first half joins the tail kept from last time, second
             // half becomes the new tail.
-            for i in 0..out_hop {
-                let v = self.band[i] * gain + self.tail[i];
-                out.push(v);
+            let (first, second) = self.band.split_at(out_hop);
+            out.reserve(out_hop);
+            for (v, tail) in first.iter().zip(&self.tail[..out_hop]) {
+                out.push(v * gain + tail);
             }
-            for i in 0..out_hop {
-                self.tail[i] = self.band[out_hop + i] * gain;
+            for (tail, v) in self.tail[..out_hop].iter_mut().zip(second) {
+                *tail = v * gain;
             }
 
             pos += hop;

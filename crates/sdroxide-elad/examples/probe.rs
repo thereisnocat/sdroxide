@@ -14,10 +14,10 @@
 //!
 //! Two questions this driver cannot answer for itself are what it is really for:
 //!
-//! * **What rate is the device in?** Nothing sdroxide can send selects the
-//!   DDC's decimation, so the measured throughput printed below is the only
-//!   evidence. Run it with the default `PROBE_RATE` first and read the measured
-//!   figure.
+//! * **What rate is the device in?** On an FDM-S1 or FDM-S2 that is which FPGA
+//!   image ELAD's `elad-firmware` loader put in it, and `PROBE_RATE` asks for
+//!   one; on an FDM-DUO nothing selects the decimation at all. Either way the
+//!   measured throughput printed below is the evidence.
 //! * **Do the samples arrive I before Q?** Point the receiver at a known strong
 //!   carrier (`PROBE_FREQ`, in Hz — a local broadcast station is ideal); the
 //!   decoded sample line in the trace is what settles it.
@@ -143,7 +143,8 @@ fn main() {
     println!("  peak |sample| {peak:.4} (1.0 is full scale)");
     if total == 0 {
         println!();
-        println!("NO SAMPLES ARRIVED. This is the interesting case — please report the trace.");
+        println!("NO SAMPLES ARRIVED.");
+        println!("  {}", sdroxide_elad::fpga::silence_hint(handle.model));
     }
 
     handle.release();

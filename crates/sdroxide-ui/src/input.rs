@@ -44,6 +44,12 @@ pub(crate) struct UiSink<'a> {
     /// reason to know about — and because the announcer is borrowed from the
     /// same `self` this sink already has torn apart.
     pub speech: &'a mut Vec<Action>,
+    /// Whether the SQL action drives the *radio's* squelch rather than the
+    /// engine's own gate — `DeviceCaps::commands_squelch`, which this module
+    /// has no other reason to know about. A bound knob has to reach the same
+    /// control the on-screen rail does, or it moves a threshold the audio never
+    /// passes through (issue #192).
+    pub rig_squelch: bool,
 }
 
 /// Which binding table an in-flight momentary press came from. Held state is
@@ -89,10 +95,16 @@ impl TickAccum {
 
 /// The 0..=1 range an absolute control (a fader) spans for this action, or
 /// `None` where an absolute position is meaningless (tuning, panning).
-fn absolute_range(act: Action, state: &RadioState) -> Option<(f32, f32)> {
+///
+/// `rig_squelch` is [`UiSink::rig_squelch`]: the SQL action has two scales, and
+/// which one a fader spans has to match the one the arm below writes.
+fn absolute_range(act: Action, state: &RadioState, rig_squelch: bool) -> Option<(f32, f32)> {
     use Action::*;
     Some(match act {
         Volume | SubVolume | TxDrive | TuneDrive | MicGain => (0.0, 1.0),
+        // dBFS for the engine's own gate, and the rig's own `0..1` where the
+        // radio is the one squelching.
+        Squelch if rig_squelch => (0.0, 1.0),
         Squelch => (SQUELCH_OPEN_DB, 0.0),
         AgcMaxGain => (0.0, 120.0),
         ManualGain => (0.0, MAX_MANUAL_GAIN_DB),
@@ -133,8 +145,9 @@ pub(crate) fn apply_action(
         };
         // Resolve an absolute position into this action's range up front, so
         // each arm below only has to deal with "here is the new value".
-        let target =
-            abs.and_then(|p| absolute_range(act, state).map(|(lo, hi)| lo + p * (hi - lo)));
+        let target = abs.and_then(|p| {
+            absolute_range(act, state, ui.rig_squelch).map(|(lo, hi)| lo + p * (hi - lo))
+        });
         if abs.is_some() && target.is_none() {
             return;
         }
@@ -183,6 +196,22 @@ pub(crate) fn apply_action(
                 let v = target.unwrap_or(cur + delta).clamp(0.0, 1.0);
                 state.rx[rx.index()].volume = v;
                 cmds.push(Command::SetVolume { rx, v });
+            }
+            Squelch if ui.rig_squelch => {
+                // The rig's own scale, `0`..`1`, not dBFS — see `UiSink`, and
+                // `absolute_range`, which answers on the same scale so a fader
+                // lands where this does.
+                //
+                // A *relative* step arrives in the action's declared units,
+                // and those are dB: `Action::default_step` gives the SQL knob
+                // 1.0 without knowing which radio is on the other end, and a
+                // step of one on a rail that spans one would be the whole
+                // range per detent. One unit is read as one percentage point
+                // here, which is what the readout beside it shows.
+                let cur = state.rig_squelch;
+                let frac = target.unwrap_or(cur + delta / 100.0).clamp(0.0, 1.0);
+                state.rig_squelch = frac;
+                cmds.push(Command::SetRigSquelch { frac });
             }
             Squelch => {
                 let cur = state.rx[0].squelch_db;
@@ -1045,6 +1074,7 @@ mod tests {
             memories: &mut memories[0],
             voice: &mut voice[0],
             speech,
+            rig_squelch: false,
         }
     }
 

@@ -315,6 +315,39 @@ mod tests {
         assert!((apply_ppm(RTL_XTAL_HZ, -100) - 28_797_120.0).abs() < 1e-6);
     }
 
+    /// What direct sampling above the ADC's Nyquist limit rides on — the
+    /// reason 17 m and 15 m are reachable at all on a V3 (issue #179).
+    ///
+    /// The DDC's word is a 22-bit two's complement fraction of the crystal, so
+    /// it spans ±14.4 MHz and a dial above that wraps into the negative half.
+    /// Sampling puts the wanted signal at exactly `dial - 28.8 MHz`, so the
+    /// wrap *is* the tuning: it lands on the second Nyquist zone's image of the
+    /// band, the right way up, and nothing downstream has to be told.
+    #[test]
+    fn a_dial_above_nyquist_wraps_onto_its_own_alias() {
+        /// The frequency the programmed word really represents.
+        fn programmed_hz(r: [u8; 3]) -> f64 {
+            let raw = ((r[0] as i32) << 16) | ((r[1] as i32) << 8) | r[2] as i32;
+            let signed = if raw & (1 << 21) != 0 { raw - (1 << 22) } else { raw };
+            -(signed as f64) * RTL_XTAL_HZ / TWO_POW_22
+        }
+
+        // Below Nyquist the word is the dial itself.
+        let lsb = RTL_XTAL_HZ / TWO_POW_22;
+        for dial in [1_840_000.0, 7_074_000.0, 14_074_000.0] {
+            let got = programmed_hz(if_freq_regs(dial, RTL_XTAL_HZ));
+            assert!((got - dial).abs() <= lsb, "{dial} Hz programmed as {got} Hz");
+        }
+        // Above it, the alias — 17 m, 15 m and 12 m, the bands with no tuner
+        // under them.
+        for dial in [18_100_000.0, 21_074_000.0, 24_915_000.0] {
+            let want = dial - RTL_XTAL_HZ;
+            let got = programmed_hz(if_freq_regs(dial, RTL_XTAL_HZ));
+            assert!(got < 0.0, "{dial} Hz must fold into the negative half");
+            assert!((got - want).abs() <= lsb, "{dial} Hz aliases to {want} Hz, programmed {got}");
+        }
+    }
+
     #[test]
     fn if_freq_regs_negate_and_mask() {
         // The R82xx's default 3.57 MHz low IF.

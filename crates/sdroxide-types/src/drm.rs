@@ -104,25 +104,28 @@ pub fn spectrum_occupancy_khz(raw: i32) -> Option<f32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrmCodec {
     Aac,
-    /// Speech codecs from the original standard, both long since withdrawn.
-    Celp,
-    Hvxc,
-    /// xHE-AAC (USAC), what most surviving broadcasters moved to.
-    XheAac,
     /// Dream's own extension, not part of the DRM standard.
     Opus,
+    /// xHE-AAC (USAC), what most surviving broadcasters moved to.
+    XheAac,
     Unknown,
 }
 
 impl DrmCodec {
-    /// The order in `CAudioParam::EAudCod`.
+    /// The order in `CAudioParam::EAudCod`, which is
+    /// `{AC_AAC=0, AC_OPUS=1, AC_RESERVED=2, AC_xHE_AAC=3, AC_NONE=4}`.
+    ///
+    /// This used to read 1 and 2 as CELP and HVXC, which is the *original*
+    /// DRM ordering. Both speech codecs were withdrawn from the standard and
+    /// Dream cannot signal either, so those slots were re-used: an Opus
+    /// service was labelled "CELP" and a service with no audio at all was
+    /// labelled "Opus". 2 is reserved and 4 is "no audio", and neither is
+    /// invented into a codec name here.
     pub fn from_raw(v: i32) -> Self {
         match v {
             0 => DrmCodec::Aac,
-            1 => DrmCodec::Celp,
-            2 => DrmCodec::Hvxc,
+            1 => DrmCodec::Opus,
             3 => DrmCodec::XheAac,
-            4 => DrmCodec::Opus,
             _ => DrmCodec::Unknown,
         }
     }
@@ -130,10 +133,8 @@ impl DrmCodec {
     pub fn label(self) -> &'static str {
         match self {
             DrmCodec::Aac => "AAC",
-            DrmCodec::Celp => "CELP",
-            DrmCodec::Hvxc => "HVXC",
-            DrmCodec::XheAac => "xHE-AAC",
             DrmCodec::Opus => "Opus",
+            DrmCodec::XheAac => "xHE-AAC",
             DrmCodec::Unknown => "?",
         }
     }
@@ -169,6 +170,14 @@ pub struct DrmService {
     pub bitrate_kbps: f32,
     #[serde(default)]
     pub codec: Option<DrmCodec>,
+    /// Whether this build can decode `codec`.
+    ///
+    /// False means the receiver is locked and reading the multiplex, and the
+    /// audio is going nowhere - which every other field on this struct reports
+    /// as a perfectly healthy station. xHE-AAC needs libfdk-aac on the system;
+    /// see `vendor/fdk-aac/PROVENANCE.md` for why it cannot be built in.
+    #[serde(default)]
+    pub codec_supported: bool,
     #[serde(default)]
     pub stereo: bool,
 }
@@ -367,8 +376,19 @@ pub struct DrmStatus {
 
 impl DrmStatus {
     /// The receiver is decoding audio, not merely holding sync on a carrier.
+    ///
+    /// `audio` on its own is not enough. A codec this build has no decoder for
+    /// still produces audio frames, and the null codec Dream substitutes fails
+    /// every one of them - which registers as `CrcError`, not `Absent`. So the
+    /// whole chain reads healthy while the speaker is silent, and anything
+    /// built on this (the top bar's chip, and its "DRM is decoding" hover) says
+    /// so. A service whose codec cannot be decoded is not decoding, however
+    /// good the signal.
     pub fn decoding(&self) -> bool {
-        self.locked && self.fac.is_ok() && self.audio != DrmSync::Absent
+        self.locked
+            && self.fac.is_ok()
+            && self.service.codec_supported
+            && self.audio != DrmSync::Absent
     }
 
     /// A one-line summary for a status bar: the label if the multiplex has
@@ -384,5 +404,51 @@ impl DrmStatus {
         } else {
             "no signal".to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `CAudioParam::EAudCod` is `{AC_AAC=0, AC_OPUS=1, AC_RESERVED=2,
+    /// AC_xHE_AAC=3, AC_NONE=4}`.
+    ///
+    /// The table used to be the original DRM ordering, where 1 and 2 were the
+    /// CELP and HVXC speech codecs. Both were withdrawn from the standard and
+    /// Dream cannot signal either, so an Opus service read as "CELP" and a
+    /// service with no audio read as "Opus" — a wrong answer with no way to
+    /// tell it was wrong, since only 0 and 3 were ever exercised on air.
+    #[test]
+    fn the_codec_table_follows_dream_not_the_original_standard() {
+        assert_eq!(DrmCodec::from_raw(0), DrmCodec::Aac);
+        assert_eq!(DrmCodec::from_raw(1), DrmCodec::Opus);
+        assert_eq!(DrmCodec::from_raw(3), DrmCodec::XheAac);
+        // Reserved, "no audio", and anything a corrupt SDC invents.
+        assert_eq!(DrmCodec::from_raw(2), DrmCodec::Unknown);
+        assert_eq!(DrmCodec::from_raw(4), DrmCodec::Unknown);
+        assert_eq!(DrmCodec::from_raw(-1), DrmCodec::Unknown);
+    }
+
+    /// A codec with no decoder is not "decoding", however good the signal.
+    ///
+    /// Dream substitutes a null codec, which fails every audio frame — and a
+    /// failed frame is `CrcError`, not `Absent`, so the sync row and the top
+    /// bar's chip both used to report a healthy decode into a silent speaker.
+    #[test]
+    fn a_codec_with_no_decoder_is_not_decoding() {
+        let mut s = DrmStatus {
+            locked: true,
+            fac: DrmSync::Ok,
+            audio: DrmSync::CrcError,
+            ..Default::default()
+        };
+        s.service.codec = Some(DrmCodec::XheAac);
+
+        s.service.codec_supported = false;
+        assert!(!s.decoding(), "no decoder for the signalled codec");
+
+        s.service.codec_supported = true;
+        assert!(s.decoding(), "everything else about this station is healthy");
     }
 }

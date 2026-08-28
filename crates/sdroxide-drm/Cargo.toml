@@ -5,7 +5,10 @@ edition.workspace = true
 # The vendored C/C++ this links — Dream (`vendor/dream`) and faad2
 # (`vendor/faad2`) — is GPL-2.0-or-later in both cases, which the workspace's
 # GPL-3.0-or-later covers. Note what that rules out: an AAC decoder under the
-# FDK licence could not be linked here at all, whatever its technical merits.
+# FDK licence cannot be linked here at all, whatever its technical merits, which
+# is why xHE-AAC is decoded through a library looked up at run time and nothing
+# from `vendor/fdk-aac` (headers only) reaches the linker. See
+# `vendor/fdk-aac/PROVENANCE.md`.
 license.workspace = true
 
 # Native-only: links a vendored C++ receiver and a vendored C codec. Must never
@@ -25,3 +28,6 @@ bindgen = "0.72"
 [dev-dependencies]
 hound = "3"
 rustfft.workspace = true
+# For the harness example only: it drives the decode path, and the warnings that
+# path emits are the point of running it.
+tracing-subscriber.workspace = true

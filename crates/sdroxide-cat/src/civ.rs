@@ -71,7 +71,16 @@ pub fn mode_to_civ(m: Mode) -> u8 {
         // RIFP is FSK on the carrier, and VHF packet frequency-modulates it,
         // so a CAT rig has to be in FM for the dial to mean what they mean by
         // it.
-        Mode::Nfm | Mode::Wfm | Mode::Rifp | Mode::Packet | Mode::Aprs => 0x05,
+        // No rig has an ADS-B mode and none ever will: the dial is at
+        // 1090 MHz. Grouped with FM so nothing downstream has to special-case
+        // a mode a radio can neither be put into nor report back.
+        Mode::Nfm
+        | Mode::Wfm
+        | Mode::Rifp
+        | Mode::Packet
+        | Mode::Aprs
+        | Mode::SstvFm
+        | Mode::Adsb => 0x05,
         Mode::Spec => 0x01,
     }
 }
@@ -306,6 +315,39 @@ pub fn parse_power_reply(data: &[u8]) -> Option<f32> {
     Some(decode_meter(&data[1..])?.min(255) as f32 / 255.0)
 }
 
+/// Set the receiver's squelch threshold (cmd `0x14` sub `0x03`), as a 0..1
+/// fraction of the radio's own scale — `0` fully open, `1` fully closed, which
+/// is how the knob on the front panel reads.
+///
+/// The squelch that matters on a rig sending demodulated audio is the rig's.
+/// Nothing on this side of the sound card can open one the radio has closed:
+/// what arrives is already gated, so the software squelch could only close
+/// further on what got through, and an operator who wanted to hear a weak
+/// station had no control that reached the thing muting it (issue #192).
+pub fn set_squelch_frame(radio: u8, frac: f32) -> Vec<u8> {
+    let level = (frac.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let mut data = vec![0x03];
+    data.extend_from_slice(&encode_level(level));
+    frame(radio, 0x14, &data)
+}
+
+/// Read the squelch threshold back (cmd `0x14` sub `0x03`, no payload), so the
+/// slider can *adopt* where the operator left the radio rather than impose a
+/// remembered level on it — the same reason [`read_power_frame`] exists.
+pub fn read_squelch_frame(radio: u8) -> Vec<u8> {
+    frame(radio, 0x14, &[0x03])
+}
+
+/// Parse a squelch-level reply payload (cmd `0x14` sub `0x03`) as a 0..1
+/// fraction. `None` for any other level on the same command, exactly as
+/// [`parse_power_reply`] answers `None` for this one.
+pub fn parse_squelch_reply(data: &[u8]) -> Option<f32> {
+    if data.first() != Some(&0x03) {
+        return None;
+    }
+    Some(decode_meter(&data[1..])?.min(255) as f32 / 255.0)
+}
+
 /// Hand the rig's *own* RIT, ΔTX (XIT) and split back to neutral.
 ///
 /// sdroxide carries all three on the dial itself (see `AudioCatSource`), so an
@@ -313,6 +355,10 @@ pub fn parse_power_reply(data: &[u8]) -> Option<f32> {
 /// operator's own RIT knob — would stack on top of ours where nothing in the
 /// software could see it. Sent once when the port opens; a rig that doesn't
 /// implement these sub-commands just NAKs them, which the parser ignores.
+///
+/// The repeater shift is the fourth of these and is deliberately not here: it
+/// is not a setting the radio holds still, so clearing it once is not enough.
+/// See [`simplex_frame`].
 pub fn clear_offsets_frames(radio: u8) -> Vec<Vec<u8>> {
     vec![
         // RIT and ΔTX share one offset register (cmd 0x21 sub 0x00): the offset
@@ -320,8 +366,32 @@ pub fn clear_offsets_frames(radio: u8) -> Vec<Vec<u8>> {
         frame(radio, 0x21, &[0x00, 0x00, 0x00, 0x00]),
         frame(radio, 0x21, &[0x01, 0x00]), // RIT off
         frame(radio, 0x21, &[0x02, 0x00]), // ΔTX (XIT) off
-        frame(radio, 0x0F, &[0x00]),       // simplex (split off)
+        // Split off. `0x0F` carries two settings on one command: `00`/`01` are
+        // split, and `10`/`11`/`12` are the duplex shift — see
+        // [`simplex_frame`], which is the other half of this and cannot be
+        // sent from here.
+        frame(radio, 0x0F, &[0x00]),
     ]
+}
+
+/// Put the rig's own repeater shift back to simplex (cmd `0x0F` sub `0x10`).
+///
+/// The transmit shift is sdroxide's, carried on the dial like RIT, XIT and
+/// split (see [`clear_offsets_frames`] and `RadioState::tx_freq_hz`), so a
+/// duplex setting still standing in the radio would be added to ours at the
+/// key-down and put the over a shift away from where the operator asked for
+/// it — and the SIMPLEX chip on screen could not take it off again.
+///
+/// Unlike the three above, this cannot be cleared once and forgotten. A radio
+/// with band stacking registers — an IC-9700 keeps one per band, holding the
+/// frequency, the mode *and* the duplex and tone settings — restores whatever
+/// that band was last left on the moment the dial crosses into it, which on
+/// 70 cm and 23 cm is normally DUP− (issue #192). Icom's own auto-repeater
+/// function does the same thing on the USA models. So it is re-asserted
+/// whenever the dial moves to another band; a rig with no such command NAKs
+/// it, which the parser ignores.
+pub fn simplex_frame(radio: u8) -> Vec<u8> {
+    frame(radio, 0x0F, &[0x10])
 }
 
 /// Decode Icom's 2-byte BCD meter reading (`0000..0255`) to a plain integer.
@@ -671,7 +741,10 @@ pub struct ScopeSweep {
     pub divisions: u8,
     /// Present on the first division only.
     pub info: Option<ScopeInfo>,
-    /// Amplitudes, 0..=160. Empty on the first division of a split sweep.
+    /// Amplitudes, on a scale the *model* sets — `0..=160` across the IC-7300
+    /// generation, `0..=200` on an IC-7610 or IC-7760. Nothing on the wire says
+    /// which, so the top of the scale comes from `IcomModel::scope_full_scale`
+    /// rather than from here. Empty on the first division of a split sweep.
     pub bins: Vec<u8>,
 }
 
@@ -1065,6 +1138,60 @@ mod tests {
         assert_eq!(body(1), vec![0x21, 0x01, 0x00], "RIT off");
         assert_eq!(body(2), vec![0x21, 0x02, 0x00], "ΔTX (XIT) off");
         assert_eq!(body(3), vec![0x0F, 0x00], "simplex");
+    }
+
+    /// The repeater shift the rig applies on its own has to be off, because
+    /// sdroxide carries the shift on the dial — see [`simplex_frame`]. It is
+    /// the *duplex* half of command `0x0F`, not the split half beside it in
+    /// [`clear_offsets_frames`], and the two must not be confused: `0x0F 0x00`
+    /// switches split off and leaves DUP− exactly where it was.
+    #[test]
+    fn the_duplex_shift_is_cleared_with_its_own_sub_command() {
+        assert_eq!(simplex_frame(0x94), vec![0xFE, 0xFE, 0x94, 0xE0, 0x0F, 0x10, 0xFD]);
+        // And is not one of the once-per-connection offset clears, which is
+        // the whole point: a band stacking register puts it back.
+        assert!(!clear_offsets_frames(0x94).contains(&simplex_frame(0x94)));
+    }
+
+    /// Squelch is a level on command `0x14`, sub-command `0x03`, on the same
+    /// 0–255 scale as the power beside it.
+    #[test]
+    fn squelch_is_a_fraction_of_the_rigs_own_scale() {
+        let level = |frac: f32| {
+            let f = set_squelch_frame(0x94, frac);
+            assert_eq!(f[..4], [0xFE, 0xFE, 0x94, 0xE0], "addressed to the rig");
+            assert_eq!(f[4..6], [0x14, 0x03], "squelch level");
+            assert_eq!(*f.last().unwrap(), 0xFD);
+            decode_meter(&f[6..f.len() - 1]).unwrap()
+        };
+        assert_eq!(level(0.0), 0, "fully open");
+        assert_eq!(level(1.0), 255, "fully closed");
+        assert_eq!(level(0.5), 128);
+        // A rail cannot ask for more than the radio has.
+        assert_eq!(level(2.0), 255);
+        assert_eq!(level(-1.0), 0);
+        // The read carries no payload, so it cannot be mistaken for a set.
+        assert_eq!(read_squelch_frame(0x94), vec![0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x03, 0xFD]);
+    }
+
+    /// Both levels are read on command `0x14`, so the sub-command byte in the
+    /// reply is the only thing that says which one arrived. Each parser has to
+    /// refuse the other's, or the opening pair of reads would set the drive
+    /// slider from the squelch knob.
+    #[test]
+    fn the_two_levels_on_command_14_are_told_apart_by_their_sub_command() {
+        assert_eq!(parse_squelch_reply(&[0x03, 0x00, 0x00]), Some(0.0));
+        assert_eq!(parse_squelch_reply(&[0x03, 0x02, 0x55]), Some(1.0));
+        // Round trip through the frame we would send.
+        let f = set_squelch_frame(0x94, 0.75);
+        let back = parse_squelch_reply(&f[5..f.len() - 1]).unwrap();
+        assert!((back - 0.75).abs() < 0.005, "{back}");
+        // Neither parser answers for the other's level, nor for a third.
+        assert_eq!(parse_squelch_reply(&[0x0A, 0x02, 0x55]), None, "that is the power");
+        assert_eq!(parse_power_reply(&[0x03, 0x02, 0x55]), None, "that is the squelch");
+        assert_eq!(parse_squelch_reply(&[0x0C, 0x00, 0x85]), None, "that is the keyer speed");
+        // A malformed BCD reading is nothing at all.
+        assert_eq!(parse_squelch_reply(&[0x03, 0x00, 0x0f]), None);
     }
 
     #[test]

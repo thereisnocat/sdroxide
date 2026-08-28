@@ -59,10 +59,13 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Am | Mode::Sam | Mode::Drm => "AM",
         Mode::Dsb => "DSB",
         Mode::Nfm => "FM",
-        Mode::Wfm => "WFM",
+        // No rig has an ADS-B mode and none ever will: the dial is at
+        // 1090 MHz. Grouped with FM so nothing downstream has to special-case
+        // a mode a radio can neither be put into nor report back.
+        Mode::Wfm | Mode::Adsb => "WFM",
         // Data over FM rather than over a sideband: the carrier is the signal's
         // centre, not one edge of it.
-        Mode::Rifp | Mode::Packet | Mode::Aprs => "PKTFM",
+        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm => "PKTFM",
         Mode::Digl => "PKTLSB",
         Mode::Digu
         | Mode::Ft8

@@ -18,12 +18,29 @@
 //!
 //! The wire format is documented from AetherSDR's C++ implementation
 //! (GPL-3.0-or-later, as is this crate) and from FlexLib's published behaviour.
-//! No code is shared; the formats are.
+//! No code is shared; the formats are. Three of AetherSDR's hard-won details are
+//! reproduced here because a simulator cannot discover them:
+//!
+//! - the UDP registration datagram goes to the radio's *control* port and must
+//!   be **repeated** until packets come back, because firmware speaking protocol
+//!   v1.4.0.0 may not honour `client udpport` at all;
+//! - a freshly created panadapter needs a moment before it will accept
+//!   configuration, and the `daxiq_channel` binding is one of the sets that goes
+//!   missing if it does not get one;
+//! - a GUI client id is worth checking against the radio's live client list
+//!   before registering it, because a duplicate is resolved by eviction rather
+//!   than by refusal.
 //!
 //! # Diagnostics
 //!
 //! Nothing here has been run against real hardware — see the
-//! [`FIELD_REPORT_HINT`]. Every connection therefore carries a [`trace::Trace`]
+//! [`FIELD_REPORT_HINT`], and note that the simulator agrees with the client by
+//! construction, so its passing is evidence about self-consistency and nothing
+//! else. [`sim::SimConfig`] therefore carries the failure modes a real radio has
+//! shown (`require_udp_register`, `unbound_dax_iq`, `existing_clients`,
+//! `evict_after`); a fault worth fixing is worth teaching the simulator first.
+//!
+//! Every connection therefore carries a [`trace::Trace`]
 //! that is always on and costs nothing to enable, and
 //! [`FlexHandle::trace`]`.dump()` renders it as one block of text. `tracing`
 //! targets `smartsdr`, `smartsdr::control` and `smartsdr::vita` carry the same
@@ -38,7 +55,10 @@ pub mod trace;
 use std::time::Duration;
 
 pub use discovery::{FlexRadioInfo, discover, discover_default};
-pub use net::{DEFAULT_IQ_CHANNEL, FlexError, FlexHandle, FlexUpdate, IQ_RATES, RadioIdent};
+pub use net::{
+    ConnectOptions, DEFAULT_IQ_CHANNEL, DEFAULT_NETWORK_MTU, FlexError, FlexHandle, FlexUpdate,
+    IQ_RATES, RadioIdent, VITA_PORT, gui_client_id,
+};
 pub use protocol::RADIO_PORT;
 pub use trace::Trace;
 

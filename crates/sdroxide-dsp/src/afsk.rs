@@ -155,7 +155,21 @@ impl AfskTx {
                 match self.bits.pop_front() {
                     Some(b) => {
                         self.cur_mark = b;
-                        self.left = self.spb;
+                        // Accumulated, never assigned: `left` is in (-1, 0]
+                        // here, and that remainder is the part of the previous
+                        // bit that did not fit in a whole sample. Assigning
+                        // would throw it away and round every bit *up* to a
+                        // whole sample — a baud rate of `rate / spb.ceil()`
+                        // rather than the one the profile names.
+                        //
+                        // On a sound card that is invisible: 48 kHz is exactly
+                        // 40 samples a bit and there is no remainder. On an SDR
+                        // it is not, because the channel rate is whatever the
+                        // decimation chain lands on — 44642.857 Hz on a HackRF
+                        // at 10 Msps, which is 37.2 samples a bit and went out
+                        // 2.1 % slow, past what a receiver's clock recovery
+                        // will follow. See issue #180.
+                        self.left += self.spb;
                     }
                     None => {
                         *slot = 0.0;
@@ -530,6 +544,54 @@ mod tests {
         for p in [AfskProfile::Hf300, AfskProfile::Vhf1200] {
             let (mark, space) = p.tones();
             assert!(mark < space, "{p:?}: the detector assumes mark below space");
+        }
+    }
+
+    /// The baud rate a modem actually produces, measured from the samples it
+    /// emitted for a known number of bits.
+    fn measured_baud(rate: f64, profile: AfskProfile) -> f64 {
+        let mut tx = AfskTx::new(rate, profile);
+        let bits = 2_000usize;
+        tx.push_bits(&vec![true; bits]);
+        let mut sent = 0usize;
+        loop {
+            let mut block = [0.0f32; 480];
+            let n = tx.next_block(&mut block);
+            if n == 0 {
+                break;
+            }
+            sent += n;
+            if tx.idle() {
+                break;
+            }
+        }
+        rate / (sent as f64 / bits as f64)
+    }
+
+    /// Issue #180. The bit clock has to hold its fractional remainder, because
+    /// on a software radio the rate it is handed is whatever the decimation
+    /// chain landed on and is rarely a whole number of samples a bit.
+    ///
+    /// 44642.857 Hz is what a HackRF at 10 Msps gives — 37.2 samples a bit —
+    /// and rounding that up to 38 put the over on the air at 1174.8 baud, which
+    /// is past what a receiver's clock recovery will follow. Every rate that
+    /// *is* a whole number of samples a bit, 48 kHz among them, was unaffected,
+    /// which is why a sound-card station never saw it.
+    #[test]
+    fn the_baud_rate_survives_a_rate_that_is_not_whole_samples_a_bit() {
+        for rate in [48_000.0, 50_000.0, 44_642.857_142_857_145, 62_500.0, 44_100.0, 48_828.125] {
+            for profile in [AfskProfile::Vhf1200, AfskProfile::Hf300] {
+                let got = measured_baud(rate, profile);
+                let err = (got / profile.baud() - 1.0).abs();
+                // A tenth of a percent. The receiver tolerates a couple of
+                // percent, which is exactly why the fault was invisible at the
+                // rates where it was small.
+                assert!(
+                    err < 0.001,
+                    "{rate} Hz, {profile:?}: {got:.2} baud against {}",
+                    profile.baud()
+                );
+            }
         }
     }
 

@@ -155,6 +155,19 @@ impl SdroxideApp {
 
         self.drm_signal(ui, &d);
         ui.add_space(8.0);
+        // Above the service block rather than below it: this is the reason the
+        // station named there cannot be heard.
+        if d.service.codec.is_some() && !d.service.codec_supported {
+            ui.label(dim(
+                "This station's audio codec is not decoding here. xHE-AAC needs libfdk-aac \
+                 on the system — it cannot be built in, because its licence and this \
+                 program's are incompatible. Install it (Debian/Ubuntu: libfdk-aac2, \
+                 Arch: libfdk-aac, macOS: brew install fdk-aac, Windows: libfdk-aac-2.dll \
+                 beside sdroxide.exe) and restart. Everything else on this screen is \
+                 decoding normally.",
+            ));
+            ui.add_space(8.0);
+        }
         self.drm_service(ui, &d, &mut cmds);
         ui.add_space(8.0);
         ui.separator();
@@ -249,13 +262,20 @@ impl SdroxideApp {
     /// How far up the chain the decoder has got, left to right in the order the
     /// stages lock.
     fn drm_sync_row(&self, ui: &mut egui::Ui, d: &DrmStatus) {
+        // Where the row stops is the diagnosis, and this is the one stage that
+        // can stop for a reason the chain itself does not show.
+        let audio_hover = if d.service.codec.is_some() && !d.service.codec_supported {
+            "Audio frames decoding — but this station's codec cannot be decoded here"
+        } else {
+            "Audio frames decoding"
+        };
         let stages = [
             ("IO", d.io, "Samples reaching the decoder"),
             ("TIME", d.time_sync, "Symbol timing recovered"),
             ("FRAME", d.frame_sync, "Transmission frames found"),
             ("FAC", d.fac, "Fast Access Channel — what the transmission is"),
             ("SDC", d.sdc, "Service Description Channel — what the services are"),
-            ("AUDIO", d.audio, "Audio frames decoding"),
+            ("AUDIO", d.audio, audio_hover),
         ];
         ui.horizontal_wrapped(|ui| {
             for (label, state, hover) in stages {
@@ -473,7 +493,11 @@ impl SdroxideApp {
             line.push(d.service.language.clone());
         }
         if let Some(c) = d.service.codec {
-            line.push(c.label().to_string());
+            line.push(if d.service.codec_supported {
+                c.label().to_string()
+            } else {
+                format!("{} — not decodable", c.label())
+            });
         }
         if d.service.bitrate_kbps > 0.0 {
             line.push(format!("{:.1} kbps", d.service.bitrate_kbps));

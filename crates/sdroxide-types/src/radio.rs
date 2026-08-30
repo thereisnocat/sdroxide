@@ -141,10 +141,24 @@ pub enum Backend {
     /// shares the Airspy's USB id. Appended last, for the same reason as
     /// `SmartSdr` above.
     HydraSdr,
+    /// A KiwiSDR or Web-888 (the board its listing calls "KiwiSDR 2") reached
+    /// over the network — the ~900 receivers published on `rx.kiwisdr.com`, and
+    /// any private one on the same firmware.
+    ///
+    /// The shape is [`Backend::SpyServerVfo`]'s: a *narrow* I/Q window that
+    /// follows the dial — the receiver's own audio channel, taken as I/Q at
+    /// about 12 kHz — plus the receiver's full 0-30 MHz waterfall as the band
+    /// view. Two WebSocket streams from one session, and the only two the
+    /// protocol offers; there is no wideband I/Q to ask for.
+    ///
+    /// Receive only, and not because of a missing feature: these are other
+    /// people's antennas. Appended last, for the same reason as `SmartSdr`
+    /// above.
+    KiwiSdr,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 20] = [
+    pub const ALL: [Backend; 21] = [
         Backend::Auto,
         Backend::Soapy,
         Backend::Cat,
@@ -157,6 +171,7 @@ impl Backend {
         Backend::RtlTcp,
         Backend::SpyServer,
         Backend::SpyServerVfo,
+        Backend::KiwiSdr,
         Backend::Rx888,
         Backend::AirspyHf,
         Backend::Airspy,
@@ -180,6 +195,7 @@ impl Backend {
             Backend::RtlTcp => "RTL-SDR over rtl_tcp (network)",
             Backend::SpyServer => "SpyServer (network)",
             Backend::SpyServerVfo => "SpyServer VFO+FFT, low bandwidth (network)",
+            Backend::KiwiSdr => "KiwiSDR / Web-888 (network)",
             Backend::Rx888 => "RX-888 (USB)",
             Backend::AirspyHf => "Airspy HF+ (USB)",
             Backend::Airspy => "Airspy R2 / Mini (USB)",
@@ -1419,17 +1435,46 @@ pub struct TciConfig {
     /// belongs to receiver 0's radio. `#[serde(default)]` on the struct keeps
     /// every existing `radio.json` on receiver 0, exactly as before.
     pub rx: u32,
+    /// How long after a `dds:` command the IQ actually arrives on the new
+    /// centre, in milliseconds — what the panadapter's axis has to be held back
+    /// by so a pan draws the band where it really is. See
+    /// `IqSource::stream_delay_s` for what goes wrong without it.
+    ///
+    /// Configurable because it belongs to the rig and the link rather than to
+    /// this protocol: nothing in TCI reports it (the `dds:` echo is a command
+    /// acknowledgement, returning in 0.4 ms), so it can only be declared. The
+    /// default is [`TciConfig::DEFAULT_STREAM_DELAY_MS`]; set it to 0 to switch
+    /// the compensation off entirely.
+    pub stream_delay_ms: f64,
 }
 
 impl Default for TciConfig {
     fn default() -> Self {
-        TciConfig { address: "127.0.0.1:50001".into(), iq_sample_rate_hz: 192_000.0, rx: 0 }
+        TciConfig {
+            address: "127.0.0.1:50001".into(),
+            iq_sample_rate_hz: 192_000.0,
+            rx: 0,
+            stream_delay_ms: TciConfig::DEFAULT_STREAM_DELAY_MS,
+        }
     }
 }
 
 impl TciConfig {
     /// IQ sample rates offered in the UI.
     pub const IQ_RATES: [f64; 3] = [48_000.0, 96_000.0, 192_000.0];
+
+    /// Measured on a SunSDR2DX through ExpertSDR3 over the loopback interface:
+    /// a `dds:` step took 109–131 ms to reach the samples at 192 kHz, 129 ms at
+    /// 96 kHz and 169 ms at 48 kHz — near enough one number rather than a fixed
+    /// count of samples, which is what a rig-side pipeline measured in
+    /// milliseconds looks like. Only 21 ms of it was sdroxide's own ring.
+    ///
+    /// One rig on one host, so it is a starting point and not a constant of
+    /// nature; a TCI server across a network will be slower. The cost of having
+    /// it wrong is bounded either way — the axis is off by the drag rate times
+    /// the *error*, where before it was off by the drag rate times the whole
+    /// delay.
+    pub const DEFAULT_STREAM_DELAY_MS: f64 = 130.0;
 }
 
 /// What the Icom's LAN audio stream is carrying.
@@ -2324,6 +2369,126 @@ impl SpyServerConfig {
             None => a.contains(':'),
         };
         if has_port { a.to_string() } else { format!("{a}:{}", Self::DEFAULT_PORT) }
+    }
+}
+
+/// A KiwiSDR or Web-888, reached over its web port. Receive only.
+///
+/// The receiver runs the whole front end: it decides the sample rate, it owns
+/// the AGC, and what arrives is one of its eight (or four) user channels taken
+/// as I/Q rather than as audio. So there is very little to configure here
+/// compared with a radio on a bus — an address, who to say we are, and how much
+/// of the link to spend on the waterfall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KiwiConfig {
+    /// `host` or `host:port`. The port may be left off and defaults to 8073,
+    /// which is what a Kiwi listens on out of the box — but note that the
+    /// project's own reverse proxy (`*.proxy.kiwisdr.com`, which is how nearly
+    /// half the public receivers are reached) answers on 80 instead, so an
+    /// address picked from the directory always carries its port explicitly.
+    pub address: String,
+    /// The *user* password, where the operator has set one. Not the admin
+    /// password, and usually empty: most public receivers ask for nothing.
+    pub password: String,
+    /// The name this end announces with `SET ident_user`, which the receiver's
+    /// owner and its other listeners can see.
+    ///
+    /// Empty means "the station callsign, or `sdroxide` when none is set" —
+    /// resolved where the source is opened, because this crate cannot reach the
+    /// configuration. Identifying is the network's convention rather than a
+    /// requirement, and some operators do block clients that will not.
+    pub ident: String,
+    /// Ask for the receiver's waterfall as well as its I/Q, to fill the
+    /// full-band strip.
+    ///
+    /// On by default. It is a second WebSocket carrying about 20 kB/s at the
+    /// default speed, against the I/Q's 44 kB/s — and without it the only band
+    /// view is the ~12 kHz the I/Q covers, which is not enough to tune by.
+    pub wide_lane: bool,
+    /// Waterfall frame rate, 1 (slowest) to 4. The receiver caps this at its
+    /// own `wf_fps_max`, which was 23 fps on the one this was measured against.
+    pub wf_speed: u8,
+    /// The *receiver's* AGC, which sits ahead of the I/Q and so ahead of
+    /// everything this program does.
+    ///
+    /// On by default, which is unlike every bus-attached backend here and is
+    /// deliberate. Measured on a live receiver, the manual gain was not
+    /// monotonic across its range and its top end clipped the I/Q at full
+    /// scale, while the AGC held about -24 dBFS RMS with 7 dB of headroom. An
+    /// AGC on the far side of the link is the lesser evil.
+    ///
+    /// It does mean the I/Q amplitude is not a signal level, which is why the
+    /// S-meter is read from the receiver's own per-frame figure instead.
+    pub agc: bool,
+    /// Fixed gain when [`Self::agc`] is off, on the receiver's own 0-90 scale.
+    /// Not decibels of anything stated: the protocol calls it `manGain` and
+    /// says nothing more.
+    pub man_gain: u8,
+}
+
+impl Default for KiwiConfig {
+    fn default() -> Self {
+        KiwiConfig {
+            address: String::new(),
+            password: String::new(),
+            ident: String::new(),
+            wide_lane: true,
+            wf_speed: 3,
+            agc: true,
+            man_gain: 50,
+        }
+    }
+}
+
+impl KiwiConfig {
+    /// The port a KiwiSDR serves its web UI on unless its operator moved it.
+    pub const DEFAULT_PORT: u16 = 8073;
+
+    /// Pseudo-elements, riding `SetGain` the way the SpyServer's do — see
+    /// [`SpyServerConfig::GAIN_ELEMENT`]. Here rather than in the driver
+    /// because the settings tab builds them and is shared with the wasm client,
+    /// which cannot see `sdroxide-kiwisdr`.
+    pub const AGC_ELEMENT: &'static str = "KIWIAGC";
+    pub const MAN_GAIN_ELEMENT: &'static str = "KIWIGAIN";
+    pub const WIDE_LANE_ELEMENT: &'static str = "KIWIWF";
+    pub const WF_SPEED_ELEMENT: &'static str = "KIWIWFSPD";
+
+    /// Slowest and fastest waterfall speeds the protocol accepts.
+    pub const WF_SPEED_MIN: u8 = 1;
+    pub const WF_SPEED_MAX: u8 = 4;
+
+    /// The configured address as `host:port`, supplying the default port when
+    /// the operator typed only a host. Same rule as [`RtlTcpConfig::endpoint`],
+    /// including the bracketed-IPv6 case.
+    pub fn endpoint(&self) -> String {
+        let a = self.address.trim();
+        let has_port = match a.rfind(']') {
+            Some(close) => a[close + 1..].starts_with(':'),
+            None => a.contains(':'),
+        };
+        if has_port { a.to_string() } else { format!("{a}:{}", Self::DEFAULT_PORT) }
+    }
+
+    /// What to announce as, given the station callsign. Empty callsign and
+    /// empty override both fall back to the program name, because announcing
+    /// nothing at all is what some operators block.
+    pub fn ident_or(&self, callsign: &str) -> String {
+        let explicit = self.ident.trim();
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+        let call = callsign.trim();
+        if call.is_empty() { "sdroxide".to_string() } else { format!("{call} (sdroxide)") }
+    }
+
+    /// Roughly what one connected receiver costs, in kilobytes a second, so the
+    /// settings tab can say it before the operator finds out.
+    ///
+    /// Measured, not derived: 44.3 kB/s of I/Q and 20.4 kB/s of waterfall at
+    /// `wf_speed` 4 against a KiwiSDR 1 running v1.902.
+    pub fn link_kbytes_s(&self) -> f64 {
+        44.3 + if self.wide_lane { 20.4 * f64::from(self.wf_speed.clamp(1, 4)) / 4.0 } else { 0.0 }
     }
 }
 
@@ -5679,6 +5844,9 @@ pub struct RadioConfig {
     /// HydraSDR RFOne. Appended after `soapy`, for the same reason as every
     /// field above it.
     pub hydrasdr: HydraSdrConfig,
+    /// KiwiSDR / Web-888. Appended after `hydrasdr`, for the same reason as
+    /// every field above it: the layout is positional.
+    pub kiwi: KiwiConfig,
 }
 
 #[cfg(test)]

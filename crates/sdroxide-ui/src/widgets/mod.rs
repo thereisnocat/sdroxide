@@ -2,6 +2,7 @@ pub mod bandplan;
 pub mod freq_display;
 pub mod memories;
 pub mod smeter;
+pub mod spectrum3d;
 pub mod spectrum_view;
 pub mod wide_spectrum;
 pub mod worldmap;
@@ -72,7 +73,7 @@ mod tests {
         let ctx = egui::Context::default();
         let input = egui::RawInput { events, ..Default::default() };
         let mut n = 0.0;
-        let _ = ctx.run_ui(input, |ui| n = wheel_detents(ui, false, acc));
+        ctx.run_ui(input, |ui| n = wheel_detents(ui, false, acc)).drop_without_applying_deltas();
         n
     }
 

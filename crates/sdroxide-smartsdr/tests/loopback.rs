@@ -543,3 +543,52 @@ fn transmit_audio_goes_to_the_radios_data_port() {
     assert_eq!(sdroxide_smartsdr::VITA_PORT, 4991);
     assert_ne!(sdroxide_smartsdr::VITA_PORT, sdroxide_smartsdr::RADIO_PORT);
 }
+
+#[test]
+fn iq_arrives_when_the_radio_streams_to_flexlibs_default_port() {
+    // A radio that never recorded our port streams to 4991, FlexLib's default.
+    // From inside the client that is indistinguishable from a firewall — the
+    // control link is perfect and no packet ever arrives — so the client listens
+    // there too, but only once the radio has refused the port it asked for.
+    let sim = SimRadio::start(SimConfig {
+        require_udp_register: true,
+        stream_to_default_port: true,
+        ..SimConfig::default()
+    })
+    .expect("start simulator");
+    let mut h = connect(&sim, 48_000.0);
+
+    if h.trace.dump().contains("is not available") {
+        // Something on this machine already holds 4991 — SmartSDR, its DAX
+        // service, or another run of this test. Refusing to bind it is the
+        // correct behaviour, so there is nothing left here to assert.
+        return;
+    }
+
+    let iq = collect_iq(&mut h, 2048);
+    assert!(
+        iq.len() >= 2048,
+        "nothing was received on the fallback port — got {} samples:\n{}",
+        iq.len(),
+        h.trace.dump()
+    );
+    assert!(
+        h.trace.dump().contains("`client udpport` did not take"),
+        "the trace does not say the radio ignored our port:\n{}",
+        h.trace.dump()
+    );
+}
+
+#[test]
+fn the_diagnostic_report_distinguishes_the_two_silences() {
+    // "No spectrum" has two causes with different fixes: nothing reached this
+    // machine (a network fault), or something did and we could not read it
+    // (ours). A report that cannot tell them apart sends everybody to the wrong
+    // one, so the raw datagram count is part of it.
+    let sim = sim();
+    let mut h = connect(&sim, 48_000.0);
+    collect_iq(&mut h, 2048);
+    let dump = h.trace.dump();
+    assert!(dump.contains("datagrams received on the VITA-49 socket(s):"), "{dump}");
+    assert!(!dump.contains("no UDP at all"), "packets arrived, so this must not be claimed");
+}

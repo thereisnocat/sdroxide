@@ -42,6 +42,12 @@ const MARKER_GRAB_PX: f32 = 5.0;
 /// about twice as long — which is how a weighted VFO knob behaves and what
 /// makes the gesture predictable.
 const FLING_FRICTION: f32 = 1400.0;
+/// How far a drag on the frequency-scale strip has to travel before it is
+/// claimed as a resize or as a sideways pan. Far enough that the pointer's
+/// direction means something, short enough that neither gesture feels like it
+/// took a moment to start.
+const SCALE_AXIS_LOCK: f32 = 4.0;
+
 /// Viscous drag, per second, on top of the friction. Stops a very hard flick
 /// from crossing half a band without making a gentle one feel sticky: an
 /// ordinary flick coasts under a second and about half a panadapter width, a
@@ -100,6 +106,26 @@ pub struct WindowPan {
     /// the gap between them is a refusal the engine would answer sixty times a
     /// second.
     pub limits: (f64, f64),
+    /// The widest window the view may be zoomed out to, `(centre, span)`, when
+    /// that is wider than the I/Q the front end is streaming.
+    ///
+    /// Set from the full-band lane, where there is one: a KiwiSDR sends 12 kHz
+    /// of I/Q and a picture of the whole 0-30 MHz, a SpyServer a decimated
+    /// stream and an FFT of the band around it. Zooming out past the I/Q is
+    /// then a real question with a real answer, and the engine draws those
+    /// spans from the wide bins.
+    ///
+    /// `None` on a front end whose I/Q is all there is, where the passband is
+    /// the end of the zoom and always was.
+    pub outer: Option<(f64, f64)>,
+    /// Whether the front end has described itself yet.
+    ///
+    /// False in the gap between the first `State` and the first
+    /// `Capabilities` — a couple of frames, and long enough to do damage: the
+    /// passband is known there but the full-band lane is not, so bounding the
+    /// view would shrink a restored window to the I/Q and the operator's zoom
+    /// would be gone before the answer arrived.
+    pub known: bool,
 }
 
 impl WindowPan {
@@ -116,7 +142,22 @@ impl WindowPan {
             .find(|&&(lo, hi)| (lo..=hi).contains(&center_hz))
             .copied()
             .unwrap_or((f64::MIN, f64::MAX));
-        Self { movable: !caps.audio_mode && !caps.center_is_dial, limits }
+        Self { movable: !caps.audio_mode && !caps.center_is_dial, limits, outer: None, known: true }
+    }
+
+    /// Add the full-band window the view may zoom out into — see
+    /// [`WindowPan::outer`]. Ignored unless it is genuinely wider than the I/Q,
+    /// so a front end whose "wide" lane is no bigger than its passband (an
+    /// Icom's scope at a narrow span) is left exactly as it was.
+    pub fn with_outer(mut self, wide: Option<(f64, f64)>, iq_span: f64) -> Self {
+        self.outer = wide.filter(|&(_, span)| span > iq_span && iq_span > 0.0);
+        self
+    }
+
+    /// The window the view may be zoomed and panned inside: the full-band lane
+    /// where there is one, else the I/Q passband.
+    fn view_bounds(&self, dev_center: f64, dev_span: f64) -> (f64, f64) {
+        self.outer.unwrap_or((dev_center, dev_span))
     }
 }
 
@@ -170,6 +211,53 @@ fn gesture_step(carried: Option<f64>, echoed: f64, dhz: f64) -> f64 {
     carried.unwrap_or(echoed) + dhz
 }
 
+/// Bring the receiver to a view that has been zoomed back in somewhere it is
+/// not listening.
+///
+/// Only on a front end whose I/Q is a narrow window onto a wider band — one
+/// with a full-band lane ([`WindowPan::outer`]). There, zooming out shows the
+/// whole band from that lane and zooming back in lands wherever the pointer
+/// was, which is usually *not* the slice the receiver is streaming. The
+/// panadapter then goes on drawing from the coarse full-band bins however far
+/// in the operator zooms, because those really are the only bins covering what
+/// they are looking at — detail that never arrives, and no visible reason why.
+///
+/// So the receiver follows. On these front ends the panadapter *is* the
+/// receiver: there is no looking without listening, and a zoom onto a signal
+/// is a request to hear it — the same request clicking the full-band strip
+/// makes, answered the same way.
+///
+/// Two conditions keep it quiet. The view has to have come back inside a
+/// passband's *width*, so panning about while zoomed out never retunes
+/// anything; and the dial has to be outside the view, which is what makes this
+/// fire once and then stop — once the engine has brought the receiver over,
+/// the dial is in the view and there is nothing left to ask for.
+fn follow_view_into_the_band(
+    view: &ViewState,
+    state: &RadioState,
+    dev_center: f64,
+    dev_span: f64,
+    pan: WindowPan,
+    cmds: &mut Vec<Command>,
+) {
+    if pan.outer.is_none() || !(dev_span > 0.0) || view.span() > dev_span {
+        return;
+    }
+    let (v_lo, v_hi) = (view.view_lo_hz, view.view_hi_hz);
+    // Already looking at what is being received: the passband covers the view.
+    let (dev_lo, dev_hi) = (dev_center - dev_span / 2.0, dev_center + dev_span / 2.0);
+    if v_lo >= dev_lo && v_hi <= dev_hi {
+        return;
+    }
+    // Already asked: the dial is in the view and the engine is bringing the
+    // receiver over. Asking again every frame would be a retune per frame.
+    let vfo = state.active_freq_hz();
+    if (v_lo..=v_hi).contains(&vfo) {
+        return;
+    }
+    cmds.push(Command::SetVfo { vfo: state.active_vfo, hz: (v_lo + v_hi) / 2.0 });
+}
+
 fn pan_center(
     dev_center: &mut f64,
     state: &mut RadioState,
@@ -189,6 +277,29 @@ fn pan_center(
     *dev_center = hz;
     state.center_hz = hz;
     cmds.push(Command::SetCenter(hz));
+}
+
+/// Slide the window so `vfo` sits in the middle of it, and report what the
+/// captured span could not absorb — the amount the front end's own centre has
+/// to move for the dial to be centred, which is nothing at all while the view
+/// is still a viewport onto a wider window.
+///
+/// Below one display column the overshoot is reported as zero: a retune costs
+/// a waterfall remap and, on some front ends, a skimmer restart, and a slide
+/// narrower than a pixel is not visible to anyone. The view is still moved by
+/// it, so the sub-pixel remainders accumulate rather than being lost and the
+/// front end is asked once the total is worth asking for.
+fn center_on_dial(
+    view: &mut ViewState,
+    vfo: f64,
+    dev_center: f64,
+    dev_span: f64,
+    width_px: f32,
+) -> f64 {
+    let dhz = vfo - (view.view_lo_hz + view.view_hi_hz) / 2.0;
+    let over = pan_view(view, dhz, dev_center, dev_span);
+    let column = if width_px > 1.0 { dev_span / width_px as f64 } else { 0.0 };
+    if over.abs() >= column { over } else { 0.0 }
 }
 
 /// The sub receiver's colour, on the panadapter and on its control module.
@@ -224,6 +335,12 @@ pub struct WfTuning {
     pub spectrum_alpha: f32,
     /// Waterfall colour-palette index (from `UiSettings`).
     pub palette: usize,
+    /// Rows a second the 3D spectrum flows away from the viewer, from the SPEC
+    /// popup's **flow** row. Zero while the stream is stalled, which is what
+    /// holds the surface still — the same rule that stops the waterfall
+    /// scrolling rather than filling it with rows of a spectrum nobody is
+    /// measuring any more.
+    pub surface_rows_per_sec: f32,
     /// Optional vertical gradient `(top, bottom)` filling the spectrum area,
     /// `None` when disabled in the UI settings.
     pub gradient: Option<(Color32, Color32)>,
@@ -991,6 +1108,11 @@ pub fn show_ext(
     peaks: &mut PeakHold,
     smooth: &mut SpectrumSmooth,
     trace: &mut TraceCache,
+    // The remembered spectra behind the 3D surface, when the SPEC popup's 3D
+    // chip is lit. Kept by the app rather than here for the same reason the
+    // smoothing and the peak hold are: it is history, and a widget redrawn
+    // from scratch every frame has nowhere to keep any.
+    surface: &mut crate::widgets::spectrum3d::Surface,
     cursor: Option<AudioCursor>,
     // FT8 DXpedition role. Anything but `Normal` shades the two halves of the
     // passband the pile-up divides itself into, with the half we operate in
@@ -1065,6 +1187,11 @@ pub fn show_ext(
     // one being asked for, not the one being left.
     let mut dev_center = state.center_hz;
     let dev_span = state.sample_rate;
+    // How far the view may zoom and pan: the full-band lane where the front end
+    // has one, else the passband. Distinct from `dev_*` above, which stays the
+    // I/Q and goes on bounding the things that really are limited by it — the
+    // sub receiver's DDC, and the zoom-in resolution floor.
+    let (zoom_center, zoom_span) = pan.view_bounds(dev_center, dev_span);
     // Both receivers are DDCs on this one IQ stream, so nothing outside these
     // edges can be tuned — the sub gets clamped to them.
     let dev_lo = dev_center - dev_span / 2.0;
@@ -1089,6 +1216,23 @@ pub fn show_ext(
     let spec_rect = Rect::from_min_size(rect.min, vec2(rect.width(), spec_h));
     let scale_rect =
         Rect::from_min_size(pos2(rect.left(), spec_rect.bottom()), vec2(rect.width(), scale_h()));
+    // What the marks that annotate the *current* spectrum are drawn across —
+    // the passband wash, the filter edge grips, the tuning lines. The whole
+    // strip for the flat trace, and only its front plane for the 3D surface:
+    // there the newest spectrum is the bottom of the picture and everything
+    // above it is time already gone, so a line drawn the full height would cut
+    // through rows the filter was never set on. See `spectrum3d::front_plane_h`.
+    let spec_marks = if view.spectrum_3d {
+        Rect::from_min_max(
+            pos2(
+                spec_rect.left(),
+                spec_rect.bottom() - crate::widgets::spectrum3d::front_plane_h(spec_h),
+            ),
+            spec_rect.max,
+        )
+    } else {
+        spec_rect
+    };
     let wf_rect = Rect::from_min_max(pos2(rect.left(), scale_rect.bottom()), rect.max);
 
     // Where the spot lanes and their ticks go. Normally the waterfall, since
@@ -1177,10 +1321,19 @@ pub fn show_ext(
     let mut sub_drag: bool = ui.data(|d| d.get_temp(sub_drag_id)).unwrap_or(false);
     let hover_sub = resp.hover_pos().map(sub_grab_at).unwrap_or(false) && hover_edge.is_none();
 
-    // The frequency-scale strip doubles as the spectrum/waterfall resize grip:
-    // a vertical drag there changes the spectrum height.
+    // The frequency-scale strip doubles as the spectrum/waterfall resize grip
+    // and as the frequency axis: a vertical drag there changes the spectrum
+    // height, a sideways one slides the band along under the picture
+    // (issue #174).
     let resize_id = ui.id().with("spec-resize");
     let mut resizing: bool = ui.data(|d| d.get_temp(resize_id)).unwrap_or(false);
+    // Which of the two a strip drag turned out to be — `None` until it has
+    // travelled far enough to have a direction, then `Some(true)` for the
+    // sideways pan and `Some(false)` for the resize, and it keeps that for the
+    // rest of the gesture. Without the lock a resize would shift the band every
+    // time the pointer wandered and a pan would quietly rewrite the split.
+    let scale_axis_id = ui.id().with("scale-axis");
+    let mut scale_axis: Option<bool> = ui.data(|d| d.get_temp(scale_axis_id)).unwrap_or(None);
     let hover_resize =
         !waterfall_only && resp.hover_pos().map(|p| scale_rect.contains(p)).unwrap_or(false);
 
@@ -1241,6 +1394,7 @@ pub fn show_ext(
             sub_drag = false;
             resizing = false;
             bw_fade = None;
+            scale_axis = None;
         } else {
             edge = origin.and_then(edge_at);
             sub_drag = edge.is_none() && origin.map(sub_grab_at).unwrap_or(false);
@@ -1252,11 +1406,13 @@ pub fn show_ext(
                 && !sub_drag
                 && origin.map(|p| scale_rect.contains(p)).unwrap_or(false);
             measuring = None;
+            scale_axis = None;
         }
         ui.data_mut(|d| {
             d.insert_temp(edge_id, edge);
             d.insert_temp(sub_drag_id, sub_drag);
             d.insert_temp(resize_id, resizing);
+            d.insert_temp(scale_axis_id, scale_axis);
             d.insert_temp(measure_id, measuring);
             d.insert_temp(fade_id, bw_fade);
         });
@@ -1308,6 +1464,8 @@ pub fn show_ext(
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
     } else if hover_sub {
         ui.ctx().set_cursor_icon(CursorIcon::Grab);
+    } else if scale_axis == Some(true) {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     } else if hover_resize || resizing {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
@@ -1363,15 +1521,46 @@ pub fn show_ext(
         // Bandwidth measurement — no tuning or panning; drawn in the overlay
         // pass at the end.
     } else if resizing && resp.dragged_by(egui::PointerButton::Primary) {
-        // Spectrum/waterfall resize — set the spectrum height from the pointer.
-        if let Some(p) = resp.interact_pointer_pos() {
-            let usable = (rect.height() - scale_h()).max(1.0);
-            view.spectrum_fraction = ((p.y - rect.top()) / usable).clamp(0.10, 0.85);
-            // Dragging the divider asks for a split, so whichever layer was
-            // switched off comes back — this is the way out of either
-            // one-layer view without going back to the SPEC popup.
-            view.spectrum_collapsed = false;
-            view.waterfall_collapsed = false;
+        // A strip drag is one gesture or the other, decided once it has gone
+        // far enough to mean something and held for the rest of the drag.
+        // Below that it does nothing at all: the resize reads the pointer's
+        // absolute height, so a gesture that turns out to be one catches up in
+        // the frame it is claimed and nothing is lost by waiting.
+        if scale_axis.is_none() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            if let (Some(p), Some(o)) = (resp.interact_pointer_pos(), origin) {
+                let travel = p - o;
+                if travel.length() >= SCALE_AXIS_LOCK {
+                    scale_axis = Some(travel.x.abs() > travel.y.abs());
+                }
+            }
+        }
+        match scale_axis {
+            // Sideways: slide the band under the picture, and only the band —
+            // the axis says where the window is, not where the dial is, so
+            // this never turns the VFO. What the captured span cannot absorb
+            // moves the front end's own centre, which is the only way the axis
+            // can keep going once the view is the whole window.
+            Some(true) => {
+                let dhz = -resp.drag_delta().x as f64 * view.span() / rect.width() as f64;
+                let over = pan_view(view, dhz, zoom_center, zoom_span);
+                pan_center(&mut dev_center, state, over, pan, cmds);
+            }
+            // Spectrum/waterfall resize — set the spectrum height from the
+            // pointer.
+            Some(false) => {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let usable = (rect.height() - scale_h()).max(1.0);
+                    view.spectrum_fraction = ((p.y - rect.top()) / usable).clamp(0.10, 0.85);
+                    // Dragging the divider asks for a split, so whichever layer
+                    // was switched off comes back — this is the way out of
+                    // either one-layer view without going back to the SPEC
+                    // popup.
+                    view.spectrum_collapsed = false;
+                    view.waterfall_collapsed = false;
+                }
+            }
+            None => {}
         }
     } else if let (Some((rx, is_hi)), true) = (edge, resp.dragged_by(egui::PointerButton::Primary))
     {
@@ -1413,7 +1602,7 @@ pub fn show_ext(
         // is what this gesture exists to promise it will not do; at the edge it
         // stops.
         let dhz = -pointer_delta.x as f64 * view.span() / rect.width() as f64;
-        pan_view(view, dhz, dev_center, dev_span);
+        pan_view(view, dhz, zoom_center, zoom_span);
     } else if resp.dragged_by(egui::PointerButton::Primary) {
         // Left-drag: grab the spectrum and slide it — content follows the
         // mouse, and the tuning follows the content (dragging right tunes
@@ -1425,7 +1614,7 @@ pub fn show_ext(
         // already turning the dial, because a window that moves takes the dial
         // with it whether anyone asked or not (issue #133).
         let dhz = -resp.drag_delta().x as f64 * view.span() / rect.width() as f64;
-        let over = pan_view(view, dhz, dev_center, dev_span);
+        let over = pan_view(view, dhz, zoom_center, zoom_span);
         if wheel.drag_tunes {
             // Ahead of the dial: the two move by the same amount, so a window
             // moved first leaves the dial exactly where it was inside it and
@@ -1664,7 +1853,7 @@ pub fn show_ext(
                 // Grab-the-content sense, matching the left-drag: the view slides
                 // with the dial so the VFO marker keeps its place on screen, and
                 // the window follows once the view has run out of room.
-                let over = pan_view(view, -dhz, dev_center, dev_span);
+                let over = pan_view(view, -dhz, zoom_center, zoom_span);
                 pan_center(&mut dev_center, state, over, pan, cmds);
                 let hz = gesture_step(gesture_dial, state.active_freq_hz(), -dhz).max(0.0);
                 gesture_dial = Some(hz);
@@ -1697,7 +1886,37 @@ pub fn show_ext(
         d.insert_temp(fling_id, fling);
         d.insert_temp(stop_click_id, stop_click);
         d.insert_temp(gesture_dial_id, gesture_dial);
+        d.insert_temp(scale_axis_id, scale_axis);
     });
+
+    // Centre tuning (issue #174): keep the dial in the middle of the window.
+    //
+    // Edge-triggered on the dial *moving*, not held every frame, so a pan or a
+    // zoom-about-the-cursor still goes where it was put and only the next tune
+    // brings the marker home. The memo is dropped while the mode is off, which
+    // is what makes switching it on centre at once — that click is also the
+    // "centre the display now" button the issue asked for.
+    //
+    // Zoomed in this costs nothing: the window slides inside the captured span
+    // and the hardware never hears about it. Zoomed right out `pan_view` has no
+    // room to give and hands the whole move on, and the front end's own centre
+    // follows the dial — the same path a drag at the edge takes. Below a
+    // column's worth of movement the front end is left alone: a retune costs a
+    // waterfall remap and, on some front ends, a skimmer restart, and nobody
+    // can see a sub-pixel slide.
+    let centring_id = ui.id().with("centre-on-vfo");
+    let centred_at: Option<f64> = ui.data(|d| d.get_temp(centring_id)).unwrap_or(None);
+    if view.center_on_vfo {
+        let vfo = state.active_freq_hz();
+        if centred_at.is_none_or(|was| (was - vfo).abs() > 0.5) {
+            let over = center_on_dial(view, vfo, zoom_center, zoom_span, rect.width());
+            pan_center(&mut dev_center, state, over, pan, cmds);
+        }
+        ui.data_mut(|d| d.insert_temp(centring_id, Some(vfo)));
+    } else if centred_at.is_some() {
+        ui.data_mut(|d| d.insert_temp(centring_id, None::<f64>));
+    }
+
     let view_log_id = ui.id().with("view-log");
 
     // The panadapter's whole zoom/pan story in one line, and only when it
@@ -1707,7 +1926,11 @@ pub fn show_ext(
     // (`span_after` < `span_before`), and a view that moved freely while the
     // picture did not follow (span changes here, waterfall does not).
     let span_before = view.span();
-    view.clamp_to(dev_center, dev_span);
+    // Not before the front end has said what it is: see [`WindowPan::known`].
+    if pan.known {
+        view.clamp_to(zoom_center, zoom_span);
+    }
+    follow_view_into_the_band(view, state, dev_center, dev_span, pan, cmds);
     let (lo_now, hi_now, span_now) = (view.view_lo_hz, view.view_hi_hz, view.span());
     if ui.data(|d| d.get_temp::<(f64, f64)>(view_log_id)) != Some((lo_now, hi_now)) {
         ui.data_mut(|d| d.insert_temp(view_log_id, (lo_now, hi_now)));
@@ -1753,28 +1976,55 @@ pub fn show_ext(
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
             painter.add(Shape::mesh(mesh));
         }
-        draw_grid(&painter, view, &spec_rect);
-        if view.peak_hold {
-            peaks.update(f);
-            let key = trace_key(f, peaks.generation, view, &spec_rect, wf.row_scale);
-            let pts = trace.hold.points_for(key, || {
-                compute_trace(view, f, Some(&peaks.bins), &spec_rect, wf.row_scale)
-            });
-            painter.add(Shape::line(
-                pts,
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 90, 170)),
-            ));
-        } else {
-            peaks.clear();
-        }
-        // Live trace: UI-smoothed (per the spectrum-speed setting) so the line's
-        // reaction speed is independent of the un-averaged waterfall detail.
+        // UI-smoothed (per the spectrum-speed setting) so the line's reaction
+        // speed is independent of the un-averaged waterfall detail. Folded in
+        // before either display is drawn: the 3D surface remembers these same
+        // bins, so the reaction setting steadies it exactly as it steadies the
+        // flat trace.
         smooth.update(f, wf.spectrum_alpha);
-        let key = trace_key(f, smooth.generation, view, &spec_rect, wf.row_scale);
-        let pts = trace.live.points_for(key, || {
-            compute_trace(view, f, Some(&smooth.bins), &spec_rect, wf.row_scale)
-        });
-        painter.add(Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(120, 220, 255))));
+        if view.spectrum_3d {
+            // Time has the depth axis instead of being thrown away. The flat
+            // grid and the peak hold are both statements about a single line
+            // and have nothing to say about a surface, so neither is drawn —
+            // the surface brings its own floor and its own amplitude axis.
+            peaks.clear();
+            surface.push(
+                f.center_hz,
+                f.span_hz,
+                &smooth.bins,
+                wf.now_unix,
+                wf.surface_rows_per_sec,
+            );
+            crate::widgets::spectrum3d::draw(
+                &painter,
+                &spec_rect,
+                view,
+                surface,
+                view.spectrum_3d_solid,
+                wf.palette,
+            );
+        } else {
+            surface.clear();
+            draw_grid(&painter, view, &spec_rect);
+            if view.peak_hold {
+                peaks.update(f);
+                let key = trace_key(f, peaks.generation, view, &spec_rect, wf.row_scale);
+                let pts = trace.hold.points_for(key, || {
+                    compute_trace(view, f, Some(&peaks.bins), &spec_rect, wf.row_scale)
+                });
+                painter.add(Shape::line(
+                    pts,
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 90, 170)),
+                ));
+            } else {
+                peaks.clear();
+            }
+            let key = trace_key(f, smooth.generation, view, &spec_rect, wf.row_scale);
+            let pts = trace.live.points_for(key, || {
+                compute_trace(view, f, Some(&smooth.bins), &spec_rect, wf.row_scale)
+            });
+            painter.add(Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(120, 220, 255))));
+        }
     }
     draw_scale(&painter, view, &scale_rect);
 
@@ -1835,7 +2085,7 @@ pub fn show_ext(
         // waterfall, so the filter width stays visible when collapsed.
         if spec_h > 1.0 {
             painter.rect_filled(
-                Rect::from_min_max(pos2(x0c, spec_rect.top()), pos2(x1c, spec_rect.bottom())),
+                Rect::from_min_max(pos2(x0c, spec_marks.top()), pos2(x1c, spec_marks.bottom())),
                 0.0,
                 Color32::from_rgba_unmultiplied(255, 90, 90, 26),
             );
@@ -1858,7 +2108,7 @@ pub fn show_ext(
                 } else {
                     crate::theme::scope_gray(90)
                 };
-                painter.vline(x, spec_rect.y_range(), Stroke::new(w, color));
+                painter.vline(x, spec_marks.y_range(), Stroke::new(w, color));
             }
             let wf_color = if hot {
                 Color32::from_rgba_unmultiplied(255, 170, 90, 200)
@@ -1871,7 +2121,7 @@ pub fn show_ext(
 
     if in_view(vfo_hz) {
         let x = view.freq_to_x(vfo_hz, &rect);
-        painter.vline(x, spec_rect.y_range(), Stroke::new(1.0, Color32::from_rgb(255, 60, 60)));
+        painter.vline(x, spec_marks.y_range(), Stroke::new(1.0, Color32::from_rgb(255, 60, 60)));
         painter.vline(
             x,
             wf_rect.y_range(),
@@ -1890,7 +2140,10 @@ pub fn show_ext(
         if sx1c > sx0c {
             if spec_h > 1.0 {
                 painter.rect_filled(
-                    Rect::from_min_max(pos2(sx0c, spec_rect.top()), pos2(sx1c, spec_rect.bottom())),
+                    Rect::from_min_max(
+                        pos2(sx0c, spec_marks.top()),
+                        pos2(sx1c, spec_marks.bottom()),
+                    ),
                     0.0,
                     Color32::from_rgba_unmultiplied(c_r, c_g, c_b, 30),
                 );
@@ -1911,7 +2164,7 @@ pub fn show_ext(
                     } else {
                         Color32::from_rgba_unmultiplied(c_r, c_g, c_b, 110)
                     };
-                    painter.vline(x, spec_rect.y_range(), Stroke::new(w, color));
+                    painter.vline(x, spec_marks.y_range(), Stroke::new(w, color));
                 }
                 painter.vline(
                     x,
@@ -1928,7 +2181,7 @@ pub fn show_ext(
             // The tuning line thickens under the pointer so the operator can
             // see they have hold of it before they start dragging.
             let w = if hover_sub || sub_drag { 2.5 } else { 1.5 };
-            painter.vline(x, spec_rect.y_range(), Stroke::new(w, SUB_COLOR));
+            painter.vline(x, spec_marks.y_range(), Stroke::new(w, SUB_COLOR));
             painter.vline(
                 x,
                 wf_rect.y_range(),
@@ -2015,7 +2268,7 @@ pub fn show_ext(
         let hz = state.rx_freq_hz() + a as f64;
         if in_view(hz) {
             let x = view.freq_to_x(hz, &rect);
-            painter.vline(x, spec_rect.y_range(), Stroke::new(1.5, crate::theme::scope().accent));
+            painter.vline(x, spec_marks.y_range(), Stroke::new(1.5, crate::theme::scope().accent));
             painter.vline(
                 x,
                 wf_rect.y_range(),
@@ -2029,7 +2282,7 @@ pub fn show_ext(
         if in_view(hz) {
             let x = view.freq_to_x(hz, &rect);
             let c = Color32::from_rgb(255, 190, 90);
-            painter.vline(x, spec_rect.y_range(), Stroke::new(1.0, c));
+            painter.vline(x, spec_marks.y_range(), Stroke::new(1.0, c));
             painter.vline(
                 x,
                 wf_rect.y_range(),
@@ -2048,7 +2301,7 @@ pub fn show_ext(
     if in_view(inactive_hz) {
         let x = view.freq_to_x(inactive_hz, &rect);
         let color = Color32::from_rgba_unmultiplied(255, 170, 40, 90);
-        painter.vline(x, spec_rect.y_range(), Stroke::new(1.0, color));
+        painter.vline(x, spec_marks.y_range(), Stroke::new(1.0, color));
         painter.vline(
             x,
             wf_rect.y_range(),
@@ -2337,6 +2590,9 @@ pub fn show_ext(
             // Item 6: crosshair + click-tune frequency readout.
             let line = Color32::from_rgba_unmultiplied(185, 205, 225, 70);
             if spec_h > 1.0 {
+                // The whole strip, not `spec_marks`: this one follows the
+                // pointer, and a crosshair that stopped short of wherever the
+                // pointer actually is would read as a broken one.
                 painter.vline(p.x, spec_rect.y_range(), Stroke::new(1.0, line));
             }
             painter.vline(p.x, wf_rect.y_range(), Stroke::new(1.0, line));
@@ -2707,7 +2963,8 @@ fn draw_grid(painter: &egui::Painter, view: &ViewState, rect: &Rect) {
             db += 20.0;
         }
     }
-    for hz in freq_gridlines(view.view_lo_hz, view.view_hi_hz) {
+    let step = freq_grid_step_for_width(view.view_lo_hz, view.view_hi_hz, rect.width());
+    for hz in gridlines_at(view.view_lo_hz, view.view_hi_hz, step) {
         let x = view.freq_to_x(hz, rect);
         painter.vline(x, rect.y_range(), grid);
     }
@@ -2715,7 +2972,20 @@ fn draw_grid(painter: &egui::Painter, view: &ViewState, rect: &Rect) {
 
 fn draw_scale(painter: &egui::Painter, view: &ViewState, rect: &Rect) {
     painter.rect_filled(*rect, 0.0, Color32::from_gray(20));
-    for hz in freq_gridlines(view.view_lo_hz, view.view_hi_hz) {
+    let step = freq_grid_step_for_width(view.view_lo_hz, view.view_hi_hz, rect.width());
+    // Unlabelled ticks between the labelled ones, the way the full-band strip
+    // above already draws its scale. A label every hundred points is as many
+    // numbers as the strip can hold, but placing a signal against the axis by
+    // eye wants marks in between — that is the other half of what issue #174
+    // asked for, and a tick costs no width at all.
+    for hz in gridlines_at(view.view_lo_hz, view.view_hi_hz, minor_grid_step(step)) {
+        painter.vline(
+            view.freq_to_x(hz, rect),
+            egui::Rangef::new(rect.top(), rect.top() + 3.0),
+            Stroke::new(1.0, crate::theme::scope_gray(80)),
+        );
+    }
+    for hz in gridlines_at(view.view_lo_hz, view.view_hi_hz, step) {
         let x = view.freq_to_x(hz, rect);
         painter.vline(
             x,
@@ -2754,21 +3024,163 @@ fn time_grid_step_s(visible_secs: f64) -> f64 {
 /// ([`crate::widgets::wide_spectrum`]), whose axis is the front end's whole
 /// window rather than a panadapter viewport, divides its scale the same way.
 pub(crate) fn freq_grid_step(lo_hz: f64, hi_hz: f64) -> f64 {
-    let raw = (hi_hz - lo_hz) / 8.0;
+    round_step((hi_hz - lo_hz) / 8.0)
+}
+
+/// The smallest 1/2/5·10^k step at or above `raw`, so a computed spacing comes
+/// out as a frequency a human reads as round.
+fn round_step(raw: f64) -> f64 {
     let mag = 10f64.powf(raw.log10().floor());
     [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|&s| s >= raw).unwrap_or(mag * 10.0)
 }
 
-/// Gridline frequencies inside a range, at [`freq_grid_step`].
-pub(crate) fn freq_gridlines(lo_hz: f64, hi_hz: f64) -> Vec<f64> {
-    let step = freq_grid_step(lo_hz, hi_hz);
+/// Points of panadapter a labelled frequency marker is given to itself.
+///
+/// The labels are `{:.4}` MHz in monospace at [`crate::theme::panadapter_font_scale`],
+/// so the widest of them — a 10 GHz dial, ten characters — is around 60 points
+/// at the smallest step of the three. This leaves room for that and a gap.
+const FREQ_LABEL_PITCH: f32 = 96.0;
+
+/// [`freq_grid_step`] for an axis `width_px` points wide.
+///
+/// The fixed eighth was a spacing chosen for no particular screen: across a
+/// wide monitor it leaves four or five labels over a thousand points, which is
+/// what issue #174 asked for more of, while on a phone the same eighth ran the
+/// labels into each other. Dividing by the width instead gives one marker per
+/// [`FREQ_LABEL_PITCH`] points wherever the panadapter is drawn, and the 1/2/5
+/// rounding keeps them on round frequencies.
+///
+/// Bounded either way: at least three markers, so even the narrowest strip has
+/// an axis rather than a lone number, and at most twenty, because past that
+/// they are a texture and not a scale.
+pub(crate) fn freq_grid_step_for_width(lo_hz: f64, hi_hz: f64, width_px: f32) -> f64 {
+    let scale = crate::theme::panadapter_font_scale();
+    let lines = (width_px / (FREQ_LABEL_PITCH * scale)).clamp(3.0, 20.0) as f64;
+    round_step((hi_hz - lo_hz) / lines)
+}
+
+/// Tick spacing between two labelled gridlines: a fifth of the step, or a half
+/// when the step is 2·10^k — the two that land on round frequencies.
+pub(crate) fn minor_grid_step(step_hz: f64) -> f64 {
+    let mag = 10f64.powf(step_hz.log10().floor());
+    if (step_hz / mag).round() == 2.0 { step_hz / 2.0 } else { step_hz / 5.0 }
+}
+
+/// Gridline frequencies inside a range, at `step`.
+pub(crate) fn gridlines_at(lo_hz: f64, hi_hz: f64, step: f64) -> Vec<f64> {
     let mut out = Vec::new();
+    if !step.is_finite() || step <= 0.0 || hi_hz <= lo_hz {
+        return out;
+    }
     let mut hz = (lo_hz / step).ceil() * step;
     while hz <= hi_hz {
         out.push(hz);
         hz += step;
     }
     out
+}
+
+/// Gridline frequencies inside a range, at [`freq_grid_step`].
+pub(crate) fn freq_gridlines(lo_hz: f64, hi_hz: f64) -> Vec<f64> {
+    gridlines_at(lo_hz, hi_hz, freq_grid_step(lo_hz, hi_hz))
+}
+
+#[cfg(test)]
+mod centring_tests {
+    use super::*;
+
+    fn view_spanning(lo: f64, hi: f64) -> ViewState {
+        ViewState { view_lo_hz: lo, view_hi_hz: hi, ..ViewState::default() }
+    }
+
+    /// Zoomed in, centring is free: the window is a viewport onto a wider
+    /// captured span, so it slides under the dial and the receiver is never
+    /// told about it.
+    #[test]
+    fn centring_a_zoomed_view_asks_the_front_end_for_nothing() {
+        // 20 kHz of a 1 MHz window, and the dial 5 kHz above the middle of it.
+        let mut v = view_spanning(990_000.0, 1_010_000.0);
+        let over = center_on_dial(&mut v, 1_005_000.0, 1_000_000.0, 1_000_000.0, 1000.0);
+        assert_eq!(over, 0.0, "a zoomed-in slide reached the hardware");
+        assert_eq!((v.view_lo_hz, v.view_hi_hz), (995_000.0, 1_015_000.0));
+    }
+
+    /// Zoomed right out there is nowhere left to slide, so the whole move is
+    /// handed to the front end — which is the part that makes the picture
+    /// scroll instead of jumping a window at a time (issue #174).
+    #[test]
+    fn centring_at_full_zoom_out_hands_the_whole_move_over() {
+        let mut v = view_spanning(0.0, 1_000_000.0);
+        let over = center_on_dial(&mut v, 520_000.0, 500_000.0, 1_000_000.0, 1000.0);
+        assert!((over - 20_000.0).abs() < 0.5, "the front end was asked for {over} Hz, not 20 kHz");
+    }
+
+    /// A slide narrower than one column of the picture is not worth a retune:
+    /// the view still takes it — so the remainders add up rather than being
+    /// thrown away — but the front end is left alone until they come to a
+    /// pixel.
+    #[test]
+    fn a_sub_pixel_slide_leaves_the_front_end_alone() {
+        // 1 Msps across 1000 points is a kilohertz a column; the dial moves 100 Hz.
+        let mut v = view_spanning(0.0, 1_000_000.0);
+        let over = center_on_dial(&mut v, 500_100.0, 500_000.0, 1_000_000.0, 1000.0);
+        assert_eq!(over, 0.0, "a tenth of a column was sent to the hardware");
+        // Ten of them are a column, and by then it is.
+        let mut moved = 0.0;
+        for i in 1..=10 {
+            let mut v = view_spanning(0.0, 1_000_000.0);
+            moved = center_on_dial(&mut v, 500_000.0 + 100.0 * i as f64, 500_000.0, 1e6, 1000.0);
+        }
+        assert!((moved - 1_000.0).abs() < 0.5, "a whole column came out as {moved} Hz");
+    }
+}
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+
+    /// A wide panadapter earns more frequency markers than the fixed eighth
+    /// gave it, which is what issue #174 asked for; a phone-width strip, which
+    /// the same eighth crowded, gets fewer.
+    #[test]
+    fn the_marker_count_follows_the_width() {
+        let (lo, hi) = (14_000_000.0, 14_350_000.0);
+        let eighth = gridlines_at(lo, hi, freq_grid_step(lo, hi)).len();
+        let wide = gridlines_at(lo, hi, freq_grid_step_for_width(lo, hi, 1800.0)).len();
+        let narrow = gridlines_at(lo, hi, freq_grid_step_for_width(lo, hi, 360.0)).len();
+        assert!(wide > eighth, "a 1800 pt axis got {wide} markers against the old {eighth}");
+        assert!(narrow < eighth, "a 360 pt axis kept {narrow} markers against {eighth}");
+        assert!(narrow >= 2, "a 360 pt axis was left with {narrow} markers");
+    }
+
+    /// However wide the axis and whatever it spans, two labelled markers never
+    /// come closer than a label is wide.
+    #[test]
+    fn the_labels_never_touch() {
+        for width in [320.0f32, 640.0, 1280.0, 2560.0, 3840.0] {
+            for span in [3_000.0f64, 48_000.0, 350_000.0, 2_000_000.0, 32_400_000.0] {
+                let (lo, hi) = (14_000_000.0, 14_000_000.0 + span);
+                let step = freq_grid_step_for_width(lo, hi, width);
+                let pitch = width as f64 * step / span;
+                assert!(
+                    pitch >= 90.0,
+                    "a {width} pt axis over {span} Hz puts labels {pitch} pt apart",
+                );
+            }
+        }
+    }
+
+    /// The minor ticks land on round frequencies between the labelled ones —
+    /// four or one of them, never a count that puts a tick off the grid.
+    #[test]
+    fn the_minor_ticks_divide_the_step_evenly() {
+        for step in [1.0f64, 2.0, 5.0, 10.0, 200.0, 500.0, 1_000.0, 2_000_000.0] {
+            let minor = minor_grid_step(step);
+            let n = step / minor;
+            assert!((n - n.round()).abs() < 1e-9, "{step} Hz divides into {n} ticks");
+            assert!(matches!(n.round() as i64, 2 | 5), "{step} Hz got {n} ticks");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3205,5 +3617,114 @@ mod tests {
         for pair in sent.chunks(2) {
             assert_eq!(pair[0], pair[1]);
         }
+    }
+
+    /// A front end whose full-band lane is wider than its I/Q may be zoomed out
+    /// into it — a KiwiSDR sends 12 kHz of I/Q and a picture of the whole
+    /// 0-30 MHz, and before this the panadapter could only ever show the 12 kHz.
+    #[test]
+    fn a_wide_lane_lets_the_view_zoom_out_past_the_iq() {
+        const DEV_C: f64 = 10_000_000.0;
+        const DEV_SPAN: f64 = 12_000.0;
+        let wide = (15_000_000.0, 30_000_000.0);
+
+        // Without one, the passband is the end of the zoom, as it always was.
+        let plain = WindowPan::default();
+        assert_eq!(plain.view_bounds(DEV_C, DEV_SPAN), (DEV_C, DEV_SPAN));
+        let mut view =
+            ViewState { view_lo_hz: 0.0, view_hi_hz: 30_000_000.0, ..Default::default() };
+        let (c, span) = plain.view_bounds(DEV_C, DEV_SPAN);
+        view.clamp_to(c, span);
+        assert!(view.span() <= DEV_SPAN, "clamped back to the passband");
+
+        // With one, the whole band is reachable.
+        let wide_pan = WindowPan::default().with_outer(Some(wide), DEV_SPAN);
+        assert_eq!(wide_pan.view_bounds(DEV_C, DEV_SPAN), wide);
+        let mut view =
+            ViewState { view_lo_hz: 0.0, view_hi_hz: 30_000_000.0, ..Default::default() };
+        let (c, span) = wide_pan.view_bounds(DEV_C, DEV_SPAN);
+        view.clamp_to(c, span);
+        assert_eq!((view.view_lo_hz, view.view_hi_hz), (0.0, 30_000_000.0));
+    }
+
+    /// Zoom out on a KiwiSDR, then zoom back in somewhere else: the view is
+    /// narrow again but the 12 kHz the receiver streams is elsewhere, so the
+    /// panadapter would go on drawing from the coarse full-band bins for ever.
+    /// The receiver follows instead.
+    #[test]
+    fn zooming_back_in_off_the_passband_brings_the_receiver_over() {
+        const DEV_C: f64 = 10_000_000.0;
+        const DEV_SPAN: f64 = 12_000.0;
+        let pan = WindowPan::default().with_outer(Some((15e6, 30e6)), DEV_SPAN);
+        let state = RadioState { vfo_a_hz: DEV_C, active_vfo: Vfo::A, ..RadioState::default() };
+
+        // Zoomed back in at 15 MHz, five megahertz from what is being received.
+        let view =
+            ViewState { view_lo_hz: 14_997_000.0, view_hi_hz: 15_003_000.0, ..Default::default() };
+        let mut cmds = Vec::new();
+        follow_view_into_the_band(&view, &state, DEV_C, DEV_SPAN, pan, &mut cmds);
+        assert_eq!(cmds, vec![Command::SetVfo { vfo: Vfo::A, hz: 15_000_000.0 }]);
+    }
+
+    /// Still zoomed out: panning about the band view must not retune anything.
+    #[test]
+    fn panning_while_zoomed_out_never_retunes() {
+        const DEV_C: f64 = 10_000_000.0;
+        const DEV_SPAN: f64 = 12_000.0;
+        let pan = WindowPan::default().with_outer(Some((15e6, 30e6)), DEV_SPAN);
+        let state = RadioState { vfo_a_hz: DEV_C, active_vfo: Vfo::A, ..RadioState::default() };
+        let view = ViewState { view_lo_hz: 12e6, view_hi_hz: 18e6, ..Default::default() };
+        let mut cmds = Vec::new();
+        follow_view_into_the_band(&view, &state, DEV_C, DEV_SPAN, pan, &mut cmds);
+        assert!(cmds.is_empty(), "a view wider than the passband is not a tuning request");
+    }
+
+    /// Asked once, not once a frame: with the dial inside the view the engine
+    /// is already bringing the receiver over.
+    #[test]
+    fn the_request_is_not_repeated_while_it_is_being_answered() {
+        const DEV_SPAN: f64 = 12_000.0;
+        let pan = WindowPan::default().with_outer(Some((15e6, 30e6)), DEV_SPAN);
+        // The dial has moved to the view; the receiver has not caught up yet.
+        let state =
+            RadioState { vfo_a_hz: 15_000_000.0, active_vfo: Vfo::A, ..RadioState::default() };
+        let view =
+            ViewState { view_lo_hz: 14_997_000.0, view_hi_hz: 15_003_000.0, ..Default::default() };
+        let mut cmds = Vec::new();
+        follow_view_into_the_band(&view, &state, 10_000_000.0, DEV_SPAN, pan, &mut cmds);
+        assert!(cmds.is_empty());
+    }
+
+    /// A front end with no full-band lane is untouched: its view can never
+    /// leave its passband in the first place.
+    #[test]
+    fn a_front_end_without_a_wide_lane_is_never_retuned_by_a_zoom() {
+        const DEV_SPAN: f64 = 2_000_000.0;
+        let pan = WindowPan::default();
+        let state = RadioState { vfo_a_hz: 10e6, active_vfo: Vfo::A, ..RadioState::default() };
+        let view =
+            ViewState { view_lo_hz: 14_997_000.0, view_hi_hz: 15_003_000.0, ..Default::default() };
+        let mut cmds = Vec::new();
+        follow_view_into_the_band(&view, &state, 10e6, DEV_SPAN, pan, &mut cmds);
+        assert!(cmds.is_empty());
+    }
+
+    /// A "wide" lane no wider than the I/Q — an Icom's scope at a narrow span —
+    /// is ignored, so nothing about that front end changes.
+    #[test]
+    fn a_wide_lane_no_wider_than_the_iq_is_ignored() {
+        const DEV_C: f64 = 10_000_000.0;
+        const DEV_SPAN: f64 = 2_000_000.0;
+        let pan = WindowPan::default().with_outer(Some((DEV_C, 100_000.0)), DEV_SPAN);
+        assert_eq!(pan.outer, None);
+        assert_eq!(pan.view_bounds(DEV_C, DEV_SPAN), (DEV_C, DEV_SPAN));
+    }
+
+    /// Before the front end has said what it streams there is nothing to
+    /// compare against, so the lane is not adopted on a zero span.
+    #[test]
+    fn no_outer_window_before_the_passband_is_known() {
+        let pan = WindowPan::default().with_outer(Some((1e6, 30e6)), 0.0);
+        assert_eq!(pan.outer, None);
     }
 }

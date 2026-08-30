@@ -28,6 +28,8 @@ pub(in crate::app) mod logbook;
 pub(in crate::app) mod net;
 pub(in crate::app) mod panels;
 pub(crate) mod persist;
+pub(in crate::app) mod publicsdr;
+pub(in crate::app) mod qo100;
 pub(in crate::app) mod rds;
 pub(in crate::app) mod sat;
 pub(in crate::app) mod scanner;
@@ -215,6 +217,9 @@ pub struct SdroxideApp {
     wf_now_pin: f64,
     /// Cached spectrum polylines (recomputed only when frame/view/rect change).
     trace_cache: spectrum_view::TraceCache,
+    /// The spectra behind the 3D surface, when the SPEC popup's 3D chip is lit
+    /// — the panadapter's only piece of history that is not the waterfall's.
+    spec3d: crate::widgets::spectrum3d::Surface,
     /// Switchable sound devices, queried once each time the settings dialog
     /// opens (cpal enumeration is too slow for per-frame).
     audio_devices: Option<AudioDevices>,
@@ -310,6 +315,24 @@ pub struct SdroxideApp {
     tci_test_result: Option<TestOutcome>,
     icomnet_test_result: Option<TestOutcome>,
     spyserver_test_result: Option<TestOutcome>,
+    kiwi_test_result: Option<TestOutcome>,
+    /// The public-SDR directories, once the machine with the radio on it has
+    /// answered. `None` until then, which is what the browse window shows a
+    /// "fetching" line for; `Some` but empty means the fetch really did come
+    /// back with nothing.
+    public_sdrs: Option<sdroxide_types::PublicSdrDirectory>,
+    show_public_sdrs: bool,
+    /// Asked once per opening of the window, so reopening it after an hour does
+    /// not go on showing an hour-old list.
+    public_sdrs_asked: bool,
+    public_sdr_search: String,
+    /// Indexed by `PublicSdrNetwork::ALL`, positionally.
+    public_sdr_nets_shown: [bool; 2],
+    public_sdr_free_only: bool,
+    public_sdr_in_band: bool,
+    /// Take a SpyServer in its VFO+FFT shape rather than wideband. No effect on
+    /// a KiwiSDR, which has only one shape.
+    public_sdr_low_bw: bool,
     /// FlexRadios found by the last SmartSDR "Discover" listen.
     smartsdr_devices: Vec<sdroxide_types::SmartSdrDevice>,
     /// Result of the last SmartSDR "Test connection".
@@ -359,6 +382,10 @@ pub struct SdroxideApp {
     /// How the device list is ordered, and which way round.
     ism_sort: ism::IsmSort,
     ism_sort_desc: bool,
+    /// The QO-100 beacon decoder's live status — lock state, measured
+    /// frequency offset, decoded telemetry — as last reported by the engine.
+    /// `None` until the decoder has been enabled at least once this session.
+    qo100_status: Option<sdroxide_types::Qo100Status>,
     show_settings: bool,
     /// Scroll the Settings window back to its tab bar on the frame it opens.
     /// The window's scroll offset is egui memory, which outlives both the
@@ -381,7 +408,11 @@ pub struct SdroxideApp {
     /// Fade clock for the sub-audible tone popup, like `skimmer_popup_since`.
     tone_popup_since: Option<f64>,
     /// Fade clock for the noise-reduction picker, like `tone_popup_since`.
+    /// Which NAVTEX message the reading pane is showing, or `None` for the one
+    /// arriving.
+    navtex_open: Option<usize>,
     nr_popup_since: Option<f64>,
+    rec_popup_since: Option<f64>,
     /// Fade clocks for the repeater popups in the VFO box — the DUPLEX shift
     /// and the TONE encoder — like `tone_popup_since`.
     duplex_popup_since: Option<f64>,
@@ -711,6 +742,11 @@ pub struct SdroxideApp {
     /// The SAT window and everything it remembers between frames.
     show_sat: bool,
     sat_win: sat::SatWinState,
+    /// Which page of the SAT window is showing. QO-100 is one of them — it is
+    /// a satellite, and it has no window of its own.
+    sat_tab: sat::SatTab,
+    /// What the QO-100 page remembers between frames.
+    qo100_win: qo100::Qo100WinState,
     /// The rotctld client's health, mirrored from
     /// [`RadioEvent::RotatorStatus`].
     rotator_status: Option<(bool, f64, f64, Option<String>)>,
@@ -881,8 +917,14 @@ pub(crate) enum RadioTabRequest {
     /// its own dongle and a remote station has two rosters in one tab strip,
     /// and "add a radio" means nothing until it says which. A browser has only
     /// the station's.
+    ///
+    /// `preset` is what "Public SDRs" uses: the new radio comes up already
+    /// pointed at the receiver that was picked, rather than arriving blank with
+    /// its settings page open for an address to be typed into. `None` is the
+    /// plain "+" chip, which does exactly that.
     Add {
         station: String,
+        preset: Option<Box<sdroxide_types::RadioConfig>>,
     },
     /// Open somebody else's station as a tab of its own: dial this WebSocket
     /// URL and, if it answers, show it under `name`. Queued by the **Remote**
@@ -929,6 +971,16 @@ pub(crate) enum RadioTabRequest {
     /// delete somebody's radio. The tab named here is a *tab* id; the shell
     /// translates it into the id its station knows it by.
     RemoveFromStation(u32),
+    /// Show the radios in this left-to-right order (issue #224): the whole
+    /// strip, by tab id, as the operator dragged it.
+    ///
+    /// The whole order rather than "move this one there" so that applying it is
+    /// idempotent and cannot half-happen: the shell sorts its tabs to match and
+    /// ignores an id it does not have. Only this machine's own radios are
+    /// recorded — a connection is not in any roster here — so a reordered
+    /// connection stays where it was put for the session and comes back at the
+    /// end of the strip next time.
+    Reorder(Vec<u32>),
 }
 
 impl SdroxideApp {
@@ -1029,6 +1081,7 @@ impl SdroxideApp {
             wf_row_accum: 0.0,
             wf_now_pin: 0.0,
             trace_cache: spectrum_view::TraceCache::default(),
+            spec3d: Default::default(),
             audio_devices: None,
             audio_devices_queried: false,
             // Asked for when the settings dialog opens, along with everything
@@ -1070,6 +1123,18 @@ impl SdroxideApp {
             tci_test_result: None,
             icomnet_test_result: None,
             spyserver_test_result: None,
+            kiwi_test_result: None,
+            public_sdrs: None,
+            show_public_sdrs: false,
+            public_sdrs_asked: false,
+            public_sdr_search: String::new(),
+            // Both on: the point of the window is to show what is out there.
+            public_sdr_nets_shown: [true, true],
+            // On, because a full receiver is not a receiver an operator can
+            // use, and the reason is still shown for the ones this hides.
+            public_sdr_free_only: true,
+            public_sdr_in_band: false,
+            public_sdr_low_bw: false,
             smartsdr_devices: Vec::new(),
             smartsdr_test_result: None,
             pluto_devices: Vec::new(),
@@ -1092,6 +1157,7 @@ impl SdroxideApp {
             ism_status: None,
             ism_sort: ism::IsmSort::default(),
             ism_sort_desc: true,
+            qo100_status: None,
             show_settings: false,
             settings_scroll_top: true,
             voice: sdroxide_types::VoiceStatus::default(),
@@ -1102,7 +1168,9 @@ impl SdroxideApp {
             skimmer_popup_since: None,
             layers_popup_since: None,
             tone_popup_since: None,
+            navtex_open: None,
             nr_popup_since: None,
+            rec_popup_since: None,
             duplex_popup_since: None,
             rpt_tone_popup_since: None,
             // Corrected on the first frame, once the viewport size is known.
@@ -1243,6 +1311,8 @@ impl SdroxideApp {
             sat_track: None,
             show_sat: false,
             sat_win: Default::default(),
+            sat_tab: sat::SatTab::default(),
+            qo100_win: Default::default(),
             rotator_status: None,
             rot_cfg_edit: Default::default(),
             rot_cfg_seeded: false,
@@ -1585,6 +1655,18 @@ impl SdroxideApp {
 
     /// Open the Settings dialog on the Radio tab — where a freshly added
     /// radio, which has no interface yet, is configured.
+    /// Point this radio at a configuration and reopen its interface.
+    ///
+    /// The same two calls Settings → Radio's "Apply / reconnect" makes, and for
+    /// the same reason they are two: the configuration is what gets persisted,
+    /// and the reopen is what makes it take effect without a restart. Works
+    /// unchanged over a connection — the remote controller sends the whole
+    /// block and asks for the reopen with it.
+    pub(crate) fn apply_radio_config(&mut self, cfg: sdroxide_types::RadioConfig) {
+        self.ctrl.set_radio_config(cfg);
+        self.ctrl.reopen_source();
+    }
+
     pub(crate) fn open_radio_settings(&mut self) {
         self.show_settings = true;
         self.settings_tab = SettingsTab::Radio;
@@ -1728,10 +1810,10 @@ mod tests {
         };
 
         let mut at = egui::Pos2::ZERO;
-        let _ =
-            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
-                at = draw(ui).rect.center();
-            });
+        ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            at = draw(ui).rect.center();
+        })
+        .drop_without_applying_deltas();
         let button = |pressed| egui::Event::PointerButton {
             pos: at,
             button: egui::PointerButton::Primary,
@@ -1741,7 +1823,7 @@ mod tests {
         let mut clicked = false;
         for events in [vec![egui::Event::PointerMoved(at), button(true)], vec![button(false)]] {
             let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| clicked |= draw(ui).clicked());
+            ctx.run_ui(input, |ui| clicked |= draw(ui).clicked()).drop_without_applying_deltas();
         }
         clicked
     }

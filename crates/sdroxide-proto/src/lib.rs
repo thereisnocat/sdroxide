@@ -828,7 +828,118 @@ use sdroxide_types::{
 /// v99 peer desynchronises on the tail of every `AdsbStatus` and the
 /// handshake's equality test is what stops it trying.
 ///
-/// **101** — the RSPduo's diversity filter (v87, now [`sdroxide_types::SdrPlayDuo`]
+/// **101** — the QO-100 beacon calibration decoder.
+///
+/// [`sdroxide_types::RadioState`] gained `qo100`
+/// ([`sdroxide_types::Qo100Settings`]) holding whether the decoder runs and how
+/// wide it searches, and [`sdroxide_types::Command`] gained `SetQo100Config` to
+/// move it — the ISM decoder's shape, no apply step, the engine echoes the
+/// setting back in the state. Both are appended at the tail of their type, so
+/// every field and variant already on the wire keeps its number; a v100 peer
+/// desynchronises on the tail of every `RadioState` regardless, and the
+/// handshake's equality test is what stops it trying.
+///
+/// The live side — [`sdroxide_types::Qo100Status`] (lock, measured offset,
+/// decoded telemetry text) — is a native-engine `RadioEvent` only and never
+/// reaches the wire: `sdroxide-server` maps it to no `ServerMsg`, the same as
+/// the spectrum lanes that travel their own way. So there is no new `ServerMsg`
+/// here, and a remote client's window shows that the reading is local-only
+/// rather than sitting on "starting…". If it is bridged later that is its own
+/// append and its own bump.
+/// **102** — RTTY on an FM carrier (issue #214).
+///
+/// `Mode::RttyFm` is appended to [`sdroxide_types::Mode`]: the same Baudot
+/// modem, the same tone pair and the same panel as `Mode::Rtty`, into an FM
+/// transmitter rather than onto a sideband. Appending a mode is on its own
+/// enough to force this bump — every mode already on the wire keeps its number,
+/// but a v101 peer handed the new one has no variant to decode it into and
+/// desynchronises on the rest of the message. Same reasoning as v99's
+/// `Mode::Adsb`, v98's `Mode::SstvFm` and v89's `Mode::Aprs`.
+///
+/// Nothing else changed: every table the new mode needs an answer in is
+/// derived from the mode, not carried beside it.
+/// **103** — recording the raw I/Q (issue #217).
+///
+/// [`sdroxide_types::Command`] gained `SetIqRecording`, and
+/// [`sdroxide_types::RadioState`] gained `iq_recording`, `iq_recording_file`
+/// and `iq_recording_mb` beside the audio recorder's three, so a remote client
+/// can start a capture and watch it grow. Both appended at the tail of their
+/// type, so every variant and field already on the wire keeps its number; a
+/// v102 peer desynchronises on the tail of every `RadioState` regardless, and
+/// the handshake's equality test is what stops it trying.
+///
+/// The file is written by the *engine*, on the machine the receiver is plugged
+/// into — a remote client's capture lands on the station, not on the laptop
+/// that asked for it, because the alternative is a gigabyte a minute over the
+/// link. That is a property of the feature and not of the wire, so nothing here
+/// carries the samples.
+/// **104** — NAVTEX (issue #212).
+///
+/// `Mode::Navtex` is appended to [`sdroxide_types::Mode`] and
+/// [`sdroxide_types::DigiStatus`] gains `navtex`
+/// ([`sdroxide_types::NavtexStatus`]) beside the other per-mode panes, carrying
+/// the messages received, the one arriving and the loose text.
+/// [`sdroxide_types::DigiConfig`] gains `navtex_reverse`, the tone-sense
+/// control — the mode's only setting, since there is nothing to transmit and no
+/// callsign to give.
+///
+/// Appending a mode is on its own enough to force the bump, for the reason
+/// v102's `Mode::RttyFm` and v99's `Mode::Adsb` were: a v103 peer handed the
+/// new one has no variant to decode it into and desynchronises on the rest of
+/// the message.
+/// **105** — EU VHF contest operation (issue #223).
+///
+/// [`sdroxide_types::DigiConfig`] gains `contest` (a new `ContestMode` enum)
+/// and `contest_serial`, and [`sdroxide_types::Command`] gains
+/// `SetContestSerial` — the number's own write route, because the engine
+/// advances it as each contact is logged and a client's copy of the
+/// configuration is stale the moment one completes.
+///
+/// Both config fields are appended at the tail of the struct and the command at
+/// the tail of the enum, so every field and variant already on the wire keeps
+/// its number; a v104 peer desynchronises on the tail of every `DigiConfig`
+/// regardless — it rides inside `Command::SetDigiConfig` and
+/// `DigiStatus.config` — and the handshake's equality test is what stops it
+/// trying.
+///
+/// The `i3 = 5` message layout the mode transmits is not on this wire at all:
+/// it is packed and unpacked inside the engine, and what crosses the link is
+/// the decoded text, exactly as for every other 77-bit layout.
+/// **106** — browsing the public-SDR directories.
+///
+/// [`sdroxide_types::DeviceProbe`] gains `PublicSdrs { refresh }` and
+/// [`sdroxide_types::ProbeAnswer`] gains `PublicSdrs`, carrying a
+/// [`sdroxide_types::PublicSdrDirectory`] — the KiwiSDR and SpyServer listings,
+/// fetched by the machine the radio is attached to.
+///
+/// The probe lane rather than a route of its own, and for one reason: a browser
+/// client has no HTTP client and could not reach either directory across
+/// origins if it had. Asking the station is the only way the web UI gets this
+/// feature at all, and the station is also the end that will hold the
+/// connection, so it is the end that should be reading the list.
+///
+/// [`sdroxide_types::Backend`] gains `KiwiSdr` and [`sdroxide_types::RadioConfig`]
+/// gains `kiwi` ([`sdroxide_types::KiwiConfig`]) at its tail. Both are appended,
+/// so every variant and field already on the wire keeps its number — but a v105
+/// peer has no `KiwiSdr` variant to decode into and desynchronises on the rest
+/// of any `RadioConfig`, which is what the handshake's equality test prevents.
+/// Same shape of bump as v81's HydraSDR and v64/v65's ELAD and Lime.
+/// **107** — zooming the panadapter out past the I/Q.
+///
+/// [`sdroxide_types::DeviceCaps`] gains `wide_span_hz` at its tail: how wide the
+/// front end's full-band lane is, or zero where it has none.
+///
+/// On the capabilities rather than on the frame because it is what bounds the
+/// client's zoom-out, and a client that had to wait for a picture to learn it
+/// would spend the first frames of every session believing the passband was the
+/// limit — long enough to shrink a restored window to it. The *position* of the
+/// lane still rides each frame, where it belongs: that moves with the receiver.
+///
+/// Appended, so every field already on the wire keeps its number; `DeviceCaps`
+/// is sent whole, so a v106 peer desynchronises on the tail of it regardless,
+/// which is what the handshake's equality test prevents.
+///
+/// **108** — the RSPduo's diversity filter (v87, now [`sdroxide_types::SdrPlayDuo`]
 /// after v90's own rename) gains two more ways to find its combining weight,
 /// alongside the original adaptive one (issue #153). `SdrPlayDuo` gained
 /// `technique` ([`sdroxide_types::DiversityTechnique`]: `Adaptive`,
@@ -840,16 +951,18 @@ use sdroxide_types::{
 /// positional wire format reconfigures the wrong setting rather than failing
 /// outright.
 ///
-/// Renumbered to sit after upstream's own v90–100 chain rather than the v90
-/// this carried on the local branch it was built on: that local v90 was never
-/// released or pushed anywhere as this exact numbering, so no compatibility
-/// with it existed outside this one branch, and upstream's v90–100 run is the
-/// one with real peers depending on its numbers.
+/// Renumbered to sit after upstream's own v90–107 chain rather than the v101
+/// this carried on the local branch it was built on: that local v101 was
+/// never released or pushed anywhere as this exact numbering, so no
+/// compatibility with it existed outside this one branch, and upstream's
+/// v90–107 run is the one with real peers depending on its numbers. Same
+/// renumbering precedent as the last time this collided, when this entry
+/// moved from v90 to v101.
 ///
 /// A field appended to the radio configuration, which rides in both a command
-/// and an event, so a v100 peer would read the tail of either as garbage —
+/// and an event, so a v107 peer would read the tail of either as garbage —
 /// the handshake's equality test is what stops it trying.
-pub const PROTO_VERSION: u16 = 101;
+pub const PROTO_VERSION: u16 = 108;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]

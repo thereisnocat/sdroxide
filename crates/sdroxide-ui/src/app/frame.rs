@@ -112,6 +112,19 @@ impl eframe::App for SdroxideApp {
         // two are the same rect.
         let tier = crate::layout::tier_for(ui.max_rect().size(), self.ui_settings.layout);
         crate::layout::set_tier(&ctx, tier);
+        // …and the two questions the tier does not answer, published the same
+        // way and for the same reason — the operator's override lives in
+        // settings the context cannot see. `Small screen` asked for on a tall
+        // display would otherwise be measured back to "roomy" at the places
+        // that draw (issue #211).
+        crate::layout::set_tight(
+            &ctx,
+            crate::layout::tight_for(ui.max_rect().size(), self.ui_settings.layout),
+        );
+        crate::layout::set_short_tablet(
+            &ctx,
+            crate::layout::short_tablet_for(ui.max_rect().size(), self.ui_settings.layout),
+        );
         if self.tier != tier {
             self.tier = tier;
             crate::theme::apply_metrics(&ctx, tier);
@@ -528,7 +541,8 @@ impl eframe::App for SdroxideApp {
             if show_wf {
                 ui.allocate_ui(egui::vec2(width, wf_h), |ui| {
                     let pan =
-                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz);
+                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz)
+                            .with_outer(Some(self.zoom_out_window()), self.state.sample_rate);
                     spectrum_view::show_ext(
                         ui,
                         &mut self.view,
@@ -537,6 +551,7 @@ impl eframe::App for SdroxideApp {
                         &mut self.peaks,
                         &mut self.spec_smooth,
                         &mut self.trace_cache,
+                        &mut self.spec3d,
                         // A click sets the tone offset in the modes that park
                         // on an agreed dial and pick a signal inside the
                         // sub-band. Not in RTTY: its tone pair is a standard
@@ -604,6 +619,9 @@ impl eframe::App for SdroxideApp {
             }
             if show_panel {
                 ui.allocate_ui(egui::vec2(width, panel_h), |ui| {
+                    // The operating panels, pulled in on a small screen — one
+                    // call for all of them, see `layout::tighten`.
+                    crate::layout::tighten(ui);
                     egui::Frame::new()
                         .fill(crate::theme::BG_DEEP())
                         .inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 0 })
@@ -613,6 +631,8 @@ impl eframe::App for SdroxideApp {
                                     self.rade_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_wefax() {
                                     self.wefax_panel(ui, &mut cmds, panel_h);
+                                } else if mode == Mode::Navtex {
+                                    self.navtex_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_image() {
                                     self.image_panel(ui, &mut cmds, mode);
                                 } else if mode.is_rf_paint() {
@@ -713,7 +733,8 @@ impl eframe::App for SdroxideApp {
             if show_wf {
                 ui.allocate_ui(egui::vec2(width, wf_h), |ui| {
                     let pan =
-                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz);
+                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz)
+                            .with_outer(Some(self.zoom_out_window()), self.state.sample_rate);
                     spectrum_view::show_ext(
                         ui,
                         &mut self.view,
@@ -722,6 +743,7 @@ impl eframe::App for SdroxideApp {
                         &mut self.peaks,
                         &mut self.spec_smooth,
                         &mut self.trace_cache,
+                        &mut self.spec3d,
                         cw_pitch,
                         sdroxide_types::DxpedMode::Normal,
                         false,
@@ -760,6 +782,9 @@ impl eframe::App for SdroxideApp {
                     }
                 }
                 ui.allocate_ui(egui::vec2(width, panel_h), |ui| {
+                    // The operating panels, pulled in on a small screen — one
+                    // call for all of them, see `layout::tighten`.
+                    crate::layout::tighten(ui);
                     egui::Frame::new()
                         .fill(crate::theme::BG_DEEP())
                         .inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 0 })
@@ -791,6 +816,7 @@ impl eframe::App for SdroxideApp {
         self.mail_window(&ctx, &mut cmds);
         self.mail_log_window(&ctx);
         self.spots_window(&ctx, &mut cmds);
+        self.public_sdrs_window(&ctx, &mut cmds);
         self.awards_window(&ctx);
         self.bands_window(&ctx);
         self.sat_window(&ctx, &mut cmds);
@@ -1000,6 +1026,15 @@ impl SdroxideApp {
                             c.label
                         )));
                     }
+                    // A different interface on this radio: the stored zoom
+                    // was taken in another span and means nothing in this one.
+                    if self.view.adopt_driver(&c.driver) {
+                        tracing::debug!(
+                            target: "sdroxide::panadapter",
+                            driver = %c.driver,
+                            "new front end — refitting the panadapter window"
+                        );
+                    }
                     self.caps = Some(c);
                     // A session the far end accepted: whatever the link was
                     // doing, it is doing it again, so the next drop starts its
@@ -1205,6 +1240,7 @@ impl SdroxideApp {
                 RadioEvent::IsmReports(r) => self.ism_reports = r,
                 RadioEvent::IsmStatus(st) => self.ism_status = Some(st),
                 RadioEvent::AdsbStatus(st) => self.adsb_status = Some(st),
+                RadioEvent::Qo100Status(st) => self.qo100_status = Some(st),
                 RadioEvent::SstvStatus(s) => {
                     // Adopt a *newly* detected RX mode for the next transmit, but
                     // don't re-apply a steady detection every frame — that would
@@ -1479,10 +1515,21 @@ impl SdroxideApp {
             show_memories,
             show_voice,
             caps,
+            wide_frame,
             ..
         } = self;
         // Read before the borrow below, which takes `self` apart.
         let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
+        // How far a bound zoom-out may go: the full-band lane where the front
+        // end has one, else its passband. Read here for the same reason
+        // `rig_squelch` is — after this the borrow has taken `self` apart.
+        let stated = caps.as_ref().map_or(0.0, |c| c.wide_span_hz);
+        let seen = wide_frame.as_ref().map(|f| (f.center_hz, f.span_hz));
+        let zoom_out = match (seen, stated > state.sample_rate) {
+            (Some((c, span)), _) if span.max(stated) > state.sample_rate => (c, span.max(stated)),
+            (None, true) => (state.center_hz, stated),
+            _ => (state.center_hz, state.sample_rate),
+        };
         let mut sink = crate::input::UiSink {
             view,
             help: &mut help.open,
@@ -1493,6 +1540,7 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut speech_acts,
             rig_squelch,
+            zoom_out,
         };
         input.poll_pointer_and_keys(ctx, state, &mut sink, cmds);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1555,6 +1603,8 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut Vec::new(),
             rig_squelch,
+            // Releasing held keys never pans or zooms, so the passband will do.
+            zoom_out: (state.center_hz, state.sample_rate),
         };
         input.release_all(state, &mut sink, cmds);
     }

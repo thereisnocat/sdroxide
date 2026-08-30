@@ -238,6 +238,45 @@ fn slack_viewport(center_hz: f64, full_span: f64, (view_lo, view_hi): (f64, f64)
 }
 
 impl SdroxideApp {
+    /// The full-band window this front end publishes beside its I/Q, `(centre,
+    /// span)` — what the main panadapter may be zoomed out into.
+    ///
+    /// `None` where there is no such lane, or where it has stopped arriving:
+    /// a window built on a spectrum that is no longer being sent would let the
+    /// operator zoom out into a frozen picture. The engine applies the same
+    /// staleness rule on its side before it will draw one.
+    pub(in crate::app) fn wide_window(&self) -> Option<(f64, f64)> {
+        let f = self.wide_frame.as_ref()?;
+        (f.span_hz > 0.0).then_some((f.center_hz, f.span_hz))
+    }
+
+    /// The widest window the view may cover: the full-band lane where there is
+    /// one and it beats the passband, else the passband itself.
+    ///
+    /// The *width* comes from the capabilities rather than from the last frame,
+    /// so it is known from the moment the front end opens. Waiting for a
+    /// picture would spend the first frames of every session believing the
+    /// passband was the limit — long enough to shrink a restored window to it
+    /// and lose the operator's zoom on every restart.
+    ///
+    /// Where it sits still comes from the frame, because that moves with the
+    /// receiver; until one arrives the passband's centre is the best guess and
+    /// is right whenever the lane is centred on the receiver, which is the
+    /// usual case.
+    pub(in crate::app) fn zoom_out_window(&self) -> (f64, f64) {
+        let dev_span = self.state.sample_rate;
+        let stated = self.caps.as_ref().map_or(0.0, |c| c.wide_span_hz);
+        let span = match self.wide_window() {
+            Some((_, seen)) => seen.max(stated),
+            None => stated,
+        };
+        if span <= dev_span {
+            return (self.state.center_hz, dev_span);
+        }
+        let center = self.wide_window().map_or(self.state.center_hz, |(c, _)| c);
+        (center, span)
+    }
+
     /// Desired engine-side spectrum config. The requested viewport gets 2×
     /// slack around the visible span so panning inside it needs no
     /// reconfiguration (which would clear the waterfall history); the FFT
@@ -322,9 +361,26 @@ impl SdroxideApp {
 
     pub(in crate::app) fn desired_spectrum_cfg(&self) -> SpectrumConfig {
         let full_span = self.state.sample_rate;
+        // The window the *view* lives in, which past the passband is the
+        // full-band lane's — slack clamped to the I/Q there would ask the
+        // engine for a window the operator is not looking at, and it is the
+        // wide bins that answer once the view leaves the passband.
+        let (out_center, out_span) = self.zoom_out_window();
         let (viewport, zoom) = if !self.view.is_unset() && full_span > 0.0 {
             let ratio = (full_span / self.view.span()).max(1.0);
-            if ratio > 1.05 {
+            // Zoomed out past the passband: the whole view is the request, and
+            // there is no zoom factor to grow the transform by — the wide lane
+            // has whatever resolution it has.
+            if self.view.span() > full_span {
+                (
+                    Some(slack_viewport(
+                        out_center,
+                        out_span,
+                        (self.view.view_lo_hz, self.view.view_hi_hz),
+                    )),
+                    1.0,
+                )
+            } else if ratio > 1.05 {
                 let vp = slack_viewport(
                     self.state.center_hz,
                     full_span,
@@ -350,8 +406,19 @@ impl SdroxideApp {
         // resolution finer than the span is exactly what somebody zoomed in is
         // asking for, and the seconds it costs are then a price they chose.
         let base = base_fft_for_rate(self.view.fft_size, full_span);
+        // …and never past the point where the engine's own zoom lane would
+        // switch off. Growing this analyser is a transform over everything the
+        // front end streams; the lane resolves the same window off a decimated
+        // copy for a fraction of it, and asking for more than this stops it
+        // being built at all — which is what made zooming in on a 2 Msps
+        // HackRF start dropping samples (issue #195).
+        let ceiling = viewport
+            .and_then(|(lo, hi)| {
+                sdroxide_types::panadapter_fft_ceiling(full_span, hi - lo, self.panadapter_bins())
+            })
+            .unwrap_or(MAX_FFT);
         let mut fft = base;
-        while (fft as f64) < base as f64 * zoom.min(8.0) && fft < MAX_FFT {
+        while (fft as f64) < base as f64 * zoom.min(8.0) && fft < MAX_FFT && fft * 2 <= ceiling {
             fft *= 2;
         }
         SpectrumConfig {
@@ -444,6 +511,14 @@ impl SdroxideApp {
             // The operator's own rate, unscaled: the gridlines are spaced in
             // points and derive the rest from `row_scale` themselves.
             rows_per_sec: self.ui_settings.waterfall_rows_per_sec(),
+            // Gated on `live` for the reason the waterfall's rows are: a
+            // stalled stream must freeze the picture, not fill it with copies
+            // of the last spectrum it managed to send.
+            surface_rows_per_sec: if live {
+                self.ui_settings.spectrum_3d_rows_per_sec()
+            } else {
+                0.0
+            },
             row_scale: row_scale.max(1.0),
             tex_w: self.panadapter_bins(),
             now_unix: self.wf_now_pin,
@@ -799,8 +874,15 @@ impl SdroxideApp {
         // comparison, and the window is only ever *narrowed* to a span that is
         // really there. Only the width is settled here; where it sits is
         // settled just below.
-        if self.state.sample_rate > 0.0 && self.view.span() > self.state.sample_rate {
-            self.view.fit(self.state.center_hz, self.state.sample_rate);
+        // Only once the front end has said what it offers. The first `State`
+        // can arrive ahead of the first `Capabilities`, and until it has there
+        // is no way to tell a front end with a full-band lane from one without
+        // — so narrowing here would shrink a restored window to the passband on
+        // the strength of an answer that had not come yet, which is exactly how
+        // a zoomed-out KiwiSDR session came back up at 12 kHz.
+        let (out_center, out_span) = self.zoom_out_window();
+        if self.caps.is_some() && out_span > 0.0 && self.view.span() > out_span {
+            self.view.fit(out_center, out_span);
         }
         let moved = (vfo - prev_vfo).abs() > 0.5;
         let outside = !(self.view.view_lo_hz..=self.view.view_hi_hz).contains(&vfo);

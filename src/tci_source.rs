@@ -39,6 +39,10 @@ pub struct TciSource {
     /// Latest SWR the rig reported while keyed, latched for the engine's meter
     /// poll. Cleared on unkey.
     last_telem: Option<TxTelemetry>,
+    /// How far behind its `dds:` commands this rig's IQ runs — see
+    /// [`IqSource::stream_delay_s`]. Read once at open; the operator changes it
+    /// by re-applying the radio settings, like every other TCI field.
+    stream_delay_s: f64,
 }
 
 impl TciSource {
@@ -51,6 +55,7 @@ impl TciSource {
         iq_rate_hz: f64,
         center_hz: f64,
         rx_index: u32,
+        stream_delay_ms: f64,
     ) -> anyhow::Result<Self> {
         let dev = registry()
             .get_or_open(DeviceKey::Tci(address.to_string()), || {
@@ -79,6 +84,9 @@ impl TciSource {
             rx: Some(rx),
             if_offset: 0.0,
             last_telem: None,
+            // Negative or absurd values are an edited config, not a request:
+            // clamp rather than let the panadapter's axis run backwards.
+            stream_delay_s: (stream_delay_ms / 1e3).clamp(0.0, 2.0),
         })
     }
 
@@ -94,6 +102,13 @@ impl IqSource for TciSource {
 
     fn center_hz(&self) -> f64 {
         self.center
+    }
+
+    /// The rig is at the end of a socket and its own pipeline: a `dds:` command
+    /// is acknowledged in well under a millisecond but the IQ takes about a
+    /// tenth of a second to follow. See `TciConfig::stream_delay_ms`.
+    fn stream_delay_s(&self) -> f64 {
+        self.stream_delay_s
     }
 
     fn set_center_hz(&mut self, hz: f64) -> Result<()> {

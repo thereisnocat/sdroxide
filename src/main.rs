@@ -11,6 +11,7 @@ mod hackrf_source;
 mod hpsdr_source;
 mod hydrasdr_source;
 mod icomnet_source;
+mod kiwisdr_source;
 mod lime_source;
 mod local_controller;
 mod null_source;
@@ -166,6 +167,11 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     width: usize,
 
+    /// Whether `--freq` was given, kept across [`Cli::apply_session`] filling it
+    /// in from the remembered session — see there.
+    #[arg(skip)]
+    freq_named: bool,
+
     /// Allow transmit on any frequency the hardware supports, not just the
     /// amateur bands
     ///
@@ -203,6 +209,11 @@ impl Cli {
     /// other VFO never had a centre frequency to ask for — and the engine
     /// restores the pair once it has read the same session itself.
     fn apply_session(&mut self, session: sdroxide_config::Session) -> Option<sdroxide_types::Mode> {
+        // Remembered before the session fills it in, because after that
+        // `freq.is_some()` is true whether the operator typed one or not — and
+        // an I/Q capture's own centre frequency has to lose to the command line
+        // and win against the last session (issue #217).
+        self.freq_named = self.freq.is_some();
         self.freq = Some(self.freq.unwrap_or_else(|| session.active_dial_hz()));
         self.mode = Some(self.mode.unwrap_or(session.mode));
         self.mode
@@ -989,7 +1000,7 @@ fn probe_hackrf() {
             // the product id and product string are what enumeration gives away
             // for free, and between them they separate a HackRF One from a Pro,
             // a Jawbreaker or a rad1o — which matters, because the four do not
-            // tune the same range.
+            // take the same sample rates.
             println!("  {}: {}", i, d.label());
         }
     }
@@ -1116,8 +1127,14 @@ fn open_source(cli: &Cli, settings: &Settings) -> anyhow::Result<(Box<dyn IqSour
         let label = format!("IQ file {}", path.display());
         return Ok((
             Box::new(
-                FileSource::open(path, rate, cli.center_hz())
-                    .with_context(|| format!("opening IQ file {}", path.display()))?,
+                FileSource::open_with(
+                    path,
+                    rate,
+                    cli.center_hz(),
+                    cli.rate.is_some(),
+                    cli.freq_named,
+                )
+                .with_context(|| format!("opening IQ file {}", path.display()))?,
             ),
             synthetic_caps(&label),
         ));
@@ -1373,6 +1390,7 @@ fn open_configured_source(
         Backend::RtlTcp => open_rtltcp_source(radio, cli.center_hz()),
         Backend::SpyServer => open_spyserver_source(radio, cli.center_hz()),
         Backend::SpyServerVfo => open_spyserver_vfo_source(radio, cli.center_hz()),
+        Backend::KiwiSdr => open_kiwisdr_source(radio, cli.center_hz()),
         Backend::Rx888 => open_rx888_source(radio, cli.center_hz()),
         Backend::AirspyHf => open_airspyhf_source(radio, cli.center_hz()),
         Backend::Airspy => open_airspy_source(radio, cli.center_hz()),
@@ -1496,7 +1514,15 @@ fn open_soapy_source(
     _settings: &Settings,
     _radio: &RadioConfig,
 ) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
-    bail!("SoapySDR support is not compiled into this build")
+    // The message a fresh install of a `-no-soapysdr` package meets, because
+    // `Backend::Soapy` is what an unconfigured `radio.json` says (issue #220).
+    // So it has to name the way out rather than only the fault.
+    bail!(
+        "SoapySDR support is not compiled into this build — open Settings → Radio and pick a \
+         built-in interface (HackRF, RTL-SDR, Airspy, AirspyHF+, SDRplay, RX-888, LimeSDR, \
+         PlutoSDR, HPSDR, a CAT rig, a network radio…), or install the SoapySDR build of \
+         sdroxide"
+    )
 }
 
 /// Build the CAT + sound-card source and its capabilities from radio.json.
@@ -1936,9 +1962,11 @@ fn open_hackrf_source(
 /// over, and claiming otherwise would let the engine keep a receive chain
 /// running against a stream that has been torn down.
 ///
-/// The frequency range comes off the radio rather than a constant — a rad1o is
-/// 50–4000 MHz and a Jawbreaker starts at 10 MHz, and telling one of those
-/// owners they can work 6 GHz would be worse than saying nothing.
+/// The frequency range is the firmware's, not the board's specified coverage:
+/// DC – 7.25 GHz on every HackRF, matching libhackrf and SoapyHackRF. A HackRF
+/// is deaf below 1 MHz and above 6 GHz, but it does tune there and people do
+/// use it there, so the range that reaches the dial is the one the radio will
+/// accept. See `sdroxide_hackrf::protocol::TUNING_RANGE_HZ`.
 ///
 /// Three real gain elements, LNA first: `gains[0]` is what the main window's
 /// Gain slider reaches, and the LNA is the stage that actually changes
@@ -2382,6 +2410,70 @@ fn spyserver_caps(src: &spyserver_source::SpyServerSource, driver: &str) -> Devi
     }
 }
 
+/// Build the KiwiSDR source: a ~12 kHz I/Q window that follows the dial, plus
+/// the receiver's own 0-30 MHz waterfall for the full-band strip.
+fn open_kiwisdr_source(
+    radio: &RadioConfig,
+    center_hz: f64,
+) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
+    // Who to announce ourselves as. Resolved here rather than in the driver
+    // crate, which has no business reading the station configuration — and it
+    // is the station callsign rather than the radio's, because it is the
+    // operator the receiver's owner sees.
+    let ident = radio.kiwi.ident_or(&sdroxide_config::load_digi_config().my_call);
+    let src = kiwisdr_source::KiwiSdrSource::connect(&radio.kiwi, &ident, center_hz)
+        .with_context(|| format!("connecting to the KiwiSDR at {}", radio.kiwi.endpoint()))?;
+    let caps = kiwisdr_caps(&src);
+    Ok((Box::new(src), caps))
+}
+
+/// Capabilities for a KiwiSDR: one narrow I/Q channel, receive only.
+///
+/// The tuning range comes from the receiver's own opening burst rather than
+/// from the directory listing, because a privately-run Kiwi is in no listing —
+/// and because the two disagree often enough to matter: the listing carries
+/// what its operator typed, the receiver carries what it is actually set to.
+///
+/// One sample rate, and it is not a round number. The receiver states its own
+/// (11998.876765 Hz on the one this was measured against) and there is nothing
+/// to choose: a Kiwi's user channel is the width it is.
+///
+/// The gain elements are the receiver's AGC and its manual gain. Both are on
+/// the far side of the link and ahead of the I/Q, which is why the S-meter is
+/// read from the frames instead — see `kiwisdr_source`.
+fn kiwisdr_caps(src: &kiwisdr_source::KiwiSdrSource) -> DeviceCaps {
+    let (lo, hi) = src.tuning_range();
+    DeviceCaps {
+        driver: "kiwisdr".into(),
+        label: src.describe(),
+        rx_channels: 1,
+        tx_channels: 0,
+        audio_mode: false,
+        freq_ranges_rx: vec![(lo, hi)],
+        sample_rates: vec![src.sample_rate()],
+        gains: vec![
+            sdroxide_types::GainElement {
+                name: sdroxide_types::KiwiConfig::AGC_ELEMENT.into(),
+                direction: sdroxide_types::Direction::Rx,
+                min_db: 0.0,
+                max_db: 1.0,
+                step_db: 1.0,
+            },
+            sdroxide_types::GainElement {
+                name: sdroxide_types::KiwiConfig::MAN_GAIN_ELEMENT.into(),
+                direction: sdroxide_types::Direction::Rx,
+                // The receiver's own scale, carried in a field named for
+                // decibels because `GainElement` has no other - the same thing
+                // the SpyServer's gain index and the SDRplay's LNA state do.
+                min_db: 0.0,
+                max_db: 90.0,
+                step_db: 1.0,
+            },
+        ],
+        ..DeviceCaps::default()
+    }
+}
+
 /// Build the TCI (WebSocket) source from radio.json: wideband IQ receive +
 /// audio transmit.
 fn open_tci_source(
@@ -2393,6 +2485,7 @@ fn open_tci_source(
         radio.tci.iq_sample_rate_hz,
         center_hz,
         radio.tci.rx,
+        radio.tci.stream_delay_ms,
     )
     .context("connecting to TCI server")?;
     let caps = tci_caps(&radio.tci.address, src.sample_rate_hz(), radio.tci.rx);

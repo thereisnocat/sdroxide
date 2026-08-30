@@ -158,12 +158,27 @@ pub struct MultiApp {
     /// settings page. Cleared as soon as one arrives — see
     /// [`MultiApp::open_peer_radios`].
     pending_add: Option<String>,
+    /// A configuration to hand the radio `pending_add` is waiting for, from
+    /// "Public SDRs". Separate from `pending_add` because the plain "+" has
+    /// none and must still open the settings page.
+    pending_preset: Option<Box<sdroxide_types::RadioConfig>>,
     /// Addresses of a station's further radios that have already been opened
     /// beside the one that was dialled. Kept for the whole session and never
     /// cleared on close: a tab the operator shut is one they did not want, and
     /// the offer arrives again on every reconnect. See
     /// [`MultiApp::open_peer_radios`].
     peers_opened: std::collections::HashSet<String>,
+    /// The station radio: the first one the frontend booted, which is the first
+    /// entry of `radios.json`.
+    ///
+    /// Held rather than read off `tabs[0]`, because the strip's order is the
+    /// operator's to arrange (issue #224) and this radio's standing is not. It
+    /// holds the station's shared services and the legacy configuration paths,
+    /// takes the command line's overrides, and is the one radio that cannot be
+    /// closed — none of which may move to another radio because a chip was
+    /// dragged. `None` only where every tab is somebody else's station, which
+    /// is every browser client.
+    station_radio: Option<u32>,
 }
 
 impl MultiApp {
@@ -203,6 +218,24 @@ impl MultiApp {
             })
             .collect();
         assert!(!tabs.is_empty(), "MultiApp needs at least one radio");
+        // Read before the strip is rearranged, off the boot order: see
+        // [`MultiApp::station_radio`].
+        let mut tabs = tabs;
+        let station_radio = tabs.iter().find(|t| !t.remote).map(|t| t.id);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // The operator's own order, if they have arranged one. Stable, so
+            // the connections — which are in no roster and so in no saved order
+            // — keep the order they were opened in, after the local radios.
+            let order = sdroxide_config::load_radios().display_order();
+            tabs.sort_by_key(|t| order.iter().position(|id| *id == t.id).unwrap_or(usize::MAX));
+        }
+        // The leftmost chip is the one the session opens on, whichever radio
+        // the operator has put there — `new_tab` above seeded the flag from the
+        // boot order, which is no longer the order on screen.
+        for (i, t) in tabs.iter_mut().enumerate() {
+            t.app.set_focused_flag(i == 0);
+        }
         let panes = vec![tabs[0].id];
         MultiApp {
             tabs,
@@ -212,7 +245,31 @@ impl MultiApp {
             remote,
             wgpu: cc.wgpu_render_state.clone(),
             pending_add: None,
+            pending_preset: None,
             peers_opened: std::collections::HashSet::new(),
+            station_radio,
+        }
+    }
+
+    /// Put the tabs in `ids` order and remember it (issue #224).
+    ///
+    /// Tolerant by design: an id that is not here is skipped and a tab the list
+    /// does not name keeps its place at the end, because the strip that sent
+    /// this drew a frame ago and a radio may have arrived or gone since. The
+    /// sort is stable, so those tabs stay in the order they were in.
+    ///
+    /// Only this machine's own radios are written to the roster: a connection
+    /// has no entry there to order.
+    fn reorder_tabs(&mut self, ids: &[u32]) {
+        let focused_id = self.tabs[self.focused].id;
+        self.tabs.sort_by_key(|t| ids.iter().position(|id| *id == t.id).unwrap_or(usize::MAX));
+        self.focused = self.tabs.iter().position(|t| t.id == focused_id).unwrap_or(0);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let local: Vec<u32> = self.tabs.iter().filter(|t| !t.remote).map(|t| t.id).collect();
+            if let Err(e) = sdroxide_config::reorder_radios(&local) {
+                eprintln!("sdroxide: recording the radio order: {e}");
+            }
         }
     }
 
@@ -292,11 +349,12 @@ impl MultiApp {
     /// copy of the strip.
     fn roster(&self) -> Vec<RadioChip> {
         // The radio each station will not part with: its first. For this
-        // machine that is the first tab that is not a connection — the station
-        // radio, which holds the shared services and the legacy configuration;
-        // for a station at the far end it is the first radio in the roster it
-        // announced, which is what its `/ws` means.
-        let first_local = self.tabs.iter().find(|t| !t.remote).map(|t| t.id);
+        // machine that is [`MultiApp::station_radio`] — the radio that holds
+        // the shared services and the legacy configuration, which is where the
+        // frontend booted it and not wherever its chip has since been dragged
+        // to; for a station at the far end it is the first radio in the roster
+        // it announced, which is what its `/ws` means.
+        let first_local = self.station_radio;
         self.tabs
             .iter()
             .enumerate()
@@ -438,7 +496,7 @@ impl MultiApp {
                         self.tabs[i].app.open_radio_settings();
                     }
                 }
-                RadioTabRequest::Add { station } => self.add_radio(&station, ctx),
+                RadioTabRequest::Add { station, preset } => self.add_radio(&station, preset, ctx),
                 #[cfg(not(target_arch = "wasm32"))]
                 RadioTabRequest::Connect { url, name } => self.connect_tab(&url, name, ctx),
                 RadioTabRequest::Close(id) => {
@@ -483,6 +541,7 @@ impl MultiApp {
                     }
                 }
                 RadioTabRequest::RemoveFromStation(id) => self.remove_at_station(id),
+                RadioTabRequest::Reorder(ids) => self.reorder_tabs(&ids),
             }
         }
     }
@@ -508,7 +567,7 @@ impl MultiApp {
                 // in the way. Adding a radio at a station is one screen away,
                 // in Settings → Radio, where the two rosters are already side
                 // by side.
-                StripAction::Add => self.add_radio("", ctx),
+                StripAction::Add => self.add_radio("", None, ctx),
             }
         }
     }
@@ -728,9 +787,14 @@ impl MultiApp {
     /// starts its engine and announces its roster again, and the new radio
     /// arrives as one more of that station's, through the same path the rest of
     /// them did.
-    fn add_radio(&mut self, station: &str, ctx: &egui::Context) {
+    fn add_radio(
+        &mut self,
+        station: &str,
+        preset: Option<Box<sdroxide_types::RadioConfig>>,
+        ctx: &egui::Context,
+    ) {
         if station.is_empty() {
-            self.add_tab(ctx);
+            self.add_tab(preset, ctx);
             return;
         }
         let Some(t) = self.tabs.iter_mut().find(|t| t.remote && t.app.station_key() == station)
@@ -742,6 +806,10 @@ impl MultiApp {
         // says otherwise.
         t.app.add_station_radio("");
         self.pending_add = Some(station.to_string());
+        // Held until the station announces the radio and `open_peer_radios`
+        // opens it: the radio does not exist yet, so there is nothing to
+        // configure until then.
+        self.pending_preset = preset;
         // Nothing else happens here. The station answers with its roster, and
         // `open_peer_radios` opens what is new in it — including, for a radio
         // this screen asked for, putting it in front of the operator.
@@ -765,14 +833,20 @@ impl MultiApp {
         t.app.remove_station_radio(station_id);
     }
 
-    fn add_tab(&mut self, ctx: &egui::Context) {
+    fn add_tab(&mut self, preset: Option<Box<sdroxide_types::RadioConfig>>, ctx: &egui::Context) {
         let Some(factory) = self.factory.as_mut() else { return };
         match factory() {
             Ok(r) => {
                 let i = self.install_tab(r, ctx);
-                // The new tab has no interface yet; the operator's next stop
-                // is Settings → Radio, so open it for them.
-                self.tabs[i].app.open_radio_settings();
+                match preset {
+                    // Already configured — it came from "Public SDRs", which
+                    // knows the whole answer. Opening the settings page over it
+                    // would be asking a question that has been answered.
+                    Some(cfg) => self.tabs[i].app.apply_radio_config(*cfg),
+                    // The new tab has no interface yet; the operator's next
+                    // stop is Settings → Radio, so open it for them.
+                    None => self.tabs[i].app.open_radio_settings(),
+                }
             }
             // Into the focused tab's dismissable banner — the main window's
             // strip may not be on screen to carry a message.
@@ -890,7 +964,10 @@ impl MultiApp {
                     let i = if asked_for {
                         self.pending_add = None;
                         let i = self.install_tab(r, ctx);
-                        self.tabs[i].app.open_radio_settings();
+                        match self.pending_preset.take() {
+                            Some(cfg) => self.tabs[i].app.apply_radio_config(*cfg),
+                            None => self.tabs[i].app.open_radio_settings(),
+                        }
                         i
                     } else {
                         self.append_tab(r, ctx)
@@ -1005,13 +1082,16 @@ impl MultiApp {
         if i >= self.tabs.len() || self.tabs.len() == 1 {
             return;
         }
-        // The station's first radio stays: it holds the shared network
-        // services and the legacy configuration, and a window is a station.
-        // A *connection* in that position is not that radio — a client dialled
-        // straight at one of a station's other radios has one as its first tab
-        // — and a connection whose radio has been closed at the far end has to
-        // be able to go with it.
-        if i == 0 && !self.tabs[0].remote {
+        // The station radio stays: it holds the shared network services and the
+        // legacy configuration, and a window is a station. Named rather than
+        // "the first tab", because the strip's order is the operator's to
+        // arrange (issue #224) and this radio's standing is not.
+        //
+        // A *connection* is never that radio, whichever chip it sits under — a
+        // client dialled straight at one of a station's other radios has one as
+        // its first tab — and a connection whose radio has been closed at the
+        // far end has to be able to go with it.
+        if self.station_radio == Some(self.tabs[i].id) {
             return;
         }
         let mut tab = self.tabs.remove(i);

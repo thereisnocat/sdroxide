@@ -37,9 +37,9 @@ use self::net::{
 use self::radio::{
     settings_airspy_tab, settings_airspyhf_tab, settings_cat_tab, settings_elad_tab,
     settings_hackrf_tab, settings_hpsdr_tab, settings_hydrasdr_tab, settings_icomnet_tab,
-    settings_lime_tab, settings_pluto_tab, settings_rtlsdr_tab, settings_rtltcp_tab,
-    settings_rx888_tab, settings_sdrplay_tab, settings_smartsdr_tab, settings_soapy_devices,
-    settings_soapy_tab, settings_spyserver_tab, settings_tci_tab,
+    settings_kiwisdr_tab, settings_lime_tab, settings_pluto_tab, settings_rtlsdr_tab,
+    settings_rtltcp_tab, settings_rx888_tab, settings_sdrplay_tab, settings_smartsdr_tab,
+    settings_soapy_devices, settings_soapy_tab, settings_spyserver_tab, settings_tci_tab,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use self::remote::settings_remote_tab;
@@ -189,6 +189,7 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// Connect to the Icom, report what it is, and disconnect (blocking).
     icomnet_test: &'a mut bool,
     spyserver_test: &'a mut bool,
+    kiwi_test: &'a mut bool,
     /// Copy the last Icom LAN session's trace to the clipboard.
     icomnet_copy_report: &'a mut bool,
     /// Listen for FlexRadio discovery broadcasts (a couple of seconds, blocking).
@@ -464,6 +465,11 @@ impl SdroxideApp {
             A::Hpsdr(d) => self.hpsdr_devices = d,
             A::SmartSdr(d) => self.smartsdr_devices = d,
             A::Pluto(d) => self.pluto_devices = d,
+            // Not a device on this machine but a list from the internet,
+            // fetched by it — see `DeviceProbe::PublicSdrs`. Kept whole rather
+            // than merged so a refresh that came back short replaces the list
+            // instead of leaving stale receivers in it.
+            A::PublicSdrs(d) => self.public_sdrs = Some(*d),
             A::Test(kind, result) => self.set_test_outcome(kind, TestOutcome::Done(result)),
             // Straight to the clipboard, which is what the button that asked
             // for it promised — from here it goes into a bug report.
@@ -486,6 +492,7 @@ impl SdroxideApp {
             K::IcomNet => &mut self.icomnet_test_result,
             K::SmartSdr => &mut self.smartsdr_test_result,
             K::Pluto => &mut self.pluto_test_result,
+            K::Kiwi => &mut self.kiwi_test_result,
         };
         *slot = Some(outcome);
     }
@@ -606,6 +613,7 @@ impl SdroxideApp {
         let mut tci_test = false;
         let mut icomnet_test = false;
         let mut spyserver_test = false;
+        let mut kiwi_test = false;
         let mut icomnet_copy_report = false;
         let mut smartsdr_discover = false;
         let mut smartsdr_test = false;
@@ -684,6 +692,10 @@ impl SdroxideApp {
         // with spyserver, in either of the two shapes it can send.
         iface_opts.push(sdroxide_types::Backend::SpyServer);
         iface_opts.push(sdroxide_types::Backend::SpyServerVfo);
+        // Pure Rust over `ws://`, no TLS and no system library: the ~900
+        // public KiwiSDRs and Web-888s, and any private one on the same
+        // firmware.
+        iface_opts.push(sdroxide_types::Backend::KiwiSdr);
         // Same reasoning as the RTL-SDR: pure Rust over `nusb`, no system
         // library, so it is in every build variant.
         iface_opts.push(sdroxide_types::Backend::Rx888);
@@ -827,6 +839,7 @@ impl SdroxideApp {
                             smartsdr_test: &mut smartsdr_test,
                             icomnet_test: &mut icomnet_test,
                             spyserver_test: &mut spyserver_test,
+                            kiwi_test: &mut kiwi_test,
                             icomnet_copy_report: &mut icomnet_copy_report,
                             smartsdr_copy_report: &mut smartsdr_copy_report,
                             pluto_discover: &mut pluto_discover,
@@ -1078,6 +1091,24 @@ impl SdroxideApp {
             } else {
                 let endpoint = block.endpoint();
                 self.ask_device(ctx, P::Test(T::SpyServer(endpoint)));
+            }
+        }
+        // The address typed in the dialog, like every other test here. A
+        // receiver behind the project's proxy answers on port 80 rather than
+        // 8073, so the endpoint is built from the config's own rule rather than
+        // by appending a default here.
+        if let (true, Some(cfg)) = (kiwi_test, &radio_edit) {
+            if cfg.kiwi.address.trim().is_empty() {
+                self.set_test_outcome(
+                    sdroxide_types::TestKind::Kiwi,
+                    TestOutcome::Done(Err(
+                        "enter the receiver's address first, or pick one from Public SDRs"
+                            .to_string(),
+                    )),
+                );
+            } else {
+                let endpoint = cfg.kiwi.endpoint();
+                self.ask_device(ctx, P::Test(T::Kiwi(endpoint)));
             }
         }
         if smartsdr_discover {
@@ -1921,6 +1952,14 @@ impl SdroxideApp {
                         backend == Backend::SpyServerVfo,
                         io.spyserver_test,
                         &self.spyserver_test_result,
+                        io.can_probe,
+                        cmds,
+                    ),
+                    Backend::KiwiSdr => settings_kiwisdr_tab(
+                        ui,
+                        io.radio_edit,
+                        io.kiwi_test,
+                        &self.kiwi_test_result,
                         io.can_probe,
                         cmds,
                     ),
@@ -3060,6 +3099,53 @@ fn station_label(key: &str) -> &str {
     key.split_once("://").map_or(key, |(_, rest)| rest)
 }
 
+/// Which gap in `placed` a chip dropped at `p` belongs in: the index of the
+/// chip it lands in front of, or `placed.len()` for the end of the strip.
+///
+/// Measured against the *nearest* chip rather than by scanning left to right,
+/// because the strip wraps: on a narrow dialog the chips are on two or three
+/// rows, and an x-only test would put a chip dropped on the second row in a gap
+/// on the first. Distance to the rectangle handles both axes at once, and the
+/// half of that chip the pointer is on decides which side of it the gap is.
+fn drop_slot(placed: &[(u32, egui::Rect)], p: egui::Pos2) -> usize {
+    let Some((i, r)) = placed
+        .iter()
+        .enumerate()
+        .map(|(i, (_, r))| (i, *r))
+        .min_by(|(_, a), (_, b)| a.distance_sq_to_pos(p).total_cmp(&b.distance_sq_to_pos(p)))
+    else {
+        return 0;
+    };
+    if p.x < r.center().x { i } else { i + 1 }
+}
+
+/// Where to draw the insertion caret for a gap: `(x, the row's y range)`. The
+/// leading edge of the chip that would follow it, or the trailing edge of the
+/// last chip for the gap at the end.
+fn caret_at(placed: &[(u32, egui::Rect)], slot: usize) -> Option<(f32, egui::Rangef)> {
+    match placed.get(slot) {
+        Some((_, r)) => Some((r.left() - 3.0, r.y_range())),
+        None => placed.last().map(|(_, r)| (r.right() + 3.0, r.y_range())),
+    }
+}
+
+/// `ids` with `dragged` taken out and put back in front of `before` — or at the
+/// end, where `before` is `None`.
+///
+/// Both indices are read off the list *before* the removal and the target is
+/// then stepped back over the hole, which is what makes dropping a chip on
+/// either half of itself a no-op: both halves name a gap that is where it
+/// already is, and an index taken after the removal would read one of them as a
+/// move by one.
+fn reordered(ids: &[u32], dragged: u32, before: Option<u32>) -> Vec<u32> {
+    let mut out = ids.to_vec();
+    let Some(from) = ids.iter().position(|id| *id == dragged) else { return out };
+    let to = before.and_then(|b| ids.iter().position(|id| *id == b)).unwrap_or(ids.len());
+    let item = out.remove(from);
+    out.insert(if to > from { to - 1 } else { to }.min(out.len()), item);
+    out
+}
+
 /// The radio-management strip at the top of Settings → Radio: the same chips
 /// the main window's tab area shows, drawn where radios are configured. The
 /// main window only shows its copy once there is more than one radio, so this
@@ -3097,12 +3183,19 @@ impl SdroxideApp {
         // Nothing to manage: one radio, with nowhere to add a second — no
         // hardware of this machine's own to open, and no station at the far end
         // that keeps a roster it would let us touch.
-        let Some(station) = self.radio_roster.first() else { return };
+        if self.radio_roster.is_empty() {
+            return;
+        }
         let targets = self.add_radio_targets();
         if self.radio_roster.len() < 2 && targets.is_empty() {
             return;
         }
-        let station_id = station.id;
+        // Which chip is being dragged along the strip, and where every chip
+        // ended up this frame — the two halves of the reorder (issue #224).
+        let drag_id = ui.id().with("roster-drag");
+        let mut dragging: Option<u32> = ui.data(|d| d.get_temp(drag_id)).unwrap_or(None);
+        let mut placed: Vec<(u32, egui::Rect)> = Vec::new();
+        let mut dropped = false;
         ui.horizontal_wrapped(|ui| {
             for chip in &self.radio_roster {
                 let mut label = RichText::new(chip.display_name()).size(12.5);
@@ -3115,11 +3208,23 @@ impl SdroxideApp {
                     // colour is the one shade guaranteed to be closest to it.
                     label = label.strong().color(crate::theme::INK_ON_CYAN());
                 }
-                if crate::chrome::chip(ui, chip.focused, label)
+                // Draggable, so the operator can arrange the strip. A drag that
+                // never travels far enough to be one still arrives as a click,
+                // so switching radios costs exactly what it did before.
+                let resp = crate::chrome::chip_draggable(ui, chip.focused, label);
+                placed.push((chip.id, resp.rect));
+                if resp.drag_started() {
+                    dragging = Some(chip.id);
+                }
+                if resp.drag_stopped() {
+                    dropped = true;
+                }
+                if resp
                     .on_hover_text(if chip.focused {
-                        "This radio's settings are below"
+                        "This radio's settings are below. Drag to move it along the strip."
                     } else {
-                        "Switch to this radio (the dialog follows)"
+                        "Switch to this radio (the dialog follows). Drag to move it along the \
+                         strip."
                     })
                     .clicked()
                     && !chip.focused
@@ -3196,7 +3301,13 @@ impl SdroxideApp {
                 // does not get found (issue #188) — and the second asks again
                 // before it acts, so taking a radio out of a station is still
                 // never one stray click.
-                if chip.id != station_id {
+                // Exactly the one tab the shell refuses to close: this
+                // machine's station radio, which holds the shared services and
+                // the legacy configuration. Not "the first chip on the strip" —
+                // that is the operator's to arrange (issue #224) — and never a
+                // connection, however far left it has been dragged: hanging up
+                // has to stay possible.
+                if !(chip.station.is_empty() && chip.first_of_station) {
                     let closing = if chip.station.is_empty() {
                         "Close this radio (its configuration is kept)"
                     } else {
@@ -3234,8 +3345,10 @@ impl SdroxideApp {
                         .on_hover_text(only.hint())
                         .clicked()
                     {
-                        requests
-                            .push(crate::app::RadioTabRequest::Add { station: only.key.clone() });
+                        requests.push(crate::app::RadioTabRequest::Add {
+                            station: only.key.clone(),
+                            preset: None,
+                        });
                     }
                 }
                 // One destination, and it is somebody else's station — which is
@@ -3261,6 +3374,7 @@ impl SdroxideApp {
                             if ui.button(t.label()).on_hover_text(t.hint()).clicked() {
                                 requests.push(crate::app::RadioTabRequest::Add {
                                     station: t.key.clone(),
+                                    preset: None,
                                 });
                                 ui.close();
                             }
@@ -3269,6 +3383,33 @@ impl SdroxideApp {
                 }
             }
         });
+        // The drop. While a chip is being dragged a caret shows where it would
+        // land; on release the whole strip's order goes to the shell, which
+        // sorts its tabs to match and records it.
+        // A drag whose release this strip never saw — the dialog was closed
+        // under it, or the pointer left the window — must not leave a caret
+        // following the mouse the next time the page is opened.
+        if dragging.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            dragging = None;
+        }
+        if let Some(id) = dragging {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let at = ui.ctx().pointer_interact_pos();
+            let slot = at.map(|p| drop_slot(&placed, p));
+            if let Some((x, y)) = slot.and_then(|i| caret_at(&placed, i)) {
+                ui.painter().vline(x, y, egui::Stroke::new(2.0, crate::theme::CYAN()));
+            }
+            if dropped {
+                let before = slot.and_then(|i| placed.get(i)).map(|(id, _)| *id);
+                let now: Vec<u32> = placed.iter().map(|(id, _)| *id).collect();
+                let next = reordered(&now, id, before);
+                if next != now {
+                    requests.push(crate::app::RadioTabRequest::Reorder(next));
+                }
+                dragging = None;
+            }
+        }
+        ui.data_mut(|d| d.insert_temp(drag_id, dragging));
         // The focused radio's name. By default a radio is named after its
         // interface — the box is empty and the hint shows what that resolves
         // to — and typing here gives it a name of the operator's own.
@@ -3350,5 +3491,62 @@ impl SdroxideApp {
                 ui.close();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod roster_order_tests {
+    use super::*;
+    use eframe::egui::{Rect, pos2};
+
+    /// A row of three chips 60 points wide with 6 points between them.
+    fn strip() -> Vec<(u32, Rect)> {
+        (0..3u32)
+            .map(|i| {
+                let x = 10.0 + i as f32 * 66.0;
+                (i, Rect::from_min_size(pos2(x, 20.0), egui::vec2(60.0, 22.0)))
+            })
+            .collect()
+    }
+
+    /// The pointer's half of the nearest chip picks the gap, and past the last
+    /// chip that is the end of the strip.
+    #[test]
+    fn the_drop_slot_follows_the_pointer() {
+        let s = strip();
+        assert_eq!(drop_slot(&s, pos2(15.0, 30.0)), 0, "the left half of the first chip");
+        assert_eq!(drop_slot(&s, pos2(65.0, 30.0)), 1, "the right half of the first chip");
+        assert_eq!(drop_slot(&s, pos2(90.0, 30.0)), 1, "the left half of the second");
+        assert_eq!(drop_slot(&s, pos2(400.0, 30.0)), 3, "past the end of the strip");
+    }
+
+    /// The strip wraps on a narrow dialog, and a chip dropped on the row below
+    /// must land in a gap on *that* row rather than in the nearest gap by x.
+    #[test]
+    fn a_wrapped_strip_drops_onto_the_row_under_the_pointer() {
+        let mut s = strip();
+        // A fourth chip, alone on a second row under the first.
+        s.push((3, Rect::from_min_size(pos2(10.0, 50.0), egui::vec2(60.0, 22.0))));
+        assert_eq!(drop_slot(&s, pos2(65.0, 60.0)), 4, "the second row's own chip");
+        assert_eq!(drop_slot(&s, pos2(15.0, 60.0)), 3, "in front of it");
+    }
+
+    /// A chip dropped where it already is changes nothing — on either half of
+    /// itself, which is what stops a drag that never really moved from
+    /// shuffling the strip by one.
+    #[test]
+    fn dropping_a_chip_on_itself_is_a_no_op() {
+        let ids = [0u32, 1, 2];
+        assert_eq!(reordered(&ids, 1, Some(1)), vec![0, 1, 2], "its own left half");
+        assert_eq!(reordered(&ids, 1, Some(2)), vec![0, 1, 2], "its own right half");
+    }
+
+    /// And a real move takes the chip out and puts it back in the gap named.
+    #[test]
+    fn a_chip_moves_to_the_gap_it_was_dropped_in() {
+        let ids = [0u32, 1, 2, 3];
+        assert_eq!(reordered(&ids, 3, Some(0)), vec![3, 0, 1, 2], "to the front");
+        assert_eq!(reordered(&ids, 0, None), vec![1, 2, 3, 0], "to the end");
+        assert_eq!(reordered(&ids, 0, Some(3)), vec![1, 2, 0, 3], "into the middle");
     }
 }

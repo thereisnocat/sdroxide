@@ -43,6 +43,13 @@ struct Inner {
     lines: VecDeque<String>,
     dropped: u64,
     streams: BTreeMap<u32, StreamCounters>,
+    /// Every datagram the VITA-49 sockets received, whatever it turned out to
+    /// be. Counted separately from [`Self::streams`] because the difference
+    /// between the two is a diagnosis: streams empty *and* this zero means not
+    /// one byte of UDP arrived from the radio, which is a network fault and not
+    /// a protocol one. Streams empty with this non-zero would mean datagrams are
+    /// arriving and we are failing to make sense of them, which is ours.
+    datagrams: u64,
 }
 
 /// A shared, bounded record of one radio session.
@@ -87,6 +94,15 @@ impl Trace {
     pub fn rx_line(&self, line: &str) {
         self.note(format!("← {}", line.trim_end()));
         tracing::trace!(target: "smartsdr::control", line = %line.trim_end(), "received");
+    }
+
+    /// Record that a datagram arrived, before anything is known about it.
+    ///
+    /// Deliberately separate from [`Self::packet`]: a "no spectrum" report has
+    /// to distinguish "the radio's UDP never reached this machine" from "it
+    /// reached us and we dropped it", and only a count taken before parsing can.
+    pub fn datagram(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).datagrams += 1;
     }
 
     /// Record a VITA-49 packet's arrival. The first packet of each stream is
@@ -135,8 +151,15 @@ impl Trace {
             ));
         }
         out.push_str("\n--- streams ---\n");
+        out.push_str(&format!("datagrams received on the VITA-49 socket(s): {}\n", g.datagrams));
         if g.streams.is_empty() {
-            out.push_str("(no VITA-49 packets received)\n");
+            out.push_str(if g.datagrams == 0 {
+                "(no VITA-49 packets received — and no UDP at all, so nothing the radio \
+                 sent reached this machine)\n"
+            } else {
+                "(no VITA-49 packets received, though datagrams did arrive — they were \
+                 too short to be VITA-49 headers)\n"
+            });
         }
         for (id, c) in &g.streams {
             out.push_str(&format!(
@@ -200,5 +223,20 @@ mod tests {
     #[test]
     fn an_empty_trace_still_dumps() {
         assert!(Trace::new().dump().contains("no VITA-49 packets received"));
+    }
+
+    #[test]
+    fn silence_says_whether_any_udp_arrived_at_all() {
+        // The two silences have different causes and different fixes, and a
+        // report that cannot tell them apart sends everybody to the wrong one.
+        let quiet = Trace::new();
+        assert!(quiet.dump().contains("no UDP at all"));
+
+        let noisy = Trace::new();
+        noisy.datagram();
+        noisy.datagram();
+        let d = noisy.dump();
+        assert!(d.contains("datagrams received on the VITA-49 socket(s): 2"));
+        assert!(d.contains("though datagrams did arrive"));
     }
 }

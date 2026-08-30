@@ -8,6 +8,19 @@ pub struct ViewState {
     /// Visible frequency window; 0/0 means "fit the full device span".
     pub view_lo_hz: f64,
     pub view_hi_hz: f64,
+    /// Which front end the window above was fitted against
+    /// ([`sdroxide_types::DeviceCaps::driver`]).
+    ///
+    /// A zoom only means anything against the span it was taken in. Opening a
+    /// different interface on the same radio leaves the old one's window
+    /// behind, and the arithmetic that keeps a view honest only ever *narrows*
+    /// it — so a 12 kHz KiwiSDR window carried straight into an 800 kHz
+    /// SpyServer session and stayed there, a 70× zoom nobody asked for and no
+    /// gesture undid short of Fit. Remembered here rather than in memory so
+    /// that a restart on the *same* interface still restores the operator's
+    /// zoom, which is the whole point of persisting the window at all.
+    #[serde(default)]
+    pub driver: String,
     /// Voice-mode window saved on entering FT8/FT4 (which locks the view to the
     /// narrow sub-band), restored on leaving so the panadapter isn't left stuck
     /// zoomed in.
@@ -35,6 +48,41 @@ pub struct ViewState {
     pub spectrum_fraction: f32,
     /// Draw a decaying peak-hold trace over the spectrum.
     pub peak_hold: bool,
+    /// Draw the spectrum strip as a receding 3D surface instead of a flat
+    /// line: the newest spectrum across the front, the ones before it flowing
+    /// away from the viewer. See [`crate::widgets::spectrum3d`].
+    ///
+    /// Off by default — the flat line is the display everything else in the
+    /// panadapter is measured against, and the surface costs the strip's whole
+    /// height to say the same thing with time in it.
+    #[serde(default)]
+    pub spectrum_3d: bool,
+    /// How that surface is drawn: `true` fills it and colours it by the
+    /// waterfall palette, `false` draws each remembered spectrum as a trace
+    /// over an opaque fill.
+    ///
+    /// Solid by default: it is the rendering that puts the level in the colour
+    /// as well as in the shape, and it reuses the palette the operator has
+    /// already picked for the waterfall, so the two halves of the panadapter
+    /// agree about what a strong signal looks like.
+    #[serde(default = "spectrum_3d_solid_default")]
+    pub spectrum_3d_solid: bool,
+    /// Keep the tuned frequency in the middle of the panadapter: every time
+    /// the dial moves, the window slides under it so the marker stays put
+    /// (issue #174).
+    ///
+    /// Off is the display as it always was — the window holds still and the
+    /// marker travels across it until the dial leaves the span, at which point
+    /// the picture jumps a whole window. That jump is what this exists to
+    /// remove: with it on the band scrolls past a fixed marker instead.
+    ///
+    /// Zoomed in the slide is free — the window is a viewport onto a wider
+    /// captured span. Zoomed all the way out there is nowhere left to slide,
+    /// so the front end's own centre is moved instead, exactly as a drag that
+    /// reaches the edge already does (issue #133). A receiver whose centre
+    /// *is* its dial has nothing to do either way: it is already centred.
+    #[serde(default)]
+    pub center_on_vfo: bool,
     /// Hide the spectrum line, showing only the waterfall (and, in FT8/FT4,
     /// giving the freed height to the operating panel).
     pub spectrum_collapsed: bool,
@@ -453,6 +501,7 @@ impl Default for ViewState {
         ViewState {
             view_lo_hz: 0.0,
             view_hi_hz: 0.0,
+            driver: String::new(),
             pre_digi_view: None,
             rds_standard: sdroxide_types::RdsStandard::default(),
             db_floor: -120.0,
@@ -461,6 +510,9 @@ impl Default for ViewState {
             fft_size: 4096,
             spectrum_fraction: 0.35,
             peak_hold: false,
+            spectrum_3d: false,
+            spectrum_3d_solid: spectrum_3d_solid_default(),
+            center_on_vfo: false,
             spectrum_collapsed: false,
             waterfall_collapsed: false,
             waterfall_flip: false,
@@ -533,6 +585,30 @@ impl ViewState {
         self.span() <= 0.0
     }
 
+    /// Note which front end is now streaming, and drop the window if it is a
+    /// different one — see [`ViewState::driver`].
+    ///
+    /// Dropping means *unsetting*, not fitting: the panadapter fits an unset
+    /// view to the device on its first draw, so this hands the decision to the
+    /// one place that already makes it rather than inventing a second.
+    ///
+    /// Returns whether the window was dropped.
+    pub fn adopt_driver(&mut self, driver: &str) -> bool {
+        if self.driver == driver {
+            return false;
+        }
+        // A first run, or a view stored before this field existed: adopt the
+        // driver without touching a window the operator may have left set.
+        let known = !self.driver.is_empty();
+        self.driver = driver.to_string();
+        if known && !self.is_unset() {
+            self.view_lo_hz = 0.0;
+            self.view_hi_hz = 0.0;
+            return true;
+        }
+        false
+    }
+
     /// Reset to show the whole device passband.
     pub fn fit(&mut self, center_hz: f64, span_hz: f64) {
         self.view_lo_hz = center_hz - span_hz / 2.0;
@@ -567,6 +643,12 @@ impl ViewState {
 /// Default for [`ViewState::wide_waterfall`] — on, so a receiver that has a
 /// full-band lane shows it without anyone having to find the chip first.
 fn wide_waterfall_default() -> bool {
+    true
+}
+
+/// Default for [`ViewState::spectrum_3d_solid`] — the filled, palette-coloured
+/// surface, which is what the 3D chip should show the first time it is clicked.
+fn spectrum_3d_solid_default() -> bool {
     true
 }
 
@@ -662,6 +744,11 @@ mod tests {
         // The layer the SPEC popup added: a blob from before it must come back
         // with the waterfall shown, not hidden.
         assert!(v.waterfall_visible(), "upgrading hid the waterfall");
+        // The same for the 3D surface behind that popup's 3D chip: an upgrade
+        // must land on the flat trace, with the solid rendering waiting behind
+        // the chip rather than the wireframe a bare `default` would give.
+        assert!(!v.spectrum_3d, "upgrading switched the 3D surface on by itself");
+        assert!(v.spectrum_3d_solid, "the 3D surface would have come up as a wireframe");
     }
 
     /// The other direction of the same trap: a blob written by a build that
@@ -753,5 +840,53 @@ mod tests {
         };
         let back: ViewState = ron::from_str(&ron::to_string(&v).unwrap()).unwrap();
         assert_eq!(back, v);
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::ViewState;
+
+    /// The 70× zoom nobody asked for: a KiwiSDR's 12 kHz window carried into a
+    /// SpyServer session, where nothing would ever widen it again.
+    #[test]
+    fn a_window_from_another_front_end_is_dropped() {
+        let mut v = ViewState { driver: "kiwisdr".into(), ..Default::default() };
+        v.fit(14_324_375.0, 11_998.9);
+        assert!(v.adopt_driver("spyserver"), "a new interface drops the window");
+        assert!(v.is_unset(), "unset, so the panadapter fits it on the next draw");
+        assert_eq!(v.driver, "spyserver");
+    }
+
+    /// The whole reason the window is persisted: coming back up on the same
+    /// interface restores the operator's zoom.
+    #[test]
+    fn the_same_front_end_keeps_its_zoom() {
+        let mut v = ViewState { driver: "rtlsdr".into(), ..Default::default() };
+        v.fit(14_100_000.0, 48_000.0);
+        let (lo, hi) = (v.view_lo_hz, v.view_hi_hz);
+        assert!(!v.adopt_driver("rtlsdr"));
+        assert_eq!((v.view_lo_hz, v.view_hi_hz), (lo, hi));
+    }
+
+    /// A view stored before this field existed, or a first run: adopt the
+    /// driver without throwing away a window the operator may have left set.
+    #[test]
+    fn a_view_with_no_remembered_driver_is_left_alone() {
+        let mut v = ViewState::default();
+        v.fit(14_100_000.0, 48_000.0);
+        let (lo, hi) = (v.view_lo_hz, v.view_hi_hz);
+        assert!(!v.adopt_driver("rtlsdr"));
+        assert_eq!((v.view_lo_hz, v.view_hi_hz), (lo, hi), "an upgrade keeps the zoom");
+        assert_eq!(v.driver, "rtlsdr");
+    }
+
+    /// An already-unset window has nothing to drop, and must not be reported as
+    /// a change the caller should log.
+    #[test]
+    fn an_unset_window_is_not_dropped_twice() {
+        let mut v = ViewState { driver: "kiwisdr".into(), ..Default::default() };
+        assert!(!v.adopt_driver("spyserver"));
+        assert!(v.is_unset());
     }
 }

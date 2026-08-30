@@ -1820,6 +1820,180 @@ pub(in crate::app) fn settings_spyserver_tab(
     );
 }
 
+/// The KiwiSDR / Web-888 interface.
+///
+/// Short, because there is very little to decide: the receiver owns the front
+/// end and the rate, and what is left is where it is, who to say we are, and
+/// how much of the link to spend on the band view.
+pub(in crate::app) fn settings_kiwisdr_tab(
+    ui: &mut egui::Ui,
+    radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    test: &mut bool,
+    test_result: &Option<crate::app::settings::TestOutcome>,
+    can_probe: bool,
+    cmds: &mut Vec<Command>,
+) {
+    use sdroxide_types::KiwiConfig;
+    let Some(radio) = radio_edit.as_mut() else {
+        ui.label("Waiting for the configuration of the machine the radio is attached to.");
+        return;
+    };
+    let cfg = &mut radio.kiwi;
+
+    egui::Grid::new("kiwi-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Receiver address").on_hover_text(
+            "Where the receiver serves its web page: an address, or an address \
+             and port. The port defaults to 8073, which is a KiwiSDR's own.\n\n\
+             Note that a receiver reached through the project's proxy \
+             (something.proxy.kiwisdr.com — nearly half the public ones) answers \
+             on port 80 instead, so give it explicitly. Picking a receiver from \
+             \"Public SDRs\" fills this in correctly.\n\nTakes effect on Apply.",
+        );
+        crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut cfg.address)
+                .desired_width(240.0)
+                .hint_text("host or host:port, e.g. kiwi.example.org:8073"),
+        );
+        ui.end_row();
+
+        ui.label("Password").on_hover_text(
+            "The receiver's *user* password, where its operator has set one. \
+             Blank on almost every public receiver. Not the admin password.\n\n\
+             Takes effect on Apply.",
+        );
+        crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut cfg.password).password(true).desired_width(160.0),
+        );
+        ui.end_row();
+
+        ui.label("Announce as").on_hover_text(
+            "The name this connection shows up under, which the receiver's \
+             owner and everybody else listening to it can see.\n\n\
+             Left blank it is your station callsign, which is the network's own \
+             convention — some operators do block clients that will not \
+             identify. Takes effect on Apply.",
+        );
+        crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut cfg.ident)
+                .desired_width(160.0)
+                .hint_text("blank = station callsign"),
+        );
+        ui.end_row();
+
+        ui.label("Band view").on_hover_text(
+            "Ask the receiver for its own waterfall as well as its I/Q, and \
+             draw it in the strip above the panadapter.\n\n\
+             Worth having: the I/Q is only about 12 kHz wide, so without this \
+             there is nothing to tune *by*. It is a second connection carrying \
+             roughly 20 kB/s at full speed, against the I/Q's 44 kB/s.\n\n\
+             Takes effect on Apply.",
+        );
+        let mut wide = cfg.wide_lane;
+        crate::chrome::checkbox(ui, &mut wide, "show the receiver's 0-30 MHz waterfall");
+        cfg.wide_lane = wide;
+        ui.end_row();
+
+        ui.label("Band view speed").on_hover_text(
+            "How often the receiver sends a waterfall row, 1 (slowest) to 4. \
+             The only setting here that changes what the link costs while \
+             running, so turn it down on a metered connection.\n\n\
+             Applies immediately.",
+        );
+        let mut speed = cfg.wf_speed.clamp(KiwiConfig::WF_SPEED_MIN, KiwiConfig::WF_SPEED_MAX);
+        if ui
+            .add_enabled(
+                cfg.wide_lane,
+                egui::Slider::new(&mut speed, KiwiConfig::WF_SPEED_MIN..=KiwiConfig::WF_SPEED_MAX),
+            )
+            .changed()
+        {
+            cfg.wf_speed = speed;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: KiwiConfig::WF_SPEED_ELEMENT.to_string(),
+                db: f64::from(speed),
+            });
+        }
+        ui.end_row();
+
+        ui.label("Receiver AGC").on_hover_text(
+            "The *receiver's* AGC, which is on the far side of the link and \
+             ahead of the I/Q — so it acts before anything sdroxide does.\n\n\
+             On by default, unlike every local SDR here, because the measured \
+             alternative was worse: on a live receiver the manual gain was not \
+             monotonic across its range and its top end clipped the I/Q at full \
+             scale, while the AGC held about -24 dBFS with 7 dB of headroom.\n\n\
+             It does mean the sample amplitude is not a signal level, which is \
+             why the S-meter is read from the receiver's own figure instead. \
+             Applies immediately.",
+        );
+        let mut agc = cfg.agc;
+        if crate::chrome::checkbox(ui, &mut agc, "let the receiver ride its own gain").changed() {
+            cfg.agc = agc;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: KiwiConfig::AGC_ELEMENT.to_string(),
+                db: f64::from(u8::from(agc)),
+            });
+        }
+        ui.end_row();
+
+        ui.label("Manual gain").on_hover_text(
+            "Fixed gain when the receiver's AGC is off, on its own 0-90 scale. \
+             Not decibels of anything stated — the protocol calls it manGain \
+             and says no more, and it was measured not to be monotonic, so \
+             treat it as a dial to find a good spot on rather than a \
+             calibration. Applies immediately.",
+        );
+        let mut gain = cfg.man_gain;
+        if ui.add_enabled(!cfg.agc, egui::Slider::new(&mut gain, 0..=90)).changed() {
+            cfg.man_gain = gain;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: KiwiConfig::MAN_GAIN_ELEMENT.to_string(),
+                db: f64::from(gain),
+            });
+        }
+        ui.end_row();
+
+        ui.label("");
+        // The test reads the receiver's `/status` page from wherever the radio
+        // is, and deliberately does not open a session: a receiver has only
+        // four or eight channels and taking one to ask a question would, on a
+        // busy receiver, be the reason it was full.
+        probe_only(ui, can_probe, |ui| {
+            if ui
+                .button("Test connection")
+                .on_hover_text(
+                    "Read the receiver's status page: what it is, what it \
+                     covers, how many channels are free, and whether its \
+                     operator allows connections from apps other than a \
+                     browser. Takes none of its channels.",
+                )
+                .clicked()
+            {
+                *test = true;
+            }
+        });
+        ui.end_row();
+    });
+    test_result_line(ui, test_result);
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(format!(
+            "Receive only — this is somebody else's antenna. The panadapter is the ~12 kHz \
+             the receiver sends as I/Q, which follows the dial; the band view above it is its \
+             own waterfall, and tuning across it retunes the receiver. About {:.0} kB/s while \
+             connected. Press \"Apply / reconnect\" to switch without a restart.",
+            cfg.link_kbytes_s(),
+        ))
+        .weak(),
+    );
+}
+
 pub(in crate::app) fn settings_tci_tab(
     ui: &mut egui::Ui,
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
@@ -5294,15 +5468,14 @@ pub(in crate::app) fn settings_hackrf_tab(
 
     ui.add_space(4.0);
     ui.label(
-        RichText::new(if is_pro {
-            "100 kHz – 6 GHz, half duplex. No SoapySDR, no libusb and no libhackrf \
+        RichText::new(
+            "DC – 7.25 GHz, half duplex. No SoapySDR, no libusb and no libhackrf \
              needed. The radio and the sample rate take effect on Apply; \
-             everything else applies as you change it."
-        } else {
-            "1 MHz – 6 GHz, half duplex. No SoapySDR, no libusb and no libhackrf \
-             needed. The radio and the sample rate take effect on Apply; \
-             everything else applies as you change it."
-        })
+             everything else applies as you change it. The band edges are the \
+             firmware's: a HackRF is specified for 1 MHz – 6 GHz (100 kHz on a \
+             Pro) and is heavily attenuated outside that, but it does tune \
+             there.",
+        )
         .weak(),
     );
 }

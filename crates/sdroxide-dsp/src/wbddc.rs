@@ -88,6 +88,52 @@ pub struct WbDdc {
     scale: f32,
 }
 
+crate::simd::kernel! {
+    /// The analysis window, applied on the way into the forward transform.
+    fn apply_window / apply_window_portable / apply_window_avx2 / apply_window_avx512 (
+        dst: &mut [f32],
+        src: &[f32],
+        win: &[f32],
+    ) {
+        for (b, (x, w)) in dst.iter_mut().zip(src.iter().zip(win)) {
+            *b = *x * *w;
+        }
+    }
+}
+
+crate::simd::kernel! {
+    /// One contiguous run of the band select: the band-pass and the
+    /// real-to-complex conversion both, in one multiply per bin.
+    fn select_bins / select_bins_portable / select_bins_avx2 / select_bins_avx512 (
+        dst: &mut [Complex32],
+        spectrum: &[Complex32],
+        taper: &[f32],
+    ) {
+        for ((b, s), t) in dst.iter_mut().zip(spectrum).zip(taper) {
+            *b = s * *t;
+        }
+    }
+}
+
+crate::simd::kernel! {
+    /// Emit one hop and keep the next: the second half of this block's inverse
+    /// transform becomes the tail the following one is added to.
+    fn overlap_add / overlap_add_portable / overlap_add_avx2 / overlap_add_avx512 (
+        out: &mut [Complex32],
+        first: &[Complex32],
+        tail: &mut [Complex32],
+        second: &[Complex32],
+        gain: f32,
+    ) {
+        for ((o, v), t) in out.iter_mut().zip(first).zip(tail.iter()) {
+            *o = v * gain + t;
+        }
+        for (t, v) in tail.iter_mut().zip(second) {
+            *t = v * gain;
+        }
+    }
+}
+
 impl WbDdc {
     /// Build a downconverter.
     ///
@@ -233,11 +279,7 @@ impl WbDdc {
         // copying per transfer.
         let mut pos = 0usize;
         while pos + self.n <= self.inbuf.len() {
-            for (b, (x, w)) in
-                self.block.iter_mut().zip(self.inbuf[pos..pos + self.n].iter().zip(&self.window))
-            {
-                *b = *x * *w;
-            }
+            apply_window(&mut self.block, &self.inbuf[pos..pos + self.n], &self.window);
 
             self.fft_fwd
                 .process_with_scratch(&mut self.block, &mut self.spectrum, &mut self.scratch_fwd)
@@ -263,12 +305,8 @@ impl WbDdc {
             let kc = self.kc;
             let (band_lo, band_hi) = self.band.split_at_mut(half);
             let (taper_lo, taper_hi) = self.taper.split_at(half);
-            for ((b, s), t) in band_lo.iter_mut().zip(&self.spectrum[kc..kc + half]).zip(taper_lo) {
-                *b = s * *t;
-            }
-            for ((b, s), t) in band_hi.iter_mut().zip(&self.spectrum[kc - half..kc]).zip(taper_hi) {
-                *b = s * *t;
-            }
+            select_bins(band_lo, &self.spectrum[kc..kc + half], taper_lo);
+            select_bins(band_hi, &self.spectrum[kc - half..kc], taper_hi);
 
             self.fft_inv.process_with_scratch(&mut self.band, &mut self.scratch_inv);
 
@@ -284,13 +322,9 @@ impl WbDdc {
             // Overlap-add: first half joins the tail kept from last time, second
             // half becomes the new tail.
             let (first, second) = self.band.split_at(out_hop);
-            out.reserve(out_hop);
-            for (v, tail) in first.iter().zip(&self.tail[..out_hop]) {
-                out.push(v * gain + tail);
-            }
-            for (tail, v) in self.tail[..out_hop].iter_mut().zip(second) {
-                *tail = v * gain;
-            }
+            let at = out.len();
+            out.resize(at + out_hop, Complex32::default());
+            overlap_add(&mut out[at..], first, &mut self.tail[..out_hop], second, gain);
 
             pos += hop;
             self.blocks += 1;

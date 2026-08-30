@@ -320,6 +320,35 @@ pub trait IqSource: Send {
     /// centre or that don't expose a per-VFO offset.
     fn set_if_offset(&mut self, _hz: f64) {}
 
+    /// How long after [`IqSource::set_center_hz`] returns the samples arriving
+    /// here are actually on the new centre. Default: no delay worth naming.
+    ///
+    /// A retune is a command, not an event: the engine learns the new centre
+    /// the instant the call returns, but the pipeline behind it is still full
+    /// of samples taken at the old one. Label those with the new centre and
+    /// they are drawn at the wrong frequency — by the distance the centre moved
+    /// in the meantime. Standing still nobody would ever see it, because the
+    /// centre stops moving and the picture catches up within one delay. It is a
+    /// **drag** that makes it visible: with the view fully zoomed out a pan
+    /// sends `SetCenter` once per displayed frame (issue #133), so the label
+    /// runs continuously ahead of the data and the whole spectrum sits
+    /// displaced by `drag rate × delay` — in the direction of the drag — until
+    /// the operator lets go and it snaps back.
+    ///
+    /// A local USB front end is a millisecond or two of this and nothing to
+    /// see. A radio at the end of a socket is not: measured on a SunSDR2DX
+    /// through ExpertSDR3's TCI on the loopback interface, **131 ms** at
+    /// 192 kHz — of which only 21 ms was sdroxide's own ring, the rest inside
+    /// the rig. Nothing on the wire marks it, either: the `dds:` echo comes
+    /// back in 0.4 ms, so it acknowledges the command rather than the data.
+    ///
+    /// Hence a declaration rather than a measurement. Sources that do not
+    /// override this are unchanged in every respect — the engine's compensation
+    /// is skipped outright at zero.
+    fn stream_delay_s(&self) -> f64 {
+        0.0
+    }
+
     /// The frequency this radio would transmit on — split, XIT and a satellite
     /// uplink already in it — told to the source *while receiving*, whenever it
     /// changes.
@@ -359,6 +388,19 @@ pub trait IqSource: Send {
     /// Default: nothing to show.
     fn wide_spectrum_db(&mut self, _out: &mut Vec<f32>) -> Option<(f64, f64)> {
         None
+    }
+
+    /// How wide [`IqSource::wide_spectrum_db`]'s window is, in Hz — `0.0` for a
+    /// source that publishes none.
+    ///
+    /// Answered at open, before any frame has been built, because it is what
+    /// the client's zoom-out is bounded by: see `DeviceCaps::wide_span_hz`. A
+    /// source whose lane is a fixed width knows this from its handshake; one
+    /// whose width moves should report the widest it will send.
+    ///
+    /// Default: no lane.
+    fn wide_span_hz(&self) -> f64 {
+        0.0
     }
 
     /// Whether this front end's centre *is* the rig's dial — one synthesiser
@@ -820,6 +862,11 @@ impl IqSource for ConvertedSource {
         Some((self.down(center), span))
     }
 
+    /// A converter shifts where the lane sits, never how wide it is.
+    fn wide_span_hz(&self) -> f64 {
+        self.inner.wide_span_hz()
+    }
+
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
         self.inner
             .poll_control()
@@ -978,6 +1025,12 @@ impl IqSource for ConvertedSource {
     /// Relative (VFO minus IQ centre), so untouched.
     fn set_if_offset(&mut self, hz: f64) {
         self.inner.set_if_offset(hz);
+    }
+
+    /// A property of the pipeline behind the converter, which a frequency
+    /// translation does not change.
+    fn stream_delay_s(&self) -> f64 {
+        self.inner.stream_delay_s()
     }
 
     /// A transmit frequency, so it takes the transmit offset: what the hardware
@@ -1235,18 +1288,54 @@ pub struct FileSource {
     path: String,
     sample_rate: f64,
     center_hz: f64,
+    /// Where the samples begin: past a WAV header, or zero for a raw stream.
+    /// The loop at the end of the file goes back to *this*, not to the start.
+    data_start: u64,
     throttle: Throttle,
 }
 
 impl FileSource {
+    /// Play a raw interleaved CF32 stream — or one of sdroxide's own I/Q WAV
+    /// captures, whose header says what the caller would otherwise have to
+    /// type: a capture made by the REC popup plays back at the rate and on the
+    /// frequency it was made, with `--file` and nothing else (issue #217).
+    ///
+    /// A rate or a centre given on the command line still wins; that is what
+    /// `--rate` and `--freq` are for, and a header is not an instruction.
     pub fn open(path: impl AsRef<Path>, sample_rate: f64, center_hz: f64) -> Result<Self> {
+        Self::open_with(path, sample_rate, center_hz, false, false)
+    }
+
+    /// [`FileSource::open`], told which of the two the operator named
+    /// themselves so the header does not overrule them.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        sample_rate: f64,
+        center_hz: f64,
+        rate_given: bool,
+        center_given: bool,
+    ) -> Result<Self> {
         let path_str = path.as_ref().display().to_string();
-        let reader = BufReader::new(File::open(path)?);
+        let wav = crate::iq_wav::probe(path.as_ref());
+        let sample_rate = match &wav {
+            Some(w) if !rate_given => w.rate_hz,
+            _ => sample_rate,
+        };
+        let center_hz = match &wav {
+            Some(w) if !center_given => w.center_hz.unwrap_or(center_hz),
+            _ => center_hz,
+        };
+        let mut reader = BufReader::new(File::open(path)?);
+        let start = wav.as_ref().map_or(0, |w| w.data_start);
+        if start > 0 {
+            reader.seek(SeekFrom::Start(start))?;
+        }
         Ok(FileSource {
             reader,
             path: path_str,
             sample_rate,
             center_hz,
+            data_start: start,
             throttle: Throttle::new(sample_rate),
         })
     }
@@ -1272,7 +1361,9 @@ impl IqSource for FileSource {
         while filled < raw.len() {
             let n = self.reader.read(&mut raw[filled..])?;
             if n == 0 {
-                self.reader.seek(SeekFrom::Start(0))?; // loop
+                // Loop — back to the first *sample*, which on a WAV is past the
+                // header. Restarting at zero would play the header as signal.
+                self.reader.seek(SeekFrom::Start(self.data_start))?;
                 continue;
             }
             filled += n;

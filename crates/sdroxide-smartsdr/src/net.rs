@@ -79,6 +79,10 @@ pub const VITA_PORT: u16 = 4991;
 const PRIME_INTERVAL: Duration = Duration::from_millis(250);
 const PRIME_WINDOW: Duration = Duration::from_secs(2);
 
+/// How long the data thread waits before writing the verdict into the trace.
+/// Comfortably past the last priming datagram, so what it records is settled.
+const SILENCE_VERDICT: Duration = Duration::from_secs(5);
+
 /// Largest datagram the radio may emit, in bytes. FlexLib's default, and the
 /// reason it is set at all: a radio left to its own devices can put datagrams on
 /// the wire that fragment, and a path that drops IP fragments then delivers
@@ -406,7 +410,42 @@ impl FlexHandle {
             opts.network_mtu.clamp(576, 9000)
         ))?;
         wire.send("keepalive enable")?;
-        wire.send(&format!("client udpport {udp_port}"))?;
+
+        // The one command in this handshake whose failure is *invisible* and
+        // total: get it wrong and every command still succeeds, the radio still
+        // reports the stream active, and not one sample ever arrives. AetherSDR
+        // records that v1.4.0.0 firmware can answer it with "command not
+        // supported". So it is read, and the answer is written into the trace as
+        // its own line rather than left as an `R` among hundreds — two field
+        // reports in a row arrived with exactly this reply trimmed out of the
+        // paste.
+        // Bound only when the radio will not take the port we chose — see
+        // [`bind_fallback`].
+        let mut fallback = None;
+        match wire.try_request(&mut reader, &mut deferred, &format!("client udpport {udp_port}"))? {
+            Some(r) if r.code == 0 => {
+                trace.note(format!("the radio accepted UDP port {udp_port} for our streams"));
+            }
+            Some(r) => {
+                fallback = bind_fallback(&trace);
+                trace.note(format!(
+                    "THE RADIO REFUSED `client udpport {udp_port}` (0x{:08X}{}).                      It will stream to whatever port it last recorded, which is not                      one we asked for — expect no spectrum.",
+                    r.code,
+                    if r.body.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", r.body.trim())
+                    }
+                ));
+                tracing::warn!(
+                    target: "smartsdr",
+                    port = udp_port,
+                    code = format!("0x{:08X}", r.code),
+                    "the radio refused our UDP port"
+                );
+            }
+            None => fallback = bind_fallback(&trace),
+        }
         for topic in ["slice", "pan", "tx", "meter", "radio", "daxiq", "dax", "atu"] {
             wire.send(&format!("sub {topic} all"))?;
         }
@@ -474,6 +513,7 @@ impl FlexHandle {
 
         let data = DataThread {
             udp,
+            fallback,
             radio_udp,
             register_udp,
             radio_udp_confirmed: false,
@@ -963,6 +1003,39 @@ fn live_holder_of(lines: &[Line], id: &str, ours: u32) -> Option<(u32, String)> 
     live.into_iter().next()
 }
 
+/// A second ear on [`VITA_PORT`], where FlexLib listens and so where a radio
+/// streams to a client whose own port it has not recorded.
+///
+/// Bound **only** when `client udpport` was refused or went unanswered, never as
+/// insurance. 4991 is SmartSDR's own receiving port on this machine: squatting
+/// on it for the length of every sdroxide session would stop the operator
+/// starting SmartSDR alongside us, which on a multiFLEX radio is something
+/// people do on purpose. When the radio has accepted the port we asked for there
+/// is nothing here to win, so nothing is taken.
+///
+/// Exclusive, and skipped if the bind fails — sharing a *unicast* port through
+/// `SO_REUSEPORT` would divert half of somebody else's stream into our socket,
+/// which is a rude way to test a hypothesis.
+fn bind_fallback(trace: &Trace) -> Option<UdpSocket> {
+    match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), VITA_PORT)) {
+        Ok(sock) => {
+            sock.set_nonblocking(true).ok();
+            trace.note(format!(
+                "listening on UDP {VITA_PORT} as well, in case the radio streams to \
+                 FlexLib's default port"
+            ));
+            Some(sock)
+        }
+        Err(e) => {
+            trace.note(format!(
+                "UDP {VITA_PORT} is not available ({e}) — SmartSDR or its DAX service is \
+                 probably holding it. Not listening there."
+            ));
+            None
+        }
+    }
+}
+
 /// How long a freshly created panadapter is left alone before it is configured.
 ///
 /// The id comes back in the create's own reply, but the object behind it is not
@@ -1439,6 +1512,7 @@ fn mode_to_flex(m: Mode) -> &'static str {
         | Mode::Packet
         | Mode::Aprs
         | Mode::SstvFm
+        | Mode::RttyFm
         | Mode::Adsb => "FM",
         Mode::Digl => "DIGL",
         Mode::Digu
@@ -1455,7 +1529,7 @@ fn mode_to_flex(m: Mode) -> &'static str {
         | Mode::Hell
         | Mode::PacketHf
         | Mode::Rade => "DIGU",
-        Mode::Usb | Mode::Sstv | Mode::Wefax | Mode::RfPaint | Mode::Spec => "USB",
+        Mode::Usb | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint | Mode::Spec => "USB",
     }
 }
 
@@ -1480,6 +1554,9 @@ fn flex_to_mode(s: &str) -> Option<Mode> {
 
 struct DataThread {
     udp: UdpSocket,
+    /// A second listening socket on [`VITA_PORT`], when it was free. See where
+    /// it is bound for why it exists and why it is not shared.
+    fallback: Option<UdpSocket>,
     /// Where DAX TX audio goes.
     ///
     /// Starts as the radio's data port, [`VITA_PORT`] — *not* the command port
@@ -1528,6 +1605,20 @@ const TX_LEAD_PACKETS: usize = 4;
 const TX_MAX_PACKETS_PER_TURN: u32 = 16;
 
 impl DataThread {
+    /// A datagram from either listening socket.
+    ///
+    /// The fallback is non-blocking, so it is checked first at the cost of one
+    /// syscall that returns immediately when it is empty — which is every turn
+    /// of the loop unless the radio really is streaming to the wrong port. The
+    /// primary socket goes last because *its* read timeout is what paces this
+    /// whole loop, and with it the TX audio clock.
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr, bool)> {
+        if let Some(Ok((n, from))) = self.fallback.as_ref().map(|f| f.recv_from(buf)) {
+            return Ok((n, from, true));
+        }
+        self.udp.recv_from(buf).map(|(n, from)| (n, from, false))
+    }
+
     fn run(mut self) {
         // Comfortably over a 192 kHz IQ packet; the radio keeps them inside the
         // path MTU it was told about, but a jumbo-frame LAN can carry more.
@@ -1552,6 +1643,14 @@ impl DataThread {
         let prime_until = Instant::now() + PRIME_WINDOW;
         let mut primed_at: Option<Instant> = None;
         let mut first_packet = false;
+        let mut reported_icmp = false;
+        let mut reported_fallback = false;
+        // One note, once, when the radio has had every chance and sent nothing.
+        // The trace is what a user pastes into a report, and "connected, and then
+        // this much silence" is the finding — it should not have to be inferred
+        // from the absence of lines.
+        let started = Instant::now();
+        let mut reported_silence = false;
 
         loop {
             if !self.alive.load(Ordering::Relaxed) {
@@ -1566,9 +1665,37 @@ impl DataThread {
                 let _ = self.udp.send_to(&[0u8], self.register_udp);
             }
 
-            match self.udp.recv_from(&mut buf) {
-                Ok((n, from)) => {
+            if !first_packet && !reported_silence && started.elapsed() >= SILENCE_VERDICT {
+                reported_silence = true;
+                self.trace.note(format!(
+                    "no UDP from the radio after {:.0}s. The control link is fine, so the \
+                     radio's VITA-49 is not reaching this machine: a host firewall on this \
+                     computer is the usual cause (SmartSDR gets a rule installed for it and \
+                     sdroxide does not), then a VPN, then an MTU smaller than the one the \
+                     radio was given.",
+                    SILENCE_VERDICT.as_secs_f64()
+                ));
+                tracing::warn!(target: "smartsdr", "no VITA-49 UDP from the radio");
+            }
+
+            match self.recv(&mut buf) {
+                Ok((n, from, via_fallback)) => {
                     first_packet = true;
+                    self.trace.datagram();
+                    // Worth exactly one line, and it is a diagnosis rather than
+                    // a detail: samples arriving here mean the radio ignored the
+                    // port we gave it and used FlexLib's default instead.
+                    if via_fallback && !reported_fallback {
+                        reported_fallback = true;
+                        self.trace.note(format!(
+                            "the radio is streaming to UDP {VITA_PORT}, not to the port it \
+                             was given — `client udpport` did not take"
+                        ));
+                        tracing::warn!(
+                            target: "smartsdr",
+                            "radio ignored `client udpport`; receiving on {VITA_PORT}"
+                        );
+                    }
                     let Some(h) = p::parse_vita_header(&buf[..n]) else { continue };
                     let lost = match self.last_count.insert(h.stream_id, h.count) {
                         Some(prev) => p::count_gap(prev, h.count),
@@ -1650,6 +1777,32 @@ impl DataThread {
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) => {}
+                // Not fatal, and it used to be. A UDP socket that has sent to a
+                // port nothing is listening on gets the ICMP unreachable handed
+                // back as an error on the *next* receive — on Windows always, as
+                // WSAECONNRESET. Our own priming datagram is exactly such a send,
+                // so treating any error as a dead socket meant one unanswered
+                // prime could tear down the receive path for the whole session
+                // and guarantee the silence it was sent to prevent. The socket is
+                // still perfectly usable; only this call failed.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::HostUnreachable
+                            | std::io::ErrorKind::NetworkUnreachable
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if !reported_icmp {
+                        reported_icmp = true;
+                        self.trace.note(format!(
+                            "VITA-49 socket reported {e} — an ICMP unreachable for a datagram \
+                             we sent, not a broken socket; still listening"
+                        ));
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(target: "smartsdr", "VITA-49 socket error: {e}");
                     self.trace.note(format!("VITA-49 socket error: {e}"));

@@ -33,6 +33,8 @@ mod pictures;
 mod probe;
 mod prop_store;
 mod propagation;
+pub mod publicsdr;
+mod qo100;
 mod radio;
 mod rds;
 pub mod region;
@@ -94,14 +96,15 @@ pub use command::Command;
 pub use contacts::FsqContact;
 pub use controller::{AudioDevices, PeerRadio, RadioController, RadioEvent};
 pub use digi::{
-    ClockHealth, CwStatus, Decode, DecodeSort, DigiConfig, DigiStatus, DxpedMode, FOX_MAX_SLOTS,
-    FOX_ZONE_MAX_HZ, FoxCaller, FsqHeard, FsqMsg, HOUND_ZONE_MAX_HZ, HellVariant, PACKET_HEARD_MAX,
-    PACKET_TERM_LINE_MAX, PACKET_TERM_MAX, PacketBaud, PacketHeard, PacketLink, PacketLinkOwner,
-    PacketStatus, PacketTermKind, PacketTermLine, QsoLive, QsoRecord, QsoStep, QueuedCall,
-    RTTY_CENTER_HZ, RadeStatus, TX_AUDIO_LEVEL_MIN, TX_AUDIO_LEVEL_MIN_DB, ThorMode,
-    TranscriptLine, adif_band, adif_records, adif_to_qso_log, clock_health, cq_is_for_us,
-    fmt_report, qso_log_to_adif, qso_log_to_text, tx_level_db, tx_level_from_db, utc_ymd_hms,
-    worked_before, ymd_hms_to_unix,
+    CONTEST_SERIAL_MAX, ClockHealth, ContestMode, CwStatus, Decode, DecodeSort, DigiConfig,
+    DigiStatus, DxpedMode, FOX_MAX_SLOTS, FOX_ZONE_MAX_HZ, FoxCaller, FsqHeard, FsqMsg,
+    HOUND_ZONE_MAX_HZ, HellVariant, NAVTEX_MESSAGE_MAX, NAVTEX_TONE_HZ, NavtexMessage,
+    NavtexStatus, PACKET_HEARD_MAX, PACKET_TERM_LINE_MAX, PACKET_TERM_MAX, PacketBaud, PacketHeard,
+    PacketLink, PacketLinkOwner, PacketStatus, PacketTermKind, PacketTermLine, QsoLive, QsoRecord,
+    QsoStep, QueuedCall, RTTY_CENTER_HZ, RadeStatus, TX_AUDIO_LEVEL_MIN, TX_AUDIO_LEVEL_MIN_DB,
+    ThorMode, TranscriptLine, adif_band, adif_records, adif_to_qso_log, clock_health, cq_is_for_us,
+    eu_vhf_rs, fmt_report, next_contest_serial, qso_log_to_adif, qso_log_to_text, tx_level_db,
+    tx_level_from_db, utc_ymd_hms, worked_before, ymd_hms_to_unix,
 };
 pub use drm::{
     DrmChannel, DrmCodec, DrmConstellation, DrmRobustness, DrmService, DrmStatus, DrmSync, DrmTime,
@@ -154,6 +157,8 @@ pub use propagation::{
     SPLAT_SIGMA_KM, cell_center, cell_of, fof2_floor_mhz, margin_db, muf3000_floor_mhz,
     obliquity_factor,
 };
+pub use publicsdr::{PublicSdrDirectory, PublicSdrEntry, PublicSdrNetwork};
+pub use qo100::{QO100_BEACON_HZ, Qo100Settings, Qo100Status};
 pub use radio::{
     AirspyConfig, AirspyDevice, AirspyGain, AirspyHfConfig, AirspyHfDevice, AirspyHfModel, Backend,
     CAT_IQ_DC_BLOCK_MAX_HZ, CAT_IQ_RATES, CAT_SCOPE_MIN_BAUD, CONVERTER_OFFSET_MAX_HZ,
@@ -164,6 +169,7 @@ pub use radio::{
     EladDevice, EladTxInput, FREQ_RANGE_MAX_HZ, HackRfConfig, HackRfDevice, HpsdrConfig,
     HpsdrDevice, HpsdrFilterBoard, HpsdrIoRxInput, HydraSdrConfig, HydraSdrDevice, HydraSdrGain,
     HydraSdrPort, IcomModel, IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend,
+    KiwiConfig,
     LimeAuxConfig, LimeAuxRole, LimeConfig, LimeDevice, LineState, ModeControl,
     PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio, PanadapterConfig, PanadapterTap, Parity, PlutoAgc,
     PlutoConfig, PlutoDevice, PlutoDuplex, PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ,
@@ -213,7 +219,8 @@ pub use sstv::{SstvMode, SstvStatus};
 pub use state::{
     MAX_DECIMATION, MAX_MANUAL_GAIN_DB, MIN_DECIMATED_RATE_HZ, OffsetState, RadioState, RxId,
     RxState, SQUELCH_OPEN_DB, SWR_LIMIT_MAX, SWR_LIMIT_MIN, SWR_TUNE_LIMIT_SCALE, TxEqBand,
-    TxEqState, TxState, Vfo, max_decimation, swr_tune_limit,
+    TxEqState, TxState, Vfo, ZOOM_LANE_MARGIN, max_decimation, panadapter_fft_ceiling,
+    swr_tune_limit, zoom_lane_decimation,
 };
 pub use station::StationConfig;
 pub use tciserver::TciServerConfig;

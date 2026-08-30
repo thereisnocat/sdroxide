@@ -50,6 +50,12 @@ pub(crate) struct UiSink<'a> {
     /// control the on-screen rail does, or it moves a threshold the audio never
     /// passes through (issue #192).
     pub rig_squelch: bool,
+    /// The window a zoom-out may reach, `(centre, span)` — the front end's
+    /// full-band lane where it has one, else its passband. Precomputed by the
+    /// caller for the same reason `rig_squelch` is: it comes off the spectrum
+    /// lane, which this module has no other reason to know about, and off the
+    /// same `self` this sink has already taken apart.
+    pub zoom_out: (f64, f64),
 }
 
 /// Which binding table an in-flight momentary press came from. Held state is
@@ -288,14 +294,14 @@ pub(crate) fn apply_action(
                     let half = (span * factor / 2.0).max(50.0);
                     ui.view.view_lo_hz = centre - half;
                     ui.view.view_hi_hz = centre + half;
-                    ui.view.clamp_to(state.center_hz, state.sample_rate);
+                    ui.view.clamp_to(ui.zoom_out.0, ui.zoom_out.1);
                 }
             }
             SpectrumPan => {
                 let shift = ui.view.span() * delta as f64;
                 ui.view.view_lo_hz += shift;
                 ui.view.view_hi_hz += shift;
-                ui.view.clamp_to(state.center_hz, state.sample_rate);
+                ui.view.clamp_to(ui.zoom_out.0, ui.zoom_out.1);
             }
             SpectrumFloorDb => {
                 let v = target.unwrap_or(ui.view.db_floor + delta);
@@ -397,7 +403,7 @@ pub(crate) fn apply_action(
                 let half = (span * if act == ZoomIn { 0.5 } else { 2.0 } / 2.0).max(50.0);
                 ui.view.view_lo_hz = centre - half;
                 ui.view.view_hi_hz = centre + half;
-                ui.view.clamp_to(state.center_hz, state.sample_rate);
+                ui.view.clamp_to(ui.zoom_out.0, ui.zoom_out.1);
             }
         }
         PeakHold => ui.view.peak_hold = !ui.view.peak_hold,
@@ -1075,6 +1081,11 @@ mod tests {
             voice: &mut voice[0],
             speech,
             rig_squelch: false,
+            // The clamp these tests exercise is a no-op at zero span, which is
+            // what a default `RadioState` carries — the same thing the caller
+            // used to read straight off it. A test about the clamp itself sets
+            // this after building the sink.
+            zoom_out: (0.0, 0.0),
         }
     }
 

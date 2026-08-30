@@ -225,6 +225,9 @@ impl PanadapterSource {
             // picture is combining two aerials, this radio is listening to
             // what came out of that.
             diversity: rx.diversity,
+            // The receiver's too — it is the one drawing the band — and the
+            // engine overwrites it from `Self::wide_span_hz` in any case.
+            wide_span_hz: rx.wide_span_hz,
         }
     }
 
@@ -351,6 +354,11 @@ impl IqSource for PanadapterSource {
     fn wide_spectrum_db(&mut self, out: &mut Vec<f32>) -> Option<(f64, f64)> {
         let (center, span) = self.rx.wide_spectrum_db(out)?;
         Some((center - self.off, span))
+    }
+
+    /// The lent receiver's lane, whose width the I.F. offset does not change.
+    fn wide_span_hz(&self) -> f64 {
+        self.rx.wide_span_hz()
     }
 
     fn set_gain_element(&mut self, name: &str, db: f64) -> Result<()> {

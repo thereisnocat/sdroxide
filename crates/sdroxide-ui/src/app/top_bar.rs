@@ -192,22 +192,27 @@ const STRIP_PTT_TEXT: f32 = 17.0;
 
 /// What a digit size costs the frequency readout, and what size fits a width.
 ///
-/// The readout is ten fixed-width digits, three group separators and a " Hz"
-/// tail, spaced 1 pt apart — so its width is linear in the digit size, and one
-/// measurement of the live fonts gives the slope. Inverting that is what lets
-/// one formula serve a 360 pt phone and a 2560 pt desktop.
+/// The readout is `digits` fixed-width digits ([`freq_display::DIGITS`]
+/// normally, [`freq_display::DIGITS_EXT`] on a radio whose converter reaches
+/// past 10 GHz — see [`SdroxideApp::readout_digits`]), three group separators
+/// and a " Hz" tail, spaced 1 pt apart — so its width is linear in the digit
+/// size, and one measurement of the live fonts gives the slope. Inverting
+/// that is what lets one formula serve a 360 pt phone and a 2560 pt desktop.
 struct ReadoutFit {
     /// Width per point of digit size.
     per_pt: f32,
     /// Height per point of digit size.
     h_per_pt: f32,
+    /// The 1 pt gaps between the readout's pieces — `digits` digits, 3 dots
+    /// and the " Hz" tail — added once rather than per point of size.
+    gaps: f32,
 }
 
 impl ReadoutFit {
     /// Everything up to the group separators scales with the digit size, and
     /// `freq_display` draws " Hz" at 0.3x it, so one reference measurement of
     /// each glyph is enough.
-    fn measure(ui: &egui::Ui) -> Self {
+    fn measure(ui: &egui::Ui, digits: u32) -> Self {
         const REF: f32 = 40.0;
         let w = |s: &str, f: egui::FontId| {
             ui.painter().layout_no_wrap(s.to_owned(), f, Color32::WHITE).size()
@@ -215,13 +220,17 @@ impl ReadoutFit {
         let digit = w("0", egui::FontId::monospace(REF));
         let dot = w(".", egui::FontId::monospace(REF)).x;
         let hz = w(" Hz", egui::FontId::proportional(REF)).x;
-        Self { per_pt: (10.0 * digit.x + 3.0 * dot + 0.3 * hz) / REF, h_per_pt: digit.y / REF }
+        Self {
+            per_pt: (digits as f32 * digit.x + 3.0 * dot + 0.3 * hz) / REF,
+            h_per_pt: digit.y / REF,
+            gaps: (digits + 3) as f32,
+        }
     }
 
     /// Width of the readout at `size`, including `freq_display`'s 1 pt spacing
-    /// between its fourteen pieces.
+    /// between its pieces.
     fn width(&self, size: f32) -> f32 {
-        size * self.per_pt + 13.0
+        size * self.per_pt + self.gaps
     }
 
     fn height(&self, size: f32) -> f32 {
@@ -231,7 +240,7 @@ impl ReadoutFit {
     /// The largest digit size whose readout fits `budget`. Uncapped and
     /// unfloored — callers clamp to their own limits.
     fn fit(&self, budget: f32) -> f32 {
-        (budget - 13.0) / self.per_pt
+        (budget - self.gaps) / self.per_pt
     }
 }
 
@@ -684,7 +693,7 @@ impl SdroxideApp {
         // strip against its own pane.
         let avail = ui.available_width();
         let gap = ui.spacing().item_spacing.x;
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, self.readout_digits());
         // The readout keeps its design size wherever the row can hold it, and
         // shrinks against the full row where it cannot (a forced Desktop
         // layout on a narrow pane) — a box the packer cannot break up any
@@ -868,7 +877,7 @@ impl SdroxideApp {
         let div = self.has_diversity();
         let gap = ui.spacing().item_spacing.x;
         let chip_h = crate::chrome::chip_height(ui, None);
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, self.readout_digits());
 
         let active = self.state.active_vfo;
         let tag = match active {
@@ -932,6 +941,7 @@ impl SdroxideApp {
                         shown,
                         plan.digit,
                         ink,
+                        self.readout_digits(),
                     ) {
                         cmds.push(Command::SetVfo { vfo: active, hz: hz - offset });
                     }
@@ -1268,6 +1278,33 @@ impl SdroxideApp {
         }
     }
 
+    /// How many digit columns the frequency readout needs: [`freq_display::DIGITS`]
+    /// on every radio this program reaches on its own, one more
+    /// ([`freq_display::DIGITS_EXT`]) once its published receive range —
+    /// already shifted by whatever converter/LNB offset is configured, see
+    /// `shift_caps` — reaches 10 GHz or past it. A QO-100 station is the case
+    /// this exists for: without it, the dial reading 10489.750 MHz has no
+    /// column for the leading "1" and silently shows "0489.750.000" instead.
+    ///
+    /// Read from the live capabilities rather than the offset alone, so a
+    /// receiver that reaches 10 GHz on its own hardware (a wideband direct
+    /// sampler, a paired panadapter) gets the same extra column without
+    /// needing a converter to ask for it.
+    ///
+    /// The published range is not the only tell, though: a SoapySDR driver
+    /// that never implemented `getFrequencyRange` publishes an empty list, so
+    /// a 3-cm LNB station driven through one would still truncate its
+    /// 10489.750 MHz dial. So the configured converter offset and the dial
+    /// itself each earn the column on their own — the offset so the column is
+    /// there *before* the operator tunes up rather than appearing mid-digit.
+    fn readout_digits(&self) -> u32 {
+        let range_reaches_10ghz =
+            self.caps.as_ref().is_some_and(|c| c.freq_ranges_rx.iter().any(|&(_, hi)| hi >= 1e10));
+        let converter_offset_hz =
+            self.radio_cfg.as_ref().map(|c| c.converter_offset_hz).unwrap_or(0.0);
+        readout_digit_count(range_reaches_10ghz, converter_offset_hz, self.state.active_freq_hz())
+    }
+
     /// The VFO frequency controls (A/B select + big readout + the inactive
     /// VFO's frequency) in a label-less box, always the first module.
     ///
@@ -1282,7 +1319,7 @@ impl SdroxideApp {
         cmds: &mut Vec<Command>,
         tier: crate::layout::Tier,
     ) -> bool {
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, self.readout_digits());
         if tier == crate::layout::Tier::Phone {
             return self.freq_module_compact(ui, cmds, &fit);
         }
@@ -1399,6 +1436,7 @@ impl SdroxideApp {
                         self.input.cfg.wheel,
                         size,
                         ink,
+                        self.readout_digits(),
                     );
                 },
             );
@@ -1568,6 +1606,7 @@ impl SdroxideApp {
                 shown,
                 size,
                 ink,
+                self.readout_digits(),
             );
             if let Some(hz) = new_hz {
                 cmds.push(Command::SetVfo { vfo: active, hz: hz - offset });
@@ -2563,48 +2602,29 @@ impl SdroxideApp {
                 }
             }
             RxChip::Rec => {
-                // Record both sides of the QSO to an MP3 file (toggling).
-                let recording = self.state.recording;
+                // Two things can be recorded and they are not the same thing:
+                // the audio of a QSO, and the band the receiver is hearing. The
+                // chip lights while either is running and opens a picker for
+                // both, rather than being a toggle for whichever one somebody
+                // decided was the default (issue #217).
+                let audio = self.state.recording;
+                let iq = self.state.iq_recording;
                 let rec = crate::chrome::chip_accent(
                     ui,
-                    recording,
+                    audio || iq,
                     "REC",
                     crate::theme::ALERT(),
                     Color32::WHITE,
                 )
-                .on_hover_text(match &self.state.recording_file {
-                    Some(f) => format!("Recording to {f} — click to stop"),
-                    None => "Record RX and TX audio to MP3".to_string(),
-                });
-                if rec.clicked() {
-                    cmds.push(Command::SetRecording(!recording));
-                }
-            }
-            RxChip::Mono => {
-                // Channel layout for the *next* recording — has no effect on one
-                // already running, hence the disabled look while `recording`.
-                let recording = self.state.recording;
-                let mono = self.state.recording_mono;
-                let mono_chip = ui
-                    .add_enabled_ui(!recording, |ui| {
-                        crate::chrome::chip_accent(
-                            ui,
-                            mono,
-                            "MONO",
-                            crate::theme::ALERT(),
-                            Color32::WHITE,
-                        )
-                    })
-                    .inner
-                    .on_hover_text(if mono {
-                        "Recording mixes RX/TX to one channel — click for two channels"
-                    } else {
-                        "Recording writes two channels: RX left / TX right while the sub receiver \
-                         is on, the same audio in both otherwise — click for a single mixed channel"
-                    });
-                if mono_chip.clicked() {
-                    cmds.push(Command::SetRecordingMono(!mono));
-                }
+                .on_hover_text(
+                    match (&self.state.recording_file, &self.state.iq_recording_file) {
+                        (Some(a), Some(q)) => format!("Recording {a} and {q}"),
+                        (Some(a), None) => format!("Recording audio to {a}"),
+                        (None, Some(q)) => format!("Recording I/Q to {q}"),
+                        (None, None) => "Record the audio, the raw I/Q, or both".to_string(),
+                    },
+                );
+                self.rec_popup(ui, cmds, &rec);
             }
             RxChip::Stereo => {
                 // WFM broadcast stereo: lit while a 19 kHz pilot is locked,
@@ -2718,6 +2738,131 @@ impl SdroxideApp {
             if r.response.contains_pointer() {
                 self.nr_popup_since = Some(now);
             }
+        }
+    }
+
+    /// What the REC chip opens: one row per thing that can be recorded.
+    ///
+    /// A popup rather than a toggle because there are two answers and neither
+    /// is the obvious one — an operator archiving a QSO wants the audio, one
+    /// capturing a band to work on offline wants the I/Q, and the second is not
+    /// reachable at all from a button that does the first (issue #217).
+    fn rec_popup(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, btn: &egui::Response) {
+        let popup_id = egui::Popup::default_response_id(btn);
+        let now = ui.input(|i| i.time);
+        let alpha =
+            crate::chrome::popup_fade_alpha(ui.ctx(), popup_id, now, &mut self.rec_popup_since);
+        let resp = egui::Popup::from_toggle_button_response(btn)
+            .frame(crate::chrome::window_frame_alpha(alpha))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_opacity(alpha);
+                crate::chrome::window_body_bg(ui);
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                ui.set_max_width(300.0);
+                self.rec_controls(ui, cmds);
+            });
+        if let Some(r) = &resp {
+            crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, alpha);
+            if r.response.contains_pointer() {
+                self.rec_popup_since = Some(now);
+            }
+        }
+    }
+
+    /// The rows inside the REC popup. Split out for the same reason
+    /// [`Self::nr_controls`] is: a menu inlines them.
+    fn rec_controls(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let audio = self.state.recording;
+        let iq = self.state.iq_recording;
+
+        crate::chrome::menu_caption(ui, "Audio");
+        ui.horizontal_wrapped(|ui| {
+            if crate::chrome::chip_accent(
+                ui,
+                audio,
+                if audio { "● MP3" } else { "MP3" },
+                crate::theme::ALERT(),
+                Color32::WHITE,
+            )
+            .on_hover_text(
+                "What you hear, as an MP3: the receiver in one channel and your own transmit in \
+                 the other. This is the recording of a QSO.",
+            )
+            .clicked()
+            {
+                cmds.push(Command::SetRecording(!audio));
+            }
+            // Channel layout is a property of the *next* recording — the
+            // encoder is initialised with it — so it greys out while one runs.
+            let mono = self.state.recording_mono;
+            let mono_chip = ui
+                .add_enabled_ui(!audio, |ui| crate::chrome::chip(ui, mono, "MONO"))
+                .inner
+                .on_hover_text(if mono {
+                    "Mixed to one channel — click for two"
+                } else {
+                    "Two channels: RX left, TX right — click for one mixed channel"
+                });
+            if mono_chip.clicked() {
+                cmds.push(Command::SetRecordingMono(!mono));
+            }
+        });
+        if let Some(f) = &self.state.recording_file {
+            ui.label(RichText::new(f).size(9.5).color(crate::theme::CYAN_DIM()));
+        }
+
+        crate::chrome::menu_caption(ui, "Spectrum");
+        // A demod-audio radio hands over audio and no I/Q, so there is nothing
+        // for this to write. Said on the chip rather than hidden: an operator
+        // looking for the feature has to find out that this radio has not got
+        // it, not that sdroxide has not.
+        let have_iq = self.state.sample_rate > 96_000.0;
+        ui.horizontal_wrapped(|ui| {
+            let chip = ui
+                .add_enabled_ui(have_iq || iq, |ui| {
+                    crate::chrome::chip_accent(
+                        ui,
+                        iq,
+                        if iq { "● I/Q WAV" } else { "I/Q WAV" },
+                        crate::theme::ALERT(),
+                        Color32::WHITE,
+                    )
+                })
+                .inner
+                .on_hover_text(if have_iq || iq {
+                    "The raw spectrum the receiver is delivering, as a stereo 32-bit float WAV \
+                     (RF64 past 4 GB) that SDR#, SDRuno, HDSDR and SDRangel open — and that \
+                     sdroxide itself plays back with --file. Large: 8 bytes a sample."
+                } else {
+                    "This radio hands over demodulated audio, so there is no I/Q to record."
+                });
+            if chip.clicked() {
+                cmds.push(Command::SetIqRecording(!iq));
+            }
+            if iq {
+                let mb = self.state.iq_recording_mb;
+                let rate = self.state.sample_rate.max(1.0);
+                let secs = f64::from(mb) * f64::from(1u32 << 20) / (rate * 8.0);
+                ui.label(
+                    RichText::new(format!("{mb} MB · {:.0}:{:02}", secs / 60.0, secs as u64 % 60))
+                        .size(9.5)
+                        .color(crate::theme::ALERT()),
+                );
+            } else if have_iq {
+                // The bill, before it is run up rather than after: at 2.4 Msps
+                // this is a gigabyte a minute.
+                let mbs = self.state.sample_rate * 8.0 / f64::from(1u32 << 20);
+                ui.label(
+                    RichText::new(format!("{mbs:.0} MB/s"))
+                        .size(9.5)
+                        .color(crate::theme::CYAN_DIM()),
+                )
+                .on_hover_text("What a capture costs at this sample rate");
+            }
+        });
+        if let Some(f) = &self.state.iq_recording_file {
+            ui.label(RichText::new(f).size(9.5).color(crate::theme::CYAN_DIM()));
         }
     }
 
@@ -3506,7 +3651,7 @@ impl SdroxideApp {
     /// SNR a track must reach before it earns a box on the waterfall. Fades out
     /// on its own like the band/mode popup.
     fn skimmer_button(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, extra: f32) {
-        let [_, skim, _] = DISPLAY_TOOL_CHIPS;
+        let [_, _, skim, _] = DISPLAY_TOOL_CHIPS;
         let btn = chip_stretched(ui, self.state.skimmer.any_enabled(), skim, extra).on_hover_text(
             "CW / PSK / RTTY skimmers — decode signals across the band and mark them on the waterfall",
         );
@@ -3755,7 +3900,21 @@ impl SdroxideApp {
                     {
                         self.view.peak_hold = !self.view.peak_hold;
                     }
+                    if crate::chrome::chip(ui, self.view.spectrum_3d, "3D")
+                        .on_hover_text(
+                            "Draw the spectrum as a receding surface instead of a flat line: \
+                             the newest spectrum across the front, the ones before it flowing \
+                             away from you. The last couple of seconds of the band as a \
+                             landscape — a carrier that comes and goes is a ridge rather than \
+                             a line that twitches. The grid and the peak hold belong to the \
+                             flat line and are not drawn on it.",
+                        )
+                        .clicked()
+                    {
+                        self.view.spectrum_3d = !self.view.spectrum_3d;
+                    }
                 });
+                self.spectrum_3d_rows(ui, &mut cfg);
                 speed_row(
                     ui,
                     "reaction",
@@ -3803,6 +3962,90 @@ impl SdroxideApp {
             self.ui_settings = cfg;
             crate::app::persist::persist_ui_settings(&self.ui_settings);
         }
+    }
+
+    /// The two rows of [`Self::panadapter_controls`] that belong to the 3D
+    /// display: how the surface is drawn, and how fast it flows away from the
+    /// viewer. Both are live only once the 3D chip above them is lit.
+    ///
+    /// Greyed rather than hidden while the flat line is showing, the way the
+    /// detail row greys a width this machine cannot hold: rows that come and go
+    /// resize the popup under the pointer, and the choices they hold are still
+    /// real ones — they are what the 3D chip will show when it is clicked.
+    fn spectrum_3d_rows(&mut self, ui: &mut egui::Ui, cfg: &mut sdroxide_types::UiSettings) {
+        let on = self.view.spectrum_3d;
+        let grey = "Switch 3D on to set this";
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("surface").size(10.0).color(crate::theme::CYAN_DIM()))
+                .on_hover_text(
+                    "How the 3D spectrum is drawn. Only the shape differs — both renderings \
+                     show the same spectra, and both hide what is behind them, so a strong \
+                     signal in front stands over the band it is covering.",
+                );
+            for (solid, label, hint) in [
+                (
+                    false,
+                    "LINES",
+                    "One trace per remembered spectrum, in the flat line's own colour, each \
+                     hiding the ones behind it. The shape without the levels, and the reading \
+                     to pick when the shape is what you are after — it costs a little more \
+                     than the solid one rather than less, because it draws the same surface \
+                     and then strokes every crest on top of it.",
+                ),
+                (
+                    true,
+                    "SOLID",
+                    "A filled surface coloured by the waterfall's palette, so the level is in \
+                     the colour as well as in the height and the two halves of the panadapter \
+                     agree about what a strong signal looks like. Change the palette in \
+                     Settings › Display.",
+                ),
+            ] {
+                let r = crate::chrome::chip_enabled(
+                    ui,
+                    on,
+                    self.view.spectrum_3d_solid == solid,
+                    label,
+                );
+                if on {
+                    if r.on_hover_text(hint).clicked() {
+                        self.view.spectrum_3d_solid = solid;
+                    }
+                } else {
+                    r.on_disabled_hover_text(grey);
+                }
+            }
+        });
+        // The flow rate, and what each step of it means on the surface: the
+        // depth is a fixed number of rows, so the rate *is* the seconds of band
+        // the picture holds, and that is the number worth putting on the hover
+        // rather than the rows a second nobody counts.
+        let depth = crate::widgets::spectrum3d::DEPTH as f32;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("flow").size(10.0).color(crate::theme::CYAN_DIM()))
+                .on_hover_text(
+                    "How fast the 3D spectrum flows away from you, in rows a second: Slow 6, \
+                     Medium 12, Fast 24, Faster 48. The surface is a fixed number of rows \
+                     deep, so this is also how much time it holds. Slower is a longer memory \
+                     and a surface that crawls; faster is a shorter one that moves. The \
+                     waterfall keeps its own scroll rate, below.",
+                );
+            for step in Speed::SURFACE {
+                let label = step.label().to_uppercase();
+                let r = crate::chrome::chip_enabled(ui, on, cfg.spectrum_3d_speed == step, &label);
+                if !on {
+                    r.on_disabled_hover_text(grey);
+                    continue;
+                }
+                let rate = sdroxide_types::UiSettings { spectrum_3d_speed: step, ..*cfg }
+                    .spectrum_3d_rows_per_sec();
+                let hint =
+                    format!("{:.0} rows a second — {:.0} seconds of band", rate, depth / rate);
+                if r.on_hover_text(hint).clicked() {
+                    cfg.spectrum_3d_speed = step;
+                }
+            }
+        });
     }
 
     /// The detail row of [`Self::panadapter_controls`]: how many columns the
@@ -3864,7 +4107,7 @@ impl SdroxideApp {
         narrow: bool,
         extra: f32,
     ) {
-        let [fit, _, fft] = DISPLAY_TOOL_CHIPS;
+        let [fit, ctr, _, fft] = DISPLAY_TOOL_CHIPS;
         // Lit while the floor/ceiling are kept fitted by themselves. Switching
         // it on fits immediately, which is also how a one-off fit is asked for:
         // click it off and on again.
@@ -3880,6 +4123,23 @@ impl SdroxideApp {
             if self.view.auto_fit {
                 self.fit_levels_now(ui.input(|i| i.time));
             }
+        }
+        // FIT's twin for the frequency axis (issue #174): lit while the window
+        // follows the dial, so the tuned frequency stays in the middle of the
+        // picture and the band scrolls past it instead of the picture jumping a
+        // whole span every time the dial leaves it. Switching it on centres at
+        // once, which is also how a one-off "put me back in the middle" is
+        // asked for: click it on, and off again if you would rather pan freely.
+        if chip_stretched(ui, self.view.center_on_vfo, ctr, extra)
+            .on_hover_text(
+                "Keep the tuned frequency in the middle of the panadapter: the window slides \
+                 under the dial instead of the picture jumping a whole span when you tune off \
+                 the edge. Switch it on to centre at once; switch it off to pan and zoom \
+                 wherever you like.",
+            )
+            .clicked()
+        {
+            self.view.center_on_vfo = !self.view.center_on_vfo;
         }
         // In a box these two hang off chips of their own. A menu inlines
         // them below instead: a popup opened from a popup counts as a click
@@ -4019,7 +4279,7 @@ impl SdroxideApp {
     /// The first five window chips — the condensed System box's top row.
     /// `extra` stretches each chip past its label; the popup passes 0.
     fn system_chips_top(&mut self, ui: &mut egui::Ui, extra: f32) {
-        let [log, spots, awards, bands, sat_label, ism, ..] = SYSTEM_CHIPS;
+        let [log, spots, awards, bands, sat_label, ism, websdr] = SYSTEM_CHIPS_TOP;
         if chip_stretched(ui, self.show_logbook, log, extra)
             .on_hover_text("Logbook — all QSOs (digital + manual)")
             .clicked()
@@ -4047,10 +4307,13 @@ impl SdroxideApp {
         {
             self.show_bands = !self.show_bands;
         }
-        // Accented while a satellite lock is running, like the scanner:
-        // Doppler is being applied whether or not the window is open, and
-        // that has to be visible.
-        let sat_chip = if self.sat_track.is_some() {
+        // Accented while a satellite lock *or* the QO-100 beacon hunt is
+        // running, like the scanner: both spend the receiver whether or not the
+        // window is open, and that has to be visible. QO-100 shares this chip
+        // because it shares the window — it is a satellite, and the only reason
+        // it ever had a chip of its own was that its calibration arrived first.
+        let qo100_running = self.state.qo100.enabled;
+        let sat_chip = if self.sat_track.is_some() || qo100_running {
             accent_chip_stretched(
                 ui,
                 true,
@@ -4063,9 +4326,12 @@ impl SdroxideApp {
             chip_stretched(ui, self.show_sat, sat_label, extra)
         };
         if sat_chip
-            .on_hover_text(match &self.sat_track {
-                Some(t) => format!("Satellite — locked on {}", t.name),
-                None => "Satellite — lock on and operate with Doppler correction".into(),
+            .on_hover_text(match (&self.sat_track, qo100_running) {
+                (Some(t), _) => format!("Satellite — locked on {}", t.name),
+                (None, true) => "Satellite — the QO-100 beacon calibration is running".into(),
+                (None, false) => {
+                    "Satellite — Doppler tracking, and the QO-100 beacon calibration".into()
+                }
             })
             .clicked()
         {
@@ -4096,11 +4362,17 @@ impl SdroxideApp {
         {
             self.show_ism = !self.show_ism;
         }
+        if chip_stretched(ui, self.show_public_sdrs, websdr, extra)
+            .on_hover_text("Public SDRs on the internet — browse and open one as a radio")
+            .clicked()
+        {
+            self.show_public_sdrs = !self.show_public_sdrs;
+        }
     }
 
     /// The remaining window chips — the condensed System box's bottom row.
     fn system_chips_bottom(&mut self, ui: &mut egui::Ui, extra: f32) {
-        let [.., mail, mem, scan_label, settings, help] = SYSTEM_CHIPS;
+        let [mail, mem, scan_label, settings, help] = SYSTEM_CHIPS_BOTTOM;
         if chip_stretched(ui, self.mail.open, mail, extra)
             .on_hover_text("Winlink radio email")
             .clicked()
@@ -4167,7 +4439,7 @@ impl SdroxideApp {
     /// chips splitting its share of the packer's stretch evenly.
     fn windows_condensed(&mut self, ui: &mut egui::Ui, w: f32) {
         let inner = w - 2.0 * crate::chrome::MODULE_MARGIN_X;
-        let (top, bottom) = (&SYSTEM_CHIPS[..SYSTEM_SPLIT], &SYSTEM_CHIPS[SYSTEM_SPLIT..]);
+        let (top, bottom): (&[&str], &[&str]) = (&SYSTEM_CHIPS_TOP, &SYSTEM_CHIPS_BOTTOM);
         let extra1 = ((inner - chip_row_w(ui, top)) / top.len() as f32).max(0.0);
         let extra2 = ((inner - chip_row_w(ui, bottom)) / bottom.len() as f32).max(0.0);
         crate::chrome::module_bare_h(ui, w, crate::chrome::MODULE_TALL_H, |ui| {
@@ -4267,36 +4539,21 @@ impl PttPress {
     }
 }
 
-/// The System box's chips, in the order they are drawn.
+/// The System box's chips, a row at a time, in the order they are drawn.
 ///
-/// One list, read by both the box that reserves the width and the rows that
-/// draw into it. `system_chips_top` and `system_chips_bottom` destructure it —
-/// the first taking [`SYSTEM_SPLIT`] labels and the second the rest — so a
-/// chip added to a row without a label added here does not compile, which is
-/// what keeps the reservation honest. A box reserved narrower than its
-/// contents does not clip them: the row simply carries on past the box, and
-/// whatever crosses the window edge is lost. That is how SCAN, SETTINGS and
-/// HELP came to vanish on the layouts where the strip put this box near the
-/// end of a row.
-const SYSTEM_CHIPS: [&str; 11] = [
-    "LOG",
-    "SPOTS",
-    "AWARDS",
-    "BANDS",
-    "SAT",
-    "ISM",
-    "MAIL",
-    "MEM",
-    "SCAN",
-    "⚙ SETTINGS",
-    "? HELP",
-];
+/// **One array per row, and `system_chips_top` / `system_chips_bottom`
+/// destructure their own exhaustively** — no `..` — so a chip added to a row
+/// without a label added here does not compile. That is what keeps the width
+/// reservation honest, and it has to be structural rather than a comment: a box
+/// reserved narrower than its contents does not clip them. The row simply
+/// carries on past the box, and whatever crosses the window edge is lost. That
+/// is how SCAN, SETTINGS and HELP came to vanish on the layouts where the strip
+/// put this box near the end of a row — and, later, how WEB SDR did, drawn in
+/// the top row while a single split index still counted it in the bottom one.
+const SYSTEM_CHIPS_TOP: [&str; 7] = ["LOG", "SPOTS", "AWARDS", "BANDS", "SAT", "ISM", "WEB SDR"];
 
-/// Where [`SYSTEM_CHIPS`] breaks into the condensed box's two rows. Has to
-/// agree with the destructuring patterns in `system_chips_top` / `_bottom` —
-/// the array length pins both, so a chip added to the list forces all three
-/// to be revisited together.
-const SYSTEM_SPLIT: usize = 6;
+/// The rest of them. See [`SYSTEM_CHIPS_TOP`].
+const SYSTEM_CHIPS_BOTTOM: [&str; 5] = ["MAIL", "MEM", "SCAN", "⚙ SETTINGS", "? HELP"];
 
 /// The Display box's top row: the solar view, then the chips that choose what
 /// the panadapter draws — the last of those only on a front end with a
@@ -4306,9 +4563,10 @@ const SYSTEM_SPLIT: usize = 6;
 /// `app::solar`.
 pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WIDE"];
 
-/// The Display box's bottom row: the level fit, the skimmers, and the
-/// FFT/levels popup. Read by the measurement and by each chip's own draw site.
-const DISPLAY_TOOL_CHIPS: [&str; 3] = ["FIT", "SKIM", "FFT"];
+/// The Display box's bottom row: the level fit, centre tuning, the skimmers,
+/// and the FFT/levels popup. Read by the measurement and by each chip's own
+/// draw site.
+const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
 
 /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
 /// labels, so the chips match and the level blocks beside them start on the
@@ -4404,7 +4662,6 @@ enum RxChip {
     Nr,
     Mute,
     Rec,
-    Mono,
     /// WFM's stereo pilot.
     Stereo,
     /// WFM's RDS subcarrier.
@@ -4426,7 +4683,6 @@ impl RxChip {
             Self::Nr => "NR",
             Self::Mute => "MUTE",
             Self::Rec => "REC",
-            Self::Mono => "MONO",
             Self::Stereo => "ST",
             Self::Rds => "RDS",
             Self::Drm => "DRM",
@@ -4467,8 +4723,11 @@ fn div_rows_w(ui: &egui::Ui) -> f32 {
 /// The RX box's chip run in a mode: the six every mode carries, then whatever
 /// the mode itself brings — a subcarrier to read, a tone to gate on.
 fn rx_chips(mode: Mode) -> Vec<RxChip> {
-    let mut chips =
-        vec![RxChip::Nb, RxChip::Anc, RxChip::Nr, RxChip::Mute, RxChip::Rec, RxChip::Mono];
+    // MONO is not among them: it is the *recording's* channel layout, and it
+    // now sits beside the recording controls it belongs to, inside the REC
+    // popup (issue #217). That is also one chip fewer on a strip that has to
+    // fit on a 1366-pixel screen (issue #211).
+    let mut chips = vec![RxChip::Nb, RxChip::Anc, RxChip::Nr, RxChip::Mute, RxChip::Rec];
     match mode {
         // Only WFM has a stereo pilot to lock or an RDS subcarrier to decode.
         Mode::Wfm => chips.extend([RxChip::Stereo, RxChip::Rds]),
@@ -4694,7 +4953,9 @@ fn panadapter_group_w(ui: &egui::Ui) -> f32 {
         .map(|d| crate::chrome::chip_width(ui, &detail_chip_label(*d), None) + gap)
         .sum();
     let widest = [
-        chips(&["SHOW SPECTRUM", "PEAK HOLD"]),
+        chips(&["SHOW SPECTRUM", "PEAK HOLD", "3D"]),
+        caption("surface") + chips(&["LINES", "SOLID"]),
+        caption("flow") + speeds(&Speed::SURFACE),
         caption("reaction") + speeds(&Speed::ALL),
         caption("scroll") + speeds(&Speed::WATERFALL),
         caption("detail") + detail + caption("8192 columns"),
@@ -4754,12 +5015,12 @@ fn accent_chip_stretched(
     crate::chrome::chip_accent_sized(ui, selected, label, fill, ink, size)
 }
 
-/// Width the System box needs for [`SYSTEM_CHIPS`] over its two rows: the
+/// Width the System box needs for its chips over the two rows: the
 /// wider row plus the box's side margins. Measured against the live style
 /// rather than fixed, because a touched layout pads every chip out past its
 /// desktop width — see `the_condensed_system_box_fits_its_chips`.
 fn system_rows_w(ui: &egui::Ui) -> f32 {
-    chip_row_w(ui, &SYSTEM_CHIPS[..SYSTEM_SPLIT]).max(chip_row_w(ui, &SYSTEM_CHIPS[SYSTEM_SPLIT..]))
+    chip_row_w(ui, &SYSTEM_CHIPS_TOP).max(chip_row_w(ui, &SYSTEM_CHIPS_BOTTOM))
         + 2.0 * crate::chrome::MODULE_MARGIN_X
 }
 
@@ -4867,11 +5128,8 @@ fn band_mode_menu(
             // DRM belongs with the analog modes rather than under "Digital"
             // below: that heading is the modes the digi engine decodes and
             // transmits, and DRM is a broadcast to listen to — a demodulator,
-            // like WFM beside it. ADS-B is here for the same reason: a
-            // receive-only signal to point the radio at, with no transmitter
-            // and nothing the digi engine touches.
+            // like WFM beside it.
             Mode::Drm,
-            Mode::Adsb,
             Mode::Digu,
             Mode::Digl,
             Mode::Dsb,
@@ -4885,7 +5143,12 @@ fn band_mode_menu(
     ui.add_space(6.0);
     crate::chrome::menu_caption(ui, "Digital");
     ui.horizontal_wrapped(|ui| {
-        for m in Mode::DIGITAL {
+        // ADS-B rides along at the end of this row rather than in
+        // [`Mode::DIGITAL`] itself: that list is what the digi engine decodes
+        // and transmits, and ADS-B is neither — its own lane, no QSO, no TX.
+        // It is a digital signal all the same, and this is where an operator
+        // looks for one.
+        for m in Mode::DIGITAL.into_iter().chain([Mode::Adsb]) {
             if crate::chrome::chip(ui, mode == m, m.label()).clicked() {
                 cmds.push(Command::SetMode { rx: RxId::Main, mode: m });
             }
@@ -4952,6 +5215,35 @@ fn sub_mode_picker(ui: &mut egui::Ui, cur: Mode, narrow: bool) -> Option<Mode> {
         );
     }
     picked
+}
+
+/// How many digit columns the frequency readout needs: [`freq_display::DIGITS`]
+/// normally, [`freq_display::DIGITS_EXT`] once anything puts a real digit in the
+/// ten-GHz column. Three independent tells, any one of them enough:
+///
+/// * `range_reaches_10ghz` — the receiver's published receive range (already
+///   shifted by the configured converter/LNB offset) reaches 10 GHz or past it.
+/// * `converter_offset_hz` — a 3-cm / 10 GHz converter is configured (LNB LO
+///   9750–10600 MHz, i.e. `|offset|` of about 9.75 GHz and up — a QO-100
+///   station's is 9.75 GHz exactly, well short of 10 GHz), so the column is
+///   there *before* the operator tunes up rather than appearing mid-digit. A
+///   driver that publishes no ranges at all (SoapySDR makes that optional)
+///   leaves the first tell blind, and this is what still earns that station
+///   its column. The `9e9` cut clears every 3-cm converter and stays above
+///   the next transverter down (13 cm, ~2.3 GHz).
+/// * `active_freq_hz` — the dial is already up there, converter or not (a
+///   wideband direct sampler, a paired panadapter).
+///
+/// Without the extra column the dial reading 10489.750 MHz has nowhere to put
+/// its leading "1" and is silently shown as "0489.750.000".
+fn readout_digit_count(
+    range_reaches_10ghz: bool,
+    converter_offset_hz: f64,
+    active_freq_hz: f64,
+) -> u32 {
+    let earns_extra =
+        range_reaches_10ghz || converter_offset_hz.abs() >= 9e9 || active_freq_hz >= 1e10;
+    if earns_extra { freq_display::DIGITS_EXT } else { freq_display::DIGITS }
 }
 
 #[cfg(test)]
@@ -5053,7 +5345,7 @@ mod tests {
     /// the shipped fonts; the assertions below are what that buys at each of
     /// the viewport widths the tiers were drawn for.
     fn shipped() -> ReadoutFit {
-        ReadoutFit { per_pt: 10.0 * 0.540 + 3.0 * 0.540 + 0.3 * 1.392, h_per_pt: 1.0 }
+        ReadoutFit { per_pt: 10.0 * 0.540 + 3.0 * 0.540 + 0.3 * 1.392, h_per_pt: 1.0, gaps: 13.0 }
     }
 
     #[test]
@@ -5331,7 +5623,7 @@ mod tests {
         };
         const LABELS: [&str; 5] = ["RX", "VFO", "TX", "DISP", "SYS"];
         let (mut tops, mut right, mut edge) = (Vec::new(), 0.0f32, 0.0f32);
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             ui.with_layout(
                 egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
@@ -5383,7 +5675,8 @@ mod tests {
                     );
                 },
             );
-        });
+        })
+        .drop_without_applying_deltas();
         let top = tops[0];
         assert!(tops.iter().all(|t| (t - top).abs() < 0.5), "the buttons landed at {tops:?}");
         assert!(right <= edge + 0.5, "the last button reaches {right} past a {edge} pt edge");
@@ -5507,7 +5800,7 @@ mod tests {
     fn system_box_and_chips() -> (f32, Vec<(&'static str, f32)>) {
         let (ctx, input) = desktop_ctx();
         let mut out = None;
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let mut chips = Vec::new();
             let width = system_rows_w(ui);
             let room =
@@ -5522,7 +5815,7 @@ mod tests {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.spacing_mut().item_spacing =
                             egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
-                        for row in [&SYSTEM_CHIPS[..SYSTEM_SPLIT], &SYSTEM_CHIPS[SYSTEM_SPLIT..]] {
+                        for row in [&SYSTEM_CHIPS_TOP[..], &SYSTEM_CHIPS_BOTTOM[..]] {
                             ui.horizontal(|ui| {
                                 for label in row {
                                     let right = chip_stretched(ui, false, label, 0.0).rect.right();
@@ -5534,7 +5827,8 @@ mod tests {
                     room
                 });
             out = Some((room, chips));
-        });
+        })
+        .drop_without_applying_deltas();
         out.expect("the box was drawn")
     }
 
@@ -5567,7 +5861,7 @@ mod tests {
     fn the_condensed_display_box_fits_its_chips() {
         for has_wide in [false, true] {
             let (ctx, input) = desktop_ctx();
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 let row1: &[&str] =
                     if has_wide { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..2] };
                 let room = chip_row_w(ui, row1).max(chip_row_w(ui, &DISPLAY_TOOL_CHIPS));
@@ -5584,7 +5878,8 @@ mod tests {
                         );
                     });
                 }
-            });
+            })
+            .drop_without_applying_deltas();
         }
     }
 
@@ -5595,7 +5890,7 @@ mod tests {
     #[test]
     fn the_diversity_box_fits_its_rows() {
         let (ctx, input) = desktop_ctx();
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let room = div_rows_w(ui) - 2.0 * crate::chrome::MODULE_MARGIN_X;
             for label in DIV_MODE_LABELS {
                 ui.horizontal(|ui| {
@@ -5617,7 +5912,8 @@ mod tests {
                 let took = ui.min_rect().width();
                 assert!(took <= room + 0.5, "the adaptation row took {took} of {room}");
             });
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// Which of the two rails the transmit box offers, and why each answer is
@@ -5679,7 +5975,7 @@ mod tests {
     fn the_condensed_tx_box_fits_its_rows() {
         for keyer in [false, true] {
             let (ctx, input) = desktop_ctx();
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
                 let (fixed1, fixed2) = tx_rows_fixed_w(ui, keyer);
                 // Both rows are drawn at the rail the box reserves for them.
@@ -5783,7 +6079,8 @@ mod tests {
                     level_w <= TX_LEVEL_COL_W + 0.5,
                     "the transmit-audio column took {level_w} of {TX_LEVEL_COL_W}"
                 );
-            });
+            })
+            .drop_without_applying_deltas();
         }
     }
 
@@ -5936,7 +6233,7 @@ mod tests {
     /// that need an app to measure (the frequency readout's side columns) are
     /// priced at their design figures, which is what a desktop gets.
     fn cat_rig_strip_boxes(ui: &egui::Ui, mode: Mode) -> Vec<StripBox> {
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, freq_display::DIGITS);
         let freq_w = 8.0
             + AB_W
             + 10.0
@@ -5990,7 +6287,7 @@ mod tests {
     #[test]
     fn the_desktop_strip_packs_a_cat_rig_into_two_rows() {
         let (ctx, input) = desktop_ctx();
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             // `top_bar` sets the strip's own inter-box gap before it packs.
             let gap = 8.0;
             // 1400 pt is where `layout::tier_for` starts calling a window a
@@ -6008,7 +6305,8 @@ mod tests {
                     rows = rows_needed(avail, gap, &boxes),
                 );
             }
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// And the box the packer's slack lands on stays a control box rather than
@@ -6017,7 +6315,7 @@ mod tests {
     #[test]
     fn the_vfo_box_does_not_swallow_a_rows_slack() {
         let (ctx, input) = desktop_ctx();
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let boxes = cat_rig_strip_boxes(ui, Mode::Lsb);
             let plan = plan_top_strip(1364.0, 8.0, &boxes);
             let vfo = plan
@@ -6030,7 +6328,8 @@ mod tests {
                 "the VFO box came out {vfo} pt against a natural {}",
                 boxes[2].w,
             );
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// Lay the condensed VFO/RIT box's rows out with real chips and drag
@@ -6042,7 +6341,7 @@ mod tests {
     fn the_condensed_vfo_box_fits_its_rows() {
         for tx_capable in [false, true] {
             let (ctx, input) = desktop_ctx();
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
                 let chips = vfo_chip_labels(tx_capable);
                 let room = chip_row_w(ui, &chips).max(vfo_offsets_w(ui, tx_capable)) + 4.0;
@@ -6074,7 +6373,8 @@ mod tests {
                     .inner;
                 assert!(row1 <= room + 0.5, "tx={tx_capable}: row 1 took {row1} of {room}");
                 assert!(row2 <= room + 0.5, "tx={tx_capable}: row 2 took {row2} of {room}");
-            });
+            })
+            .drop_without_applying_deltas();
         }
     }
 
@@ -6135,12 +6435,13 @@ mod tests {
         };
         // The first pass gives the chip an id; then it is opened and laid out.
         let mut id = None;
-        let _ = ctx.run_ui(input(), |ui| id = Some(menu(ui)));
+        ctx.run_ui(input(), |ui| id = Some(menu(ui))).drop_without_applying_deltas();
         let id = id.expect("the chip was drawn");
         egui::Popup::open_id(&ctx, id);
-        let _ = ctx.run_ui(input(), |ui| {
+        ctx.run_ui(input(), |ui| {
             menu(ui);
-        });
+        })
+        .drop_without_applying_deltas();
         ctx.memory(|m| m.area_rect(id)).expect("the menu was shown")
     }
 
@@ -6198,7 +6499,7 @@ mod tests {
                 for agc_off in [false, true] {
                     for mode in [Mode::Usb, Mode::Nfm, Mode::Wfm, Mode::Drm] {
                         let (ctx, input) = desktop_ctx();
-                        let _ = ctx.run_ui(input, |ui| {
+                        ctx.run_ui(input, |ui| {
                             ui.spacing_mut().item_spacing =
                                 egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
                             // The box draws its Vol and SQL rails at what it
@@ -6299,10 +6600,53 @@ mod tests {
                             let (room1, room2) = (rows.receive, rows.noise);
                             assert!(row1 <= room1 + 0.5, "{state}: row 1 took {row1} of {room1}");
                             assert!(row2 <= room2 + 0.5, "{state}: row 2 took {row2} of {room2}");
-                        });
+                        })
+                        .drop_without_applying_deltas();
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_readout_stays_at_ten_columns_for_an_ordinary_station() {
+        // No range past 10 GHz, no converter, dial on HF / VHF / 23 cm.
+        assert_eq!(readout_digit_count(false, 0.0, 14_074_000.0), freq_display::DIGITS);
+        assert_eq!(readout_digit_count(false, 0.0, 1_296_000_000.0), freq_display::DIGITS);
+        // A 13 cm transverter (~2.256 GHz offset) is the nearest converter
+        // below a 3 cm one and must not trip the extra column.
+        assert_eq!(
+            readout_digit_count(false, -2_256_000_000.0, 144_000_000.0),
+            freq_display::DIGITS
+        );
+    }
+
+    #[test]
+    fn a_qo100_converter_offset_earns_the_eleventh_column_before_the_dial_moves() {
+        // A QO-100 LNB down-converts by 9.75 GHz — short of 10 GHz, which is
+        // why the cut is 9e9 — while the dial is still parked on HF and the
+        // driver may publish no ranges at all. The column has to be there
+        // already, or it appears mid-digit the moment the operator tunes up.
+        assert_eq!(
+            readout_digit_count(false, -9_750_000_000.0, 14_074_000.0),
+            freq_display::DIGITS_EXT
+        );
+        // A 10 GHz-LO LNB (some 3 cm setups) too.
+        assert_eq!(
+            readout_digit_count(false, -10_000_000_000.0, 14_074_000.0),
+            freq_display::DIGITS_EXT
+        );
+    }
+
+    #[test]
+    fn a_dial_at_the_beacon_earns_the_column_on_its_own() {
+        // A wideband front end tuned straight to 10489.750 MHz, no converter —
+        // the exact reading the extra column exists to keep from truncating.
+        assert_eq!(readout_digit_count(false, 0.0, 10_489_750_000.0), freq_display::DIGITS_EXT);
+    }
+
+    #[test]
+    fn a_published_range_reaching_10_ghz_is_enough_by_itself() {
+        assert_eq!(readout_digit_count(true, 0.0, 14_074_000.0), freq_display::DIGITS_EXT);
     }
 }

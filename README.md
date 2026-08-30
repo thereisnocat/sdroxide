@@ -415,6 +415,18 @@ starting sdroxide before the rig is fine:
   kilobytes a frame. Roughly a hundredth of the link a wideband Airspy stream
   needs.
 
+- **KiwiSDR / Web-888 (network)** — one of the ~900 receivers published on
+  `rx.kiwisdr.com`, or a private one on the same firmware. Receive only: these
+  are other people's antennas. A KiwiSDR has no wideband I/Q to give — what it
+  has is user channels about 12 kHz wide, one of which it will send as complex
+  baseband instead of as audio — so the panadapter is that window and the strip
+  above it is the receiver's own 0–30 MHz waterfall. Tuning across the strip
+  retunes the receiver. About 64 kB/s while connected.
+
+  Browse the public ones with **WEB SDR** in the System box; picking one there
+  fills the address in and opens it, either in this radio or in a tab of its
+  own.
+
 - **RX-888 (USB)** — an RX-888 or RX-888 Mk2 direct-sampling HF receiver
   (LTC2208 16-bit ADC, Cypress FX3), driven directly over USB by a native
   pure-Rust driver. **No SoapySDR, no libusb, and no vendor driver package.**
@@ -521,7 +533,7 @@ starting sdroxide before the rig is fine:
 - **HackRF One / Pro (USB)** — a HackRF One or HackRF Pro (or a Jawbreaker or
   rad1o), driven directly over USB by a native pure-Rust driver. **No SoapySDR,
   no libusb and no libhackrf needed**, so it works in every build including the
-  standard `.msi` and `.dmg`. 1 MHz–6 GHz, 2–20 Msps, wideband IQ receive *and*
+  standard `.msi` and `.dmg`. DC–7.25 GHz, 2–20 Msps, wideband IQ receive *and*
   transmit. See "HackRF permissions" under Building for the Linux udev rule.
 
   **Half duplex**: receive stops for the length of an over, the way the hardware
@@ -536,18 +548,27 @@ starting sdroxide before the rig is fine:
   separate receive and transmit settings so you can run the preamp bypassed on
   receive and in circuit on transmit. sdroxide reprograms the whole front end on
   every change of direction, which is why that works here and does not through
-  SoapySDR. Bias tee, baseband filter and ppm correction are on the same tab;
-  the board's real tuning range is read off it, so a rad1o is honestly reported
-  as 50–4000 MHz rather than offered a HackRF One's span.
+  SoapySDR. Bias tee, baseband filter and ppm correction are on the same tab.
+
+  The tuning range is the **firmware's**, DC–7.25 GHz, the same on every board
+  and the same span libhackrf and SoapySDR publish. That is wider than any of
+  these radios is specified for — a HackRF One is a 1 MHz–6 GHz receiver — and
+  outside that it is heavily attenuated and makes little transmit power. It
+  does still tune there, though, which is what people listening to shortwave
+  below 1 MHz or watching 5 GHz Wi-Fi are relying on, so the dial goes where
+  the radio goes.
 
   A **HackRF Pro** is the same driver and the same protocol — it shares the
   HackRF One's USB id and every vendor request this driver sends — with three
-  differences sdroxide reads off the board rather than assuming: it tunes down
-  to **100 kHz** instead of 1 MHz, it accepts sample rates down to **250 ksps**
-  because it decimates in its FPGA rather than running the converter slowly, and
-  it **chooses its own baseband filter** (three quarters of the sample rate) and
-  ignores anything the host asks for, so that control is greyed out. sdroxide
-  decodes the Pro's standard 8-bit stream; its half-precision and
+  differences. It is specified down to **100 kHz** instead of 1 MHz, which is
+  most of the reason to have one for the low bands. It accepts sample rates
+  down to **250 ksps**, because it decimates in its FPGA rather than running
+  the converter slowly. And it **chooses its own baseband filter** (three
+  quarters of the sample rate) and ignores anything the host asks for, so that
+  control is greyed out. The last two sdroxide reads off the board rather than
+  assuming.
+
+  sdroxide decodes the Pro's standard 8-bit stream; its half-precision and
   extended-precision gateware modes are not driven, and a Pro left in one of
   them by `hackrf_debug -P` will need unplugging.
 
@@ -708,8 +729,10 @@ starting sdroxide before the rig is fine:
 
   The AD9361's four AGC modes, receive gain, transmit attenuation and both RF
   ports are on the Radio tab. Tuning limits are read off the device, so a stock
-  AD9363 board (325 MHz–3.8 GHz) and one unlocked to AD9364 (70 MHz–6 GHz) are
-  both reported correctly without a setting. Half duplex by default: receive
+  AD9363 board (325 MHz–3.8 GHz), one unlocked to AD9364 (70 MHz–6 GHz) and one
+  running F5OEO's [tezuka](https://github.com/F5OEO/tezuka_fw) firmware
+  (47.5 MHz–6 GHz, which puts 6 m and 4 m in reach) are all reported correctly
+  without a setting. Half duplex by default: receive
   stops for the length of an over, because a USB 2.0 gadget will not carry a
   megasample-per-second stream both ways at once. On a board with real Ethernet
   behind it — a LibreSDR, or a Pluto on a gigabit adapter — tick **Full duplex**
@@ -851,6 +874,23 @@ It has been developed against a **HackRF One** (half-duplex TX) and a
   when the device exposes those sensors.
 - Hardware-free sources for testing: `--siggen` (built-in signal generator) and
   `--file <raw CF32 IQ>`.
+
+## Installing
+
+Every release carries, for Linux:
+
+- an **AppImage** — one file, no install: download
+  `sdroxide-<version>-linux-x86_64-compat.AppImage` (or the `aarch64` one for a
+  Raspberry Pi or other ARM board), `chmod +x` it, and run it. Built against
+  glibc 2.35, so it runs on old and new distributions alike, and it needs no
+  SoapySDR: every native driver is compiled in. USB receivers still need the
+  udev rule (see below); the rules travel inside the AppImage under
+  `usr/share/doc/sdroxide`.
+- a **`.deb`**, which installs the udev rules and the menu entry for you, and
+  declares its dependencies.
+- a **portable tarball**, for anything else.
+
+Windows gets an `.msi`, macOS a `.dmg`. Or build it yourself:
 
 ## Building
 

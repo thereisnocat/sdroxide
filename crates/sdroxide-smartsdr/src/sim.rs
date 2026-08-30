@@ -89,6 +89,13 @@ pub struct SimConfig {
     /// Evict this client for a duplicate client id once it has been registered
     /// for this long, as a radio does when a second client claims its id.
     pub evict_after: Option<Duration>,
+    /// Stream to FlexLib's default client port (4991) rather than to whatever
+    /// address the client's datagrams came from.
+    ///
+    /// What a radio does with a client whose own port it never recorded. The
+    /// client is on the right machine and listening on the wrong socket, which
+    /// looks exactly like a firewall from the inside and is not one.
+    pub stream_to_default_port: bool,
 }
 
 impl Default for SimConfig {
@@ -118,6 +125,7 @@ impl Default for SimConfig {
             require_udp_register: false,
             unbound_dax_iq: false,
             evict_after: None,
+            stream_to_default_port: false,
         }
     }
 }
@@ -812,7 +820,11 @@ impl Session {
             self.last_tick = Instant::now();
             return;
         }
-        let (Some(stream), Some(dest)) = (self.iq_stream, self.client_udp) else {
+        let dest = match (self.client_udp, self.cfg.stream_to_default_port) {
+            (Some(a), true) => Some(SocketAddr::new(a.ip(), crate::net::VITA_PORT)),
+            (a, _) => a,
+        };
+        let (Some(stream), Some(dest)) = (self.iq_stream, dest) else {
             // Nothing to send yet: reset the clock so the first packet after the
             // stream comes up isn't a burst covering the whole setup handshake.
             self.last_tick = Instant::now();

@@ -112,15 +112,15 @@ impl SmartSdrSource {
 
         // Nothing at all is a different fault from the wrong rate, and it is the
         // one an operator can act on: the control link is up (we got this far),
-        // so what is missing is the radio's UDP reaching us. Naming the port it
-        // was told to use is the difference between "it doesn't work" and a
-        // firewall rule.
-        if handle.trace.stream_counters().is_empty() {
+        // so what is missing is the radio's UDP reaching us. Naming the likely
+        // cause is the difference between "it doesn't work" and a firewall rule.
+        if wait_for_any_packet(&handle) {
             warning = Some(format!(
-                "connected, but no VITA-49 data has arrived from the radio. \
-                 Its spectrum rides UDP, which the control link does not — check that \
-                 UDP from {address} can reach this machine (host firewall, VPN, or a \
-                 router between the two)."
+                "connected, but not one UDP packet has arrived from {address}. The radio \
+                 reports the stream as running, so the control link is fine and its \
+                 spectrum — which travels by UDP — is being blocked before it reaches \
+                 here. Check this computer's firewall first: SmartSDR installs a rule for \
+                 itself and sdroxide has none. Then a VPN, then the Network MTU setting."
             ));
             tracing::warn!(target: "smartsdr", "{}", warning.as_deref().unwrap_or(""));
         } else if (actual - cfg.iq_sample_rate_hz).abs() > 1.0 {
@@ -178,6 +178,23 @@ fn wait_for_rate(handle: &FlexHandle, requested: f64) -> f64 {
         std::thread::sleep(Duration::from_millis(25));
     }
     handle.actual_rate_hz()
+}
+
+/// Whether the radio has sent nothing at all, after giving it long enough to be
+/// sure.
+///
+/// Long enough matters: the client's registration datagrams go out over the
+/// first two seconds of the session, so a verdict passed before that is a
+/// verdict on a question still being asked.
+fn wait_for_any_packet(handle: &FlexHandle) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if !handle.trace.stream_counters().is_empty() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    handle.trace.stream_counters().is_empty()
 }
 
 impl Drop for SmartSdrSource {

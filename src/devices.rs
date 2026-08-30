@@ -43,6 +43,13 @@ pub fn probe(req: DeviceProbe, radio: u32) -> ProbeAnswer {
         DeviceProbe::Hpsdr => ProbeAnswer::Hpsdr(sdroxide_hpsdr::discover_default()),
         DeviceProbe::SmartSdr => ProbeAnswer::SmartSdr(crate::smartsdr_source::discover()),
         DeviceProbe::Pluto => ProbeAnswer::Pluto(sdroxide_pluto::discover_default()),
+        // The one probe that asks about the internet rather than about this
+        // machine. It still belongs here: this is the computer that will hold
+        // the connection, so it is the one whose reachability decides whether a
+        // receiver in the list is any use.
+        DeviceProbe::PublicSdrs { refresh } => {
+            ProbeAnswer::PublicSdrs(Box::new(sdroxide_config::public_sdr_directory(refresh)))
+        }
         DeviceProbe::Test(t) => ProbeAnswer::Test(t.kind(), test(&t)),
         DeviceProbe::Report(k) => ProbeAnswer::Report(k, report(k, radio)),
     }
@@ -87,6 +94,9 @@ fn test(t: &ProbeTest) -> Result<String, String> {
         }
         ProbeTest::Pluto(address) => {
             sdroxide_pluto::test_connection(address, Duration::from_secs(3))
+        }
+        ProbeTest::Kiwi(address) => {
+            sdroxide_kiwisdr::test_connection(address, Duration::from_secs(3))
         }
         ProbeTest::IcomNet(cfg) => {
             sdroxide_icomnet::test_connection(sdroxide_icomnet::IcomNetOptions {
